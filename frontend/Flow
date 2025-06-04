@@ -1,0 +1,261 @@
+import streamlit as st
+from streamlit_flow import streamlit_flow
+from streamlit_flow.elements import StreamlitFlowNode, StreamlitFlowEdge
+from streamlit_flow.layouts import TreeLayout
+import requests
+import asyncio
+import aiohttp
+import json
+
+# Initialize session state for storing results
+if 'api_results' not in st.session_state:
+    st.session_state.api_results = {}
+
+# API functions
+async def call_api_1():
+    """Example API call 1 - Replace with your actual API"""
+    try:
+        # Example: JSONPlaceholder API
+        async with aiohttp.ClientSession() as session:
+            async with session.get('https://jsonplaceholder.typicode.com/posts/1') as response:
+                data = await response.json()
+                return {"status": "success", "data": data, "api": "API 1"}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "api": "API 1"}
+
+async def call_api_2():
+    """Example API call 2 - Replace with your actual API"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get('https://jsonplaceholder.typicode.com/users/1') as response:
+                data = await response.json()
+                return {"status": "success", "data": data, "api": "API 2"}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "api": "API 2"}
+
+async def call_api_3():
+    """Example API call 3 - Replace with your actual API"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post('https://jsonplaceholder.typicode.com/posts', 
+                                  json={'title': 'Test', 'body': 'Test body', 'userId': 1}) as response:
+                data = await response.json()
+                return {"status": "success", "data": data, "api": "API 3"}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "api": "API 3"}
+
+async def call_api_4():
+    """Example API call 4 - Replace with your actual API"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get('https://jsonplaceholder.typicode.com/albums/1') as response:
+                data = await response.json()
+                return {"status": "success", "data": data, "api": "API 4"}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "api": "API 4"}
+
+# Synchronous wrapper for async functions
+def run_async_api(api_func):
+    """Run async API function in sync context"""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(api_func())
+        loop.close()
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# Custom HTML for the node with buttons
+def create_custom_node_html():
+    return """
+    <div style="
+        padding: 20px; 
+        border: 2px solid #4CAF50; 
+        border-radius: 10px; 
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+        min-width: 300px;
+        text-align: center;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+    ">
+        <h3 style="margin-bottom: 15px; color: #333;">API Control Center</h3>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+            <button onclick="window.parent.postMessage({type: 'api_call', api: 'api1'}, '*')" 
+                    style="
+                        padding: 10px 15px; 
+                        background: #FF6B6B; 
+                        color: white; 
+                        border: none; 
+                        border-radius: 5px; 
+                        cursor: pointer;
+                        font-weight: bold;
+                        transition: all 0.3s;
+                    "
+                    onmouseover="this.style.background='#FF5252'"
+                    onmouseout="this.style.background='#FF6B6B'">
+                Fetch Post
+            </button>
+            <button onclick="window.parent.postMessage({type: 'api_call', api: 'api2'}, '*')" 
+                    style="
+                        padding: 10px 15px; 
+                        background: #4ECDC4; 
+                        color: white; 
+                        border: none; 
+                        border-radius: 5px; 
+                        cursor: pointer;
+                        font-weight: bold;
+                        transition: all 0.3s;
+                    "
+                    onmouseover="this.style.background='#26A69A'"
+                    onmouseout="this.style.background='#4ECDC4'">
+                Get User
+            </button>
+            <button onclick="window.parent.postMessage({type: 'api_call', api: 'api3'}, '*')" 
+                    style="
+                        padding: 10px 15px; 
+                        background: #45B7D1; 
+                        color: white; 
+                        border: none; 
+                        border-radius: 5px; 
+                        cursor: pointer;
+                        font-weight: bold;
+                        transition: all 0.3s;
+                    "
+                    onmouseover="this.style.background='#2196F3'"
+                    onmouseout="this.style.background='#45B7D1'">
+                Create Post
+            </button>
+            <button onclick="window.parent.postMessage({type: 'api_call', api: 'api4'}, '*')" 
+                    style="
+                        padding: 10px 15px; 
+                        background: #96CEB4; 
+                        color: white; 
+                        border: none; 
+                        border-radius: 5px; 
+                        cursor: pointer;
+                        font-weight: bold;
+                        transition: all 0.3s;
+                    "
+                    onmouseover="this.style.background='#4CAF50'"
+                    onmouseout="this.style.background='#96CEB4'">
+                Get Album
+            </button>
+        </div>
+    </div>
+    """
+
+def main():
+    st.set_page_config(page_title="API Flow Controller", layout="wide")
+    
+    st.title("🔄 API Flow Controller")
+    st.markdown("Click on the buttons in the node to trigger different API calls")
+    
+    # Create the flow elements
+    nodes = [
+        StreamlitFlowNode(
+            id="api_node",
+            pos=(250, 100),
+            data={"content": create_custom_node_html()},
+            node_type="html",
+            source_position="right",
+            target_position="left",
+            draggable=True,
+            selectable=True
+        )
+    ]
+    
+    # Create the flow
+    selected_id = streamlit_flow(
+        "api_flow",
+        nodes,
+        edges=[],
+        layout=TreeLayout(direction="right"),
+        fit_view=True,
+        show_controls=True,
+        show_minimap=True,
+        height=400,
+        get_node_on_click=True,
+        get_edge_on_click=False,
+        allow_new_edges=False,
+        animate_new_edges=True,
+        hide_watermark=True
+    )
+    
+    # Handle API calls through query parameters or session state
+    query_params = st.experimental_get_query_params()
+    
+    # Check for API triggers
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        if st.button("🔴 Call API 1", key="btn1"):
+            with st.spinner("Calling API 1..."):
+                result = run_async_api(call_api_1)
+                st.session_state.api_results['api1'] = result
+                st.success("API 1 completed!")
+    
+    with col2:
+        if st.button("🟢 Call API 2", key="btn2"):
+            with st.spinner("Calling API 2..."):
+                result = run_async_api(call_api_2)
+                st.session_state.api_results['api2'] = result
+                st.success("API 2 completed!")
+    
+    with col3:
+        if st.button("🔵 Call API 3", key="btn3"):
+            with st.spinner("Calling API 3..."):
+                result = run_async_api(call_api_3)
+                st.session_state.api_results['api3'] = result
+                st.success("API 3 completed!")
+    
+    with col4:
+        if st.button("🟡 Call API 4", key="btn4"):
+            with st.spinner("Calling API 4..."):
+                result = run_async_api(call_api_4)
+                st.session_state.api_results['api4'] = result
+                st.success("API 4 completed!")
+    
+    # Display results
+    if st.session_state.api_results:
+        st.markdown("## 📊 API Results")
+        
+        for api_key, result in st.session_state.api_results.items():
+            with st.expander(f"Results from {result.get('api', api_key)}", expanded=False):
+                if result['status'] == 'success':
+                    st.success("✅ API call successful")
+                    st.json(result['data'])
+                else:
+                    st.error(f"❌ API call failed: {result['message']}")
+    
+    # Clear results button
+    if st.button("🗑️ Clear Results"):
+        st.session_state.api_results = {}
+        st.experimental_rerun()
+    
+    # JavaScript to handle button clicks from the flow
+    st.markdown("""
+    <script>
+    window.addEventListener('message', function(event) {
+        if (event.data.type === 'api_call') {
+            // Trigger the corresponding Streamlit button
+            const apiMap = {
+                'api1': 'btn1',
+                'api2': 'btn2', 
+                'api3': 'btn3',
+                'api4': 'btn4'
+            };
+            
+            const buttonId = apiMap[event.data.api];
+            if (buttonId) {
+                const button = window.parent.document.querySelector(`[data-testid="baseButton-secondary"][key="${buttonId}"]`);
+                if (button) {
+                    button.click();
+                }
+            }
+        }
+    });
+    </script>
+    """, unsafe_allow_html=True)
+
+if __name__ == "__main__":
+    main()
