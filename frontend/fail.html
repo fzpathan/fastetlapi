@@ -1,0 +1,79 @@
+Sure! Here's a basic HTML email template you can use in your Python script to send an email when a script fails. This version includes placeholders for the script name, timestamp, and error message (or reason for failure), which you can dynamically populate.
+
+
+---
+
+✅ HTML Email Template (Script Failure Notification)
+
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Script Failure Notification</title>
+</head>
+<body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px;">
+    <div style="max-width: 600px; margin: auto; background-color: white; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1);">
+        <div style="background-color: #d9534f; color: white; padding: 20px; border-top-left-radius: 8px; border-top-right-radius: 8px;">
+            <h2 style="margin: 0;">🚨 Script Execution Failed</h2>
+        </div>
+        <div style="padding: 20px;">
+            <p><strong>Script:</strong> {{script_name}}</p>
+            <p><strong>Timestamp:</strong> {{timestamp}}</p>
+            <p><strong>Reason:</strong></p>
+            <pre style="background-color: #f8f9fa; padding: 10px; border-left: 5px solid #d9534f; color: #333;">
+{{error_message}}
+            </pre>
+            <p>Please check the logs and take necessary actions.</p>
+        </div>
+        <div style="background-color: #f1f1f1; padding: 15px; text-align: center; font-size: 12px; color: #888;">
+            This is an automated message from your monitoring system.
+        </div>
+    </div>
+</body>
+</html>
+
+
+---
+
+🔄 Replace Placeholders Dynamically in Python
+
+Here’s an example of how to use this with Python:
+
+from datetime import datetime
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+# Sample data
+script_name = "daily_data_pipeline.py"
+timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+error_message = "FileNotFoundError: data/input.csv not found"
+
+# Load HTML and replace placeholders
+with open("template.html") as f:
+    html_template = f.read()
+
+html_content = html_template \
+    .replace("{{script_name}}", script_name) \
+    .replace("{{timestamp}}", timestamp) \
+    .replace("{{error_message}}", error_message)
+
+# Email setup
+msg = MIMEMultipart('alternative')
+msg['Subject'] = "❌ Script Failed: " + script_name
+msg['From'] = "alert@example.com"
+msg['To'] = "you@example.com"
+
+msg.attach(MIMEText(html_content, 'html'))
+
+# Send email
+with smtplib.SMTP('smtp.example.com', 587) as server:
+    server.starttls()
+    server.login("username", "password")
+    server.sendmail(msg['From'], msg['To'], msg.as_string())
+
+
+---
+
+Would you like the HTML template embedded directly into the Python script instead of as a separate file?
+
