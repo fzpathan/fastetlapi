@@ -43,7 +43,7 @@ Then add Tailwind to your CSS:
 
 ---
 
-🧱 Usage
+## 🧱 Usage
 
 1. Import the component
 
@@ -71,7 +71,7 @@ const data = [
 
 ---
 
-🧪 Component Props
+## 🧪 Component Props
 
 Prop	Type	Required	Description
 
@@ -89,7 +89,7 @@ storageKey	string	❌	Key used for saving layout state
 
 ---
 
-📤 Features in Action
+## 📤 Features in Action
 
 Long text fields auto-wrap:
 
@@ -117,7 +117,7 @@ Downloads visible data as .csv file
 
 ---
 
-🧰 Developer Notes
+## 🧰 Developer Notes
 
 Built with:
 
@@ -136,7 +136,7 @@ Component file: DynamicAgGrid.tsx
 
 ---
 
-📁 Project Structure
+## 📁 Project Structure
 
 src/
 ├── components/
@@ -148,21 +148,21 @@ src/
 
 ---
 
-📜 License
+## 📜 License
 
 MIT — Feel free to use and customize!
 
 
 ---
 
-🤝 Contributions
+## 🤝 Contributions
 
 If you find a bug or have a feature request, feel free to open an issue or submit a PR.
 
 
 ---
 
-✨ Author
+## ✨ Author
 
 You — powered by AG Grid + React + ChatGPT 😄
 
