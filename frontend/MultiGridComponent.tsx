@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { AgGridReact } from 'ag-grid-react';
 import {
   ColDef,
@@ -9,7 +9,7 @@ import {
 import 'ag-grid-community/styles/ag-grid.css';
 import 'ag-grid-community/styles/ag-theme-alpine.css';
 
-// ✅ Tooltip
+// ✅ Tooltip component
 const CustomTooltip: React.FC<ITooltipParams> = ({ value }) => {
   const text = String(value || '');
   const maxLength = 200;
@@ -20,79 +20,62 @@ const CustomTooltip: React.FC<ITooltipParams> = ({ value }) => {
   );
 };
 
-// ✅ Row data type
-interface RowDataType {
-  id: number;
-  name: string;
-  description: string;
-  shortNote: string;
-  comments: string;
-}
-
-type ViewType = 'full' | 'commentsOnly' | 'summary';
-
 const MultiGridComponent: React.FC = () => {
-  const gridRef = useRef<AgGridReact<RowDataType>>(null);
-  const [rowData, setRowData] = useState<RowDataType[]>([]);
+  const gridRef = useRef<AgGridReact>(null);
+  const [rowData, setRowData] = useState<any[]>([]);
   const [columnDefs, setColumnDefs] = useState<ColDef[]>([]);
-  const [selectedView, setSelectedView] = useState<ViewType>('full');
+  const [layoutKey, setLayoutKey] = useState('default');
 
+  // ✅ Simulated dynamic dataset
   useEffect(() => {
-    const data: RowDataType[] = Array.from({ length: 1000 }).map((_, i) => ({
-      id: i + 1,
-      name: `Item ${i + 1}`,
-      description: `This is a long description for row ${i + 1}. `.repeat(10),
-      shortNote: `Note ${i + 1}`,
-      comments: i % 10 === 0 ? `Long comment: `.repeat(30) : `Short comment`,
-    }));
+    const generateData = () => {
+      const rows = [];
+      for (let i = 0; i < 1000; i++) {
+        rows.push({
+          [`col_${i % 10}`]: `Short ${i}`,
+          [`text_block_${i % 3}`]: i % 5 === 0 ? 'This is a very long cell text '.repeat(20) : `Text ${i}`,
+        });
+      }
+      return rows;
+    };
+
+    const data = generateData();
     setRowData(data);
-  }, []);
 
-  useEffect(() => {
-    if (rowData.length === 0) return;
+    if (data.length > 0) {
+      const longColumns = new Set<string>();
 
-    const longTextCols = new Set<string>();
-    for (const row of rowData) {
-      for (const [key, value] of Object.entries(row)) {
-        if (String(value).length > 300) {
-          longTextCols.add(key);
+      for (const row of data) {
+        for (const [key, value] of Object.entries(row)) {
+          if (String(value).length > 300) {
+            longColumns.add(key);
+          }
         }
       }
+
+      const dynamicCols: ColDef[] = Object.keys(data[0]).map((key) => {
+        const isLong = longColumns.has(key);
+        return {
+          field: key,
+          headerName: key,
+          width: 200,
+          wrapText: isLong,
+          autoHeight: isLong,
+          tooltipField: key,
+          tooltipComponent: 'customTooltip',
+          pinned: undefined, // No default pin
+          cellStyle: isLong ? { whiteSpace: 'normal' } : undefined,
+          sortable: true,
+          filter: true,
+          resizable: true,
+        };
+      });
+
+      setColumnDefs(dynamicCols);
     }
+  }, []);
 
-    let fields: (keyof RowDataType)[];
-    switch (selectedView) {
-      case 'commentsOnly':
-        fields = ['id', 'comments'];
-        break;
-      case 'summary':
-        fields = ['id', 'name', 'shortNote'];
-        break;
-      default:
-        fields = ['id', 'name', 'description', 'shortNote', 'comments'];
-    }
-
-    const generatedCols: ColDef[] = fields.map((key) => {
-      const isLong = longTextCols.has(key);
-      return {
-        field: key,
-        headerName: key.charAt(0).toUpperCase() + key.slice(1),
-        width: 200,
-        wrapText: isLong,
-        autoHeight: isLong,
-        tooltipField: key,
-        tooltipComponent: 'customTooltip',
-        pinned: key === 'id' ? 'left' : undefined,
-        cellStyle: isLong ? { whiteSpace: 'normal' } : undefined,
-        sortable: true,
-        filter: true,
-        resizable: true,
-      };
-    });
-
-    setColumnDefs(generatedCols);
-  }, [selectedView, rowData]);
-
+  // ✅ Default column settings
   const defaultColDef: ColDef = useMemo(() => ({
     resizable: true,
     sortable: true,
@@ -107,50 +90,34 @@ const MultiGridComponent: React.FC = () => {
   const saveLayout = () => {
     const state = gridRef.current?.columnApi.getColumnState();
     if (state) {
-      localStorage.setItem(`layout-${selectedView}`, JSON.stringify(state));
-      console.log(`✅ Layout saved for "${selectedView}"`);
+      localStorage.setItem(`layout-${layoutKey}`, JSON.stringify(state));
+      console.log('✅ Layout saved');
     }
   };
 
   const resetLayout = () => {
-    localStorage.removeItem(`layout-${selectedView}`);
-    setSelectedView((prev) => prev); // force re-render
-    console.log(`🧹 Layout reset for "${selectedView}"`);
+    localStorage.removeItem(`layout-${layoutKey}`);
+    setLayoutKey(prev => prev + '_reset'); // trigger remount
+    console.log('🧹 Layout reset');
   };
 
   const onGridReady = (params: GridReadyEvent) => {
-    const saved = localStorage.getItem(`layout-${selectedView}`);
+    const saved = localStorage.getItem(`layout-${layoutKey}`);
     if (saved) {
       const parsed = JSON.parse(saved) as ColumnState[];
       params.columnApi.applyColumnState({
         state: parsed,
         applyOrder: true,
       });
+      console.log('🔁 Layout restored');
     }
   };
 
   return (
     <div className="w-full overflow-x-auto p-4">
-      {/* ✅ Tabs */}
+      {/* Header Controls */}
       <div className="flex justify-between items-center mb-4">
-        <div className="flex space-x-3">
-          {(['full', 'commentsOnly', 'summary'] as ViewType[]).map((view) => (
-            <button
-              key={view}
-              className={`px-4 py-2 rounded-md text-sm font-medium transition
-                ${selectedView === view
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-200 text-gray-800 hover:bg-gray-300'}`}
-              onClick={() => setSelectedView(view)}
-            >
-              {view === 'full' && 'Full View'}
-              {view === 'commentsOnly' && 'Comments Only'}
-              {view === 'summary' && 'Summary'}
-            </button>
-          ))}
-        </div>
-
-        {/* ✅ Action Buttons */}
+        <div className="text-lg font-semibold">📊 Dynamic Grid</div>
         <div className="flex space-x-2">
           <button
             onClick={handleExport}
@@ -173,9 +140,9 @@ const MultiGridComponent: React.FC = () => {
         </div>
       </div>
 
-      {/* ✅ AG Grid */}
+      {/* AG Grid */}
       <div className="ag-theme-alpine w-full" style={{ height: '600px' }}>
-        <AgGridReact<RowDataType>
+        <AgGridReact
           ref={gridRef}
           rowData={rowData}
           columnDefs={columnDefs}
@@ -187,7 +154,7 @@ const MultiGridComponent: React.FC = () => {
           animateRows={true}
           onGridReady={onGridReady}
           enableBrowserTooltips={false}
-          key={selectedView}
+          key={layoutKey} // Force re-mount when layout is reset
         />
       </div>
     </div>
