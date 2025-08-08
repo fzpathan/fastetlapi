@@ -1,0 +1,94 @@
+Of course! To get high-quality, structured documentation from a large language model like Phi-4, you need to provide a detailed and well-structured prompt. You are essentially creating a template for the AI to fill in.
+Here is a comprehensive prompt template you can use. It is designed to be a "zero-shot" prompt, meaning you can just copy, paste, and fill in your code without needing to train the model with examples first.
+The Master Prompt Template
+Below is a template you can use directly. I will explain the purpose of each section after the template.
+# ROLE AND GOAL
+
+You are an expert Senior Software Engineer and Technical Writer. Your task is to create comprehensive, clear, and user-friendly documentation for the provided code snippet. The documentation should be structured in Markdown format.
+
+# DOCUMENTATION REQUIREMENTS
+
+For the code I provide below, generate documentation that includes the following sections for EACH class and/or function:
+
+1.  **Name (`Class`/`Function`):** The name of the class or function, clearly identified.
+2.  **Objective:** A concise, one or two-sentence summary of what the class or function's primary purpose is. What problem does it solve?
+3.  **How it is Used:** A paragraph explaining the typical use case and how a developer would interact with it in a project.
+4.  **Parameters / Arguments:** A detailed breakdown of all arguments or parameters. Present this in a Markdown table with the following columns:
+    * `Argument`: The name of the parameter.
+    * `Type`: The expected data type (e.g., `int`, `string`, `list`, `custom object`).
+    * `Description`: A clear explanation of what this parameter represents.
+    * `Required`: State if it's "Yes" or "No". If "No", mention the default value.
+5.  **Returns:** A description of the value or object that the function returns. Include its data type. If the function does not return anything (e.g., modifies an object in-place), state that.
+6.  **Usage Example (Code Snippet):** A clear, self-contained, and runnable code snippet that demonstrates how to use the function or class. Include necessary imports and sample data. Add comments in the code to explain the steps. Show the expected output.
+7.  **Logical Flowchart (Mermaid Syntax):** Generate a flowchart representing the internal logic of the function (e.g., decision points, loops, and processing steps). The flowchart MUST be written in Mermaid.js syntax, enclosed in a `mermaid` code block.
+8.  **Custom Use Case Example:**
+    ---
+    [YOUR CUSTOM USE CASE DESCRIPTION AND EXAMPLE CODE GOES HERE. IF YOU HAVE NO CUSTOM EXAMPLE, PLEASE WRITE 'N/A'.]
+    ---
+
+# CODE TO DOCUMENT
+
+```python
+[ ### PASTE YOUR CODE HERE ### ]
+
+START DOCUMENTATION
+
+***
+
+### How to Use the Prompt
+
+1.  **Copy the entire text** from the box above.
+2.  **Paste your code** into the section marked `[ ### PASTE YOUR CODE HERE ### ]`. Make sure your code is complete and correctly formatted.
+3.  **(Optional)** If you have a specific example you want the AI to include, replace the line `[YOUR CUSTOM USE CASE DESCRIPTION AND EXAMPLE CODE GOES HERE...]` with your own notes and code. The AI will then incorporate it into the final documentation. If you don't have one, you can just leave it, and the AI will handle it.
+4.  **Submit the entire prompt** to the language model.
+
+---
+
+### Why This Prompt is Effective
+
+* **Role-Playing (`You are an expert...`):** This sets the context and encourages the model to produce output of a higher quality, adopting the persona of an expert.
+* **Clear Structure (`# DOCUMENTATION REQUIREMENTS`):** By using Markdown headers and numbered lists, you are giving the AI a precise structure to follow. This prevents it from giving you a single, messy block of text.
+* **Specificity is Key:**
+    * Instead of just asking for "arguments," you specify a **Markdown table format** with exact column headers (`Argument`, `Type`, `Description`, `Required`). This forces structured, easy-to-read output.
+    * You explicitly ask for a **runnable code snippet** with comments and expected output, which is far more useful than a simple function call.
+* **Handles Complex Requests (Flowchart):** A language model cannot *draw* a flowchart. However, it can generate code that *describes* a flowchart. **Mermaid.js** is a widely supported syntax (used on GitHub, GitLab, and many documentation tools) for creating diagrams from text. By asking for Mermaid syntax, you get a portable and renderable flowchart.
+    * **To view the flowchart:** You can paste the generated `mermaid` code into a free online Mermaid editor (like `mermaid.live`) or into any Markdown editor that supports it.
+* **Customization Placeholder (`[YOUR CUSTOM USE CASE...]`):** This gives you an easy way to inject your own specific examples or context, making the final documentation even more tailored to your needs. The AI is instructed on how to handle it if you provide something or if you leave it blank.
+
+### Example Walkthrough
+
+Let's say your code is:
+
+```python
+def calculate_order_total(items, discount_code=None):
+    """Calculates the total price of a list of items with an optional discount."""
+    subtotal = sum(item['price'] * item['quantity'] for item in items)
+    if discount_code:
+        if discount_code == "SAVE10":
+            return subtotal * 0.90
+        elif discount_code == "SAVE20":
+            return subtotal * 0.80
+    return subtotal
+
+You would paste this into the prompt. The AI would then generate a full documentation page with a section for the calculate_order_total function, including a summary, a Markdown table for its parameters (items, discount_code), a description of the float it returns, a code example showing how to use it, and a Mermaid flowchart detailing the if/elif/else logic.
+You are an expert technical writer and Python developer.
+Your task is to create **clear, complete, and professional documentation** for the following code.
+
+The documentation must follow this structure for **each function, method, and class** in the code:
+
+1. **Name** – The exact name of the function, method, or class.
+2. **Purpose / Objective** – A concise explanation of what it does and why it exists.
+3. **Usage Context** – How and when this function or class is intended to be used in a larger system.
+4. **Arguments / Parameters** – For each parameter:
+    - Name
+    - Data type
+    - Whether it’s required or optional
+    - Default value (if any)
+    - Description of its role
+5. **Return Value(s)** – Data type and meaning.
+6. **Flow of Execution** – Step-by-step breakdown of what happens inside the function/class, optionally represented as a **flowchart** (ASCII or Mermaid format).
+7. **Example Use Case** – Provide at least one realistic usage example.
+8. **Additional Notes** – Performance considerations, potential pitfalls, and related functions.
+9. **Placeholders for Extra Examples** – Leave `[Add your own example here]`.
+
+Here is the code to document:
