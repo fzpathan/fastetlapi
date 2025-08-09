@@ -2,124 +2,116 @@ import re
 import pandas as pd
 import numpy as np
 
-class F:
+class Formula:
     def __init__(self, df: pd.DataFrame):
         self.df = df
 
+    # ----------- NULL CHECKS -----------
+    @staticmethod
+    def is_null(series: pd.Series) -> pd.Series:
+        """Custom null detection"""
+        return (
+            series.isna()
+            | (series.astype(str).str.strip() == "")
+            | (series.astype(str).str.lower() == "null")
+        )
+
+    @staticmethod
+    def is_not_null(series: pd.Series) -> pd.Series:
+        """Custom not-null detection"""
+        return ~Formula.is_null(series)
+
+    # ----------- COLUMN REPLACEMENT -----------
     def _replace_column_refs(self, formula: str) -> str:
-        """Replace bare column names with @df['col']"""
+        """Replace bare column names with df['col']"""
         col_pattern = r'\b({})\b'.format('|'.join(map(re.escape, self.df.columns)))
-        return re.sub(col_pattern, lambda m: f"@df[{repr(m.group(0))}]", formula)
+        return re.sub(col_pattern, lambda m: f"df[{repr(m.group(0))}]", formula)
 
+    # ----------- SLICE HANDLING -----------
+    def _process_slices(self, formula: str) -> str:
+        """
+        Convert (df['col'])[:3] or (df['col'])[1:5] to df['col'].str.slice(start, stop)
+        """
+        slice_pattern = re.compile(r"(df\[['\"]?\w+['\"]?\])\s*\[\s*(\d*)\s*:\s*(\d*)\s*\]")
+        
+        def repl(match):
+            col_ref = match.group(1)
+            start = match.group(2) if match.group(2) != "" else "None"
+            stop = match.group(3) if match.group(3) != "" else "None"
+            return f"{col_ref}.str.slice({start}, {stop})"
+        
+        return slice_pattern.sub(repl, formula)
+
+    # ----------- NULL CHECKS REPLACEMENT -----------
     def _process_null_checks(self, formula: str) -> str:
-        """Convert IsNull/IsNotNull"""
-        formula = re.sub(r"IsNull\((@df\[['\"]?\w+['\"]?\])\)", r"\1.isnull()", formula)
-        formula = re.sub(r"IsNotNull\((@df\[['\"]?\w+['\"]?\])\)", r"\1.notnull()", formula)
+        """Replace IsNull / IsNotNull with custom calls"""
+        formula = re.sub(
+            r"IsNull\((df\[['\"]?\w+['\"]?\])\)",
+            r"Formula.is_null(\1)",
+            formula
+        )
+        formula = re.sub(
+            r"IsNotNull\((df\[['\"]?\w+['\"]?\])\)",
+            r"Formula.is_not_null(\1)",
+            formula
+        )
         return formula
 
+    # ----------- STRING METHODS HANDLING -----------
     def _process_str_methods(self, formula: str) -> str:
-        """
-        Dynamically convert col.method(...) → col.str.method(...)
-        For any method that exists in pandas.Series.str
-        """
-        str_methods = dir(pd.Series([]).str)
-        method_pattern = r"(\@df\[['\"]?\w+['\"]?\])\.(%s)\(" % "|".join(map(re.escape, str_methods))
-        return re.sub(method_pattern, r"\1.str.\2(", formula)
+        """Ensure string methods and __contains__ are prefixed with .str."""
+        str_methods = set(dir(pd.Series([], dtype="object").str))
 
+        # Handle __contains__ → .str.contains
+        formula = re.sub(
+            r"(df\[['\"]?\w+['\"]?\])\.__contains__\(",
+            r"\1.str.contains(",
+            formula
+        )
+
+        # Handle standard string methods
+        method_pattern = re.compile(r"(df\[['\"]?\w+['\"]?\])\.(\w+)\(")
+
+        def repl(match):
+            col_ref = match.group(1)
+            method = match.group(2)
+            if method in str_methods:
+                return f"{col_ref}.str.{method}("
+            else:
+                return match.group(0)
+
+        return method_pattern.sub(repl, formula)
+
+    # ----------- INLINE IF-ELSE TO np.select -----------
     def _convert_ifelse(self, formula: str) -> str:
-        """
-        Convert Python ternary:
-        A if cond1 else B if cond2 else C
-        → np.select([cond1, cond2], [A, B], default=C)
-        """
-        # This pattern only works for chained two-condition ternary; can be extended
-        m = re.match(r"\s*(.+?)\s+if\s+(.+?)\s+else\s+(.+?)\s+if\s+(.+?)\s+else\s+(.+)", formula)
-        if m:
-            val1, cond1, val2, cond2, val3 = m.groups()
-            return f"np.select([{cond1}, {cond2}], [{val1}, {val2}], default={val3})"
-        return formula
+        """Convert any nested inline if-else to np.select"""
+        # Tokenize inline if-else
+        pattern = re.compile(r"(.+?)\s+if\s+(.+?)\s+else\s+(.+)")
+        conds, vals = [], []
+        while True:
+            m = pattern.fullmatch(formula)
+            if not m:
+                default_val = formula.strip()
+                break
+            val, cond, rest = m.groups()
+            conds.append(cond.strip())
+            vals.append(val.strip())
+            formula = rest.strip()
+        return f"np.select([{', '.join(conds)}], [{', '.join(vals)}], default={default_val})"
 
+    # ----------- MAIN EVALUATOR -----------
     def evaluate(self, formula: str, output_col: str):
         safe_formula = self._replace_column_refs(formula)
+        safe_formula = self._process_slices(safe_formula)
         safe_formula = self._process_null_checks(safe_formula)
         safe_formula = self._process_str_methods(safe_formula)
-        safe_formula = self._convert_ifelse(safe_formula)
+        if " if " in safe_formula:
+            safe_formula = self._convert_ifelse(safe_formula)
 
-        local_dict = {"df": self.df, "np": np}
-        result = pd.eval(safe_formula, local_dict=local_dict, engine="python")
-        self.df[output_col] = result
+        local_dict = {
+            "df": self.df,
+            "np": np,
+            "Formula": Formula
+        }
+        self.df[output_col] = eval(safe_formula, {}, local_dict)
         return self.df
-
-
-import pandas as pd
-import numpy as np
-import string
-import random
-from datetime import datetime, timedelta
-
-def random_dataframe(schema: dict, nrows: int, seed: int = None) -> pd.DataFrame:
-    """
-    Generate a random DataFrame given column names, datatypes, and row count.
-    
-    Parameters:
-        schema (dict): {col_name: dtype} where dtype is one of:
-                       'int', 'float', 'str', 'bool', 'date', 'datetime'
-        nrows (int): Number of rows
-        seed (int): Optional random seed for reproducibility
-        
-    Returns:
-        pd.DataFrame
-    """
-    if seed is not None:
-        np.random.seed(seed)
-        random.seed(seed)
-        
-    df_data = {}
-    
-    for col, dtype in schema.items():
-        if dtype == "int":
-            df_data[col] = np.random.randint(0, 100, nrows)
-        elif dtype == "float":
-            df_data[col] = np.random.uniform(0, 100, nrows).round(2)
-        elif dtype == "str":
-            df_data[col] = [
-                ''.join(random.choices(string.ascii_lowercase, k=5))
-                for _ in range(nrows)
-            ]
-        elif dtype == "bool":
-            df_data[col] = np.random.choice([True, False], nrows)
-        elif dtype == "date":
-            start_date = datetime(2000, 1, 1)
-            df_data[col] = [
-                (start_date + timedelta(days=random.randint(0, 7300))).date()
-                for _ in range(nrows)
-            ]
-        elif dtype == "datetime":
-            start_date = datetime(2000, 1, 1)
-            df_data[col] = [
-                start_date + timedelta(days=random.randint(0, 7300),
-                                       seconds=random.randint(0, 86400))
-                for _ in range(nrows)
-            ]
-        else:
-            raise ValueError(f"Unsupported dtype: {dtype}")
-    
-    return pd.DataFrame(df_data)
-
-df = pd.DataFrame({
-    "col1": [1, None, None, 4],
-    "col2": ["xa", "xb", "ya", "za"],
-    "col3": [10, 20, 30, 40]
-})
-
-f = F(df)
-
-formula_str = "1 if IsNotNull(col1) else 2 if col2.startswith('x') else col3"
-
-result_df = f.evaluate(formula_str, "result")
-print(result_df)
-
-# Another example: using endswith + slice
-formula_str2 = "100 if col2.endswith('a') else col3"
-result_df2 = f.evaluate(formula_str2, "result2")
-print(result_df2)
