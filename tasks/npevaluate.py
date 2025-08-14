@@ -51,3 +51,28 @@ df['new'] = ne.evaluate(expr, local_dict=local_dict)
 
 print("Final Expr:", expr)
 print(df)
+import json
+
+def flatten_json(obj, parent_key='', sep='.'):
+    items = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_key = f"{parent_key}{sep}{k}" if parent_key else k
+            items.update(flatten_json(v, new_key, sep=sep))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            new_key = f"{parent_key}{sep}{i}" if parent_key else str(i)
+            items.update(flatten_json(v, new_key, sep=sep))
+    else:
+        items[parent_key] = obj
+    return items
+
+# Load once
+with open("data.json") as f:
+    data = json.load(f)
+
+# Flatten once
+flat_data = flatten_json(data)
+
+# Search is now just a dict lookup
+print(flat_data.get("user.details.address.city"))
