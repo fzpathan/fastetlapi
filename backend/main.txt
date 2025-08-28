@@ -1,0 +1,1528 @@
+import asyncio
+import json
+import logging
+import multiprocessing as mp
+import signal
+import time
+import traceback
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from enum import Enum
+from multiprocessing import Manager, Process, Queue
+from typing import Any, Dict, List, Optional, Union
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field, validator
+import uvicorn
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Data Models
+# ============================================================================
+
+class ProcessStatus(str, Enum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING" 
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+class ProcessType(str, Enum):
+    READ = "read"
+    TRANSFORM = "transform"
+    ENRICH = "enrich"
+    GENERATE = "generate"
+
+class APIError(BaseModel):
+    error_code: str
+    message: str
+    details: Optional[str] = None
+    suggestion: Optional[str] = None
+
+class APIResponse(BaseModel):
+    success: bool
+    data: Optional[Any] = None
+    error: Optional[APIError] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+class ProcessProgress(BaseModel):
+    process_id: str
+    progress_percentage: float = Field(ge=0, le=100)
+    current_stage: str
+    estimated_completion: Optional[datetime] = None
+    logs: List[str] = []
+    stages_completed: List[str] = []
+    current_stage_details: Optional[str] = None
+
+class ProcessSchema(BaseModel):
+    name: str
+    description: str
+    parameters: Dict[str, Any]
+    estimated_duration: int  # in seconds
+    output_format: str
+    stages: List[str]
+    required_params: List[str] = []
+
+class ProcessRequest(BaseModel):
+    parameters: Dict[str, Any] = {}
+    
+    @validator('parameters')
+    def validate_parameters(cls, v):
+        return v
+
+class ProcessInfo(BaseModel):
+    process_id: str
+    name: str
+    status: ProcessStatus
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    data_count: Optional[int] = None
+    progress: Optional[ProcessProgress] = None
+    duration_seconds: Optional[float] = None
+
+class ProcessResult(BaseModel):
+    process_id: str
+    process_name: str
+    status: ProcessStatus
+    result: Optional[Dict[str, Any]] = None
+    data_count: Optional[int] = None
+    completed_at: Optional[datetime] = None
+    duration_seconds: Optional[float] = None
+    metadata: Dict[str, Any] = {}
+
+# ============================================================================
+# Process Implementations
+# ============================================================================
+
+class DataProcessor:
+    """Base class for all data processors"""
+    
+    def __init__(self, process_id: str, progress_queue: Queue):
+        self.process_id = process_id
+        self.progress_queue = progress_queue
+        self.stages = []
+        
+    def update_progress(self, stage: str, percentage: float, details: str = None, logs: List[str] = None):
+        """Update process progress"""
+        try:
+            progress = {
+                'process_id': self.process_id,
+                'current_stage': stage,
+                'progress_percentage': percentage,
+                'current_stage_details': details,
+                'logs': logs or [],
+                'timestamp': datetime.now().isoformat()
+            }
+            self.progress_queue.put(progress)
+        except Exception as e:
+            logger.error(f"Failed to update progress: {e}")
+
+class ReadProcessor(DataProcessor):
+    """Data reading processor"""
+    
+    def __init__(self, process_id: str, progress_queue: Queue):
+        super().__init__(process_id, progress_queue)
+        self.stages = ["initializing", "connecting", "reading", "validating", "completed"]
+    
+    def execute(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute read process"""
+        
+        # Stage 1: Initializing
+        self.update_progress("initializing", 10, "Setting up data source connections")
+        time.sleep(1)
+        
+        # Stage 2: Connecting
+        self.update_progress("connecting", 25, "Establishing connection to data source")
+        time.sleep(2)
+        
+        # Stage 3: Reading
+        self.update_progress("reading", 60, "Reading data from source")
+        
+        # Simulate reading data
+        source_type = parameters.get('source_type', 'database')
+        batch_size = parameters.get('batch_size', 100)
+        total_records = parameters.get('total_records', 1000)
+        
+        data = []
+        for i in range(total_records):
+            if i % (total_records // 4) == 0:
+                progress = 60 + (i / total_records) * 30
+                self.update_progress("reading", progress, f"Read {i}/{total_records} records")
+            
+            record = {
+                "id": i,
+                "source_type": source_type,
+                "data_field_1": f"value_{i}",
+                "data_field_2": i * 1.5,
+                "timestamp": datetime.now().isoformat(),
+                "batch_id": i // batch_size,
+                "record_metadata": {
+                    "created_by": "read_processor",
+                    "version": "1.0",
+                    "quality_score": round(0.8 + (i % 20) / 100, 2)
+                }
+            }
+            data.append(record)
+            
+            if i % 100 == 0:
+                time.sleep(0.1)
+        
+        # Stage 4: Validating
+        self.update_progress("validating", 95, "Validating read data")
+        time.sleep(1)
+        
+        # Stage 5: Completed
+        self.update_progress("completed", 100, f"Successfully read {len(data)} records")
+        
+        return {
+            "operation": "read",
+            "source_type": source_type,
+            "records": data,
+            "metadata": {
+                "total_records": len(data),
+                "batch_size": batch_size,
+                "source_info": {
+                    "type": source_type, 
+                    "connected_at": datetime.now().isoformat(),
+                    "connection_id": f"conn_{uuid.uuid4().hex[:8]}"
+                },
+                "data_quality": {
+                    "completeness": 99.5,
+                    "accuracy": 98.2,
+                    "validity": 99.8
+                }
+            }
+        }
+
+class TransformProcessor(DataProcessor):
+    """Data transformation processor"""
+    
+    def __init__(self, process_id: str, progress_queue: Queue):
+        super().__init__(process_id, progress_queue)
+        self.stages = ["preparing", "analyzing", "transforming", "optimizing", "completed"]
+    
+    def execute(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute transform process"""
+        
+        # Stage 1: Preparing
+        self.update_progress("preparing", 15, "Preparing transformation rules")
+        time.sleep(1)
+        
+        # Stage 2: Analyzing
+        self.update_progress("analyzing", 30, "Analyzing data structure")
+        time.sleep(2)
+        
+        # Stage 3: Transforming
+        self.update_progress("transforming", 70, "Applying transformations")
+        
+        # Simulate transformation
+        transform_type = parameters.get('transform_type', 'normalize')
+        total_records = parameters.get('total_records', 1000)
+        
+        transformed_data = []
+        for i in range(total_records):
+            if i % (total_records // 5) == 0:
+                progress = 30 + (i / total_records) * 40
+                self.update_progress("transforming", progress, f"Transformed {i}/{total_records} records")
+            
+            record = {
+                "transformed_id": f"T_{i:06d}",
+                "original_id": i,
+                "transform_type": transform_type,
+                "normalized_value": round((i * 2.5) / 100, 4),
+                "category": f"cat_{i % 10}",
+                "processed_at": datetime.now().isoformat(),
+                "transformation_rules": ["normalize", "categorize", "timestamp"],
+                "data_lineage": {
+                    "source_system": "read_processor",
+                    "transformation_id": f"trans_{uuid.uuid4().hex[:8]}",
+                    "applied_rules": ["rule_1", "rule_2", "rule_3"]
+                },
+                "quality_metrics": {
+                    "transformation_confidence": round(0.9 + (i % 10) / 100, 3),
+                    "data_integrity": True,
+                    "validation_status": "passed"
+                }
+            }
+            transformed_data.append(record)
+            
+            if i % 50 == 0:
+                time.sleep(0.05)
+        
+        # Stage 4: Optimizing
+        self.update_progress("optimizing", 85, "Optimizing transformed data")
+        time.sleep(1)
+        
+        # Stage 5: Completed
+        self.update_progress("completed", 100, f"Successfully transformed {len(transformed_data)} records")
+        
+        return {
+            "operation": "transform",
+            "transform_type": transform_type,
+            "records": transformed_data,
+            "metadata": {
+                "total_records": len(transformed_data),
+                "transformation_summary": {
+                    "rules_applied": ["normalize", "categorize", "timestamp"],
+                    "success_rate": 99.8,
+                    "failed_records": 2,
+                    "processed_at": datetime.now().isoformat(),
+                    "performance_metrics": {
+                        "avg_processing_time_ms": 1.2,
+                        "throughput_records_per_sec": 833
+                    }
+                }
+            }
+        }
+
+class EnrichProcessor(DataProcessor):
+    """Data enrichment processor"""
+    
+    def __init__(self, process_id: str, progress_queue: Queue):
+        super().__init__(process_id, progress_queue)
+        self.stages = ["loading", "matching", "enriching", "validating", "completed"]
+    
+    def execute(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute enrich process"""
+        
+        # Stage 1: Loading
+        self.update_progress("loading", 20, "Loading enrichment sources")
+        time.sleep(1.5)
+        
+        # Stage 2: Matching
+        self.update_progress("matching", 40, "Matching records with enrichment data")
+        time.sleep(2)
+        
+        # Stage 3: Enriching
+        self.update_progress("enriching", 75, "Applying data enrichment")
+        
+        # Simulate enrichment
+        enrichment_type = parameters.get('enrichment_type', 'demographic')
+        total_records = parameters.get('total_records', 1000)
+        
+        enriched_data = []
+        for i in range(total_records):
+            if i % (total_records // 3) == 0:
+                progress = 40 + (i / total_records) * 35
+                self.update_progress("enriching", progress, f"Enriched {i}/{total_records} records")
+            
+            record = {
+                "enriched_id": f"E_{i:06d}",
+                "base_id": i,
+                "enrichment_type": enrichment_type,
+                "demographic_data": {
+                    "age_group": f"group_{i % 5}",
+                    "location": f"region_{i % 20}",
+                    "segment": f"segment_{i % 8}",
+                    "income_bracket": f"bracket_{i % 6}"
+                },
+                "behavioral_data": {
+                    "activity_score": round(i * 0.1 % 10, 2),
+                    "engagement_level": ["low", "medium", "high"][i % 3],
+                    "last_activity": datetime.now().isoformat(),
+                    "interaction_count": i % 50,
+                    "preference_category": f"pref_{i % 12}"
+                },
+                "enrichment_confidence": round(0.7 + (i % 30) / 100, 2),
+                "enriched_at": datetime.now().isoformat(),
+                "enrichment_sources": [
+                    "demographic_service",
+                    "behavioral_analytics",
+                    "location_service"
+                ],
+                "data_completeness": {
+                    "demographic": round(0.8 + (i % 20) / 100, 2),
+                    "behavioral": round(0.9 + (i % 10) / 100, 2),
+                    "overall": round(0.85 + (i % 15) / 100, 2)
+                }
+            }
+            enriched_data.append(record)
+            
+            if i % 75 == 0:
+                time.sleep(0.08)
+        
+        # Stage 4: Validating
+        self.update_progress("validating", 90, "Validating enriched data quality")
+        time.sleep(1)
+        
+        # Stage 5: Completed
+        self.update_progress("completed", 100, f"Successfully enriched {len(enriched_data)} records")
+        
+        return {
+            "operation": "enrich",
+            "enrichment_type": enrichment_type,
+            "records": enriched_data,
+            "metadata": {
+                "total_records": len(enriched_data),
+                "enrichment_summary": {
+                    "sources_used": ["demographic_db", "behavioral_db", "location_service"],
+                    "avg_confidence": 0.85,
+                    "match_rate": 95.2,
+                    "enrichment_coverage": {
+                        "demographic": 92.3,
+                        "behavioral": 87.1,
+                        "location": 96.8
+                    },
+                    "processed_at": datetime.now().isoformat(),
+                    "api_calls_made": 1500,
+                    "cache_hit_rate": 78.5
+                }
+            }
+        }
+
+class GenerateProcessor(DataProcessor):
+    """Report/output generation processor"""
+    
+    def __init__(self, process_id: str, progress_queue: Queue):
+        super().__init__(process_id, progress_queue)
+        self.stages = ["planning", "aggregating", "formatting", "generating", "completed"]
+    
+    def execute(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute generate process"""
+        
+        # Stage 1: Planning
+        self.update_progress("planning", 18, "Planning report structure")
+        time.sleep(1)
+        
+        # Stage 2: Aggregating
+        self.update_progress("aggregating", 40, "Aggregating source data")
+        time.sleep(2)
+        
+        # Stage 3: Formatting
+        self.update_progress("formatting", 65, "Formatting output structure")
+        time.sleep(1.5)
+        
+        # Stage 4: Generating
+        self.update_progress("generating", 85, "Generating final output")
+        
+        # Simulate generation
+        output_type = parameters.get('output_type', 'summary_report')
+        total_records = parameters.get('total_records', 1000)
+        
+        generated_data = []
+        for i in range(total_records):
+            if i % (total_records // 2) == 0:
+                progress = 65 + (i / total_records) * 20
+                self.update_progress("generating", progress, f"Generated {i}/{total_records} output records")
+            
+            record = {
+                "report_id": f"R_{i:06d}",
+                "generated_at": datetime.now().isoformat(),
+                "output_type": output_type,
+                "summary_metrics": {
+                    "total_processed": i + 1,
+                    "success_rate": round(95 + (i % 5), 2),
+                    "avg_processing_time": round(2.5 + (i % 10) * 0.1, 2),
+                    "data_volume_mb": round((i + 1) * 0.001, 3)
+                },
+                "detailed_results": {
+                    "category_breakdown": {f"cat_{j}": i % (j + 1) for j in range(5)},
+                    "quality_scores": [round(0.8 + (i + j) * 0.01 % 0.2, 3) for j in range(3)],
+                    "trend_analysis": f"trend_{i % 4}",
+                    "anomaly_count": i % 15,
+                    "confidence_intervals": {
+                        "lower": round(0.7 + (i % 20) / 100, 2),
+                        "upper": round(0.9 + (i % 10) / 100, 2)
+                    }
+                },
+                "output_files": {
+                    "main_report": f"{output_type}_{i}.json",
+                    "summary": f"{output_type}_summary_{i}.csv",
+                    "charts": f"{output_type}_charts_{i}.png",
+                    "raw_data": f"{output_type}_raw_{i}.parquet"
+                },
+                "export_metadata": {
+                    "format": "multi-format",
+                    "compression": "gzip",
+                    "file_size_kb": round((i + 1) * 0.5, 1),
+                    "checksum": f"sha256_{uuid.uuid4().hex[:16]}"
+                },
+                "export_ready": True
+            }
+            generated_data.append(record)
+            
+            if i % 100 == 0:
+                time.sleep(0.05)
+        
+        # Stage 5: Completed
+        self.update_progress("completed", 100, f"Successfully generated {len(generated_data)} output records")
+        
+        return {
+            "operation": "generate",
+            "output_type": output_type,
+            "records": generated_data,
+            "metadata": {
+                "total_records": len(generated_data),
+                "generation_summary": {
+                    "output_formats": ["json", "csv", "png", "parquet"],
+                    "total_file_size_mb": round(len(generated_data) * 0.001, 2),
+                    "generation_time_seconds": 15.2,
+                    "export_ready": True,
+                    "generated_at": datetime.now().isoformat(),
+                    "report_sections": ["executive_summary", "detailed_analysis", "recommendations", "appendix"],
+                    "visualization_count": 12,
+                    "data_sources": ["read", "transform", "enrich"]
+                }
+            }
+        }
+
+# ============================================================================
+# Process Registry
+# ============================================================================
+
+class ProcessRegistry:
+    """Registry for all available processes"""
+    
+    def __init__(self):
+        self.processes = {
+            ProcessType.READ: {
+                "class": ReadProcessor,
+                "schema": ProcessSchema(
+                    name="Data Read",
+                    description="Read data from various sources (database, files, APIs)",
+                    parameters={
+                        "source_type": "database",
+                        "batch_size": 100,
+                        "total_records": 1000
+                    },
+                    estimated_duration=30,
+                    output_format="json",
+                    stages=["initializing", "connecting", "reading", "validating", "completed"],
+                    required_params=["source_type"]
+                )
+            },
+            ProcessType.TRANSFORM: {
+                "class": TransformProcessor,
+                "schema": ProcessSchema(
+                    name="Data Transform",
+                    description="Transform and normalize data according to business rules",
+                    parameters={
+                        "transform_type": "normalize",
+                        "total_records": 1000
+                    },
+                    estimated_duration=25,
+                    output_format="json",
+                    stages=["preparing", "analyzing", "transforming", "optimizing", "completed"],
+                    required_params=["transform_type"]
+                )
+            },
+            ProcessType.ENRICH: {
+                "class": EnrichProcessor,
+                "schema": ProcessSchema(
+                    name="Data Enrich",
+                    description="Enrich data with additional information from external sources",
+                    parameters={
+                        "enrichment_type": "demographic",
+                        "total_records": 1000
+                    },
+                    estimated_duration=35,
+                    output_format="json",
+                    stages=["loading", "matching", "enriching", "validating", "completed"],
+                    required_params=["enrichment_type"]
+                )
+            },
+            ProcessType.GENERATE: {
+                "class": GenerateProcessor,
+                "schema": ProcessSchema(
+                    name="Generate Report",
+                    description="Generate reports and final outputs from processed data",
+                    parameters={
+                        "output_type": "summary_report",
+                        "total_records": 1000
+                    },
+                    estimated_duration=20,
+                    output_format="json",
+                    stages=["planning", "aggregating", "formatting", "generating", "completed"],
+                    required_params=["output_type"]
+                )
+            }
+        }
+    
+    def get_process_class(self, process_type: ProcessType):
+        return self.processes.get(process_type, {}).get("class")
+    
+    def get_process_schema(self, process_type: ProcessType):
+        return self.processes.get(process_type, {}).get("schema")
+    
+    def get_all_schemas(self):
+        return {k.value: v["schema"] for k, v in self.processes.items()}
+
+# ============================================================================
+# WebSocket Connection Manager
+# ============================================================================
+
+class ConnectionManager:
+    """WebSocket connection manager"""
+    
+    def __init__(self):
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+    
+    async def connect(self, websocket: WebSocket, process_id: str):
+        await websocket.accept()
+        if process_id not in self.active_connections:
+            self.active_connections[process_id] = []
+        self.active_connections[process_id].append(websocket)
+        logger.info(f"WebSocket connected for process {process_id}")
+    
+    def disconnect(self, websocket: WebSocket, process_id: str):
+        if process_id in self.active_connections:
+            if websocket in self.active_connections[process_id]:
+                self.active_connections[process_id].remove(websocket)
+            if not self.active_connections[process_id]:
+                del self.active_connections[process_id]
+        logger.info(f"WebSocket disconnected for process {process_id}")
+    
+    async def send_personal_message(self, message: dict, process_id: str):
+        if process_id in self.active_connections:
+            disconnected = []
+            for connection in self.active_connections[process_id]:
+                try:
+                    await connection.send_json(message)
+                except Exception as e:
+                    logger.error(f"Failed to send message to WebSocket: {e}")
+                    disconnected.append(connection)
+            
+            # Remove disconnected connections
+            for conn in disconnected:
+                if conn in self.active_connections[process_id]:
+                    self.active_connections[process_id].remove(conn)
+
+# ============================================================================
+# Process Manager
+# ============================================================================
+
+class ProcessManager:
+    def __init__(self):
+        self.manager = Manager()
+        self.process_registry = self.manager.dict()
+        self.progress_queues = {}
+        self.active_processes = {}
+        self.max_concurrent_processes = mp.cpu_count()
+        self.cleanup_interval = 3600
+        self.registry = ProcessRegistry()
+        
+    def generate_process_id(self) -> str:
+        return str(uuid.uuid4())
+    
+    def get_active_process_count(self) -> int:
+        return len([p for p in self.active_processes.values() if p.is_alive()])
+    
+    def start_process(self, process_name: str, parameters: Dict[str, Any]) -> str:
+        """Start a new process"""
+        try:
+            # Validate process type
+            try:
+                process_type = ProcessType(process_name)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid process type: {process_name}. Available types: {[t.value for t in ProcessType]}"
+                )
+            
+            # Check capacity
+            if self.get_active_process_count() >= self.max_concurrent_processes:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Maximum concurrent processes reached"
+                )
+            
+            process_id = self.generate_process_id()
+            
+            # Create progress queue
+            progress_queue = Queue()
+            self.progress_queues[process_id] = progress_queue
+            
+            # Initialize process info
+            process_info = {
+                'process_id': process_id,
+                'name': process_name,
+                'status': ProcessStatus.PENDING.value,
+                'created_at': datetime.now().isoformat(),
+                'started_at': None,
+                'completed_at': None,
+                'result': None,
+                'error': None,
+                'data_count': None,
+                'parameters': parameters,
+                'progress': None,
+                'duration_seconds': None
+            }
+            
+            self.process_registry[process_id] = process_info
+            
+            # Start process
+            process = Process(
+                target=self._execute_process,
+                args=(process_id, process_type, parameters, progress_queue)
+            )
+            process.start()
+            self.active_processes[process_id] = process
+            
+            logger.info(f"Started process {process_id} for {process_name}")
+            return process_id
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to start process {process_name}: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to start process: {str(e)}")
+    
+    def _execute_process(self, process_id: str, process_type: ProcessType, 
+                        parameters: Dict[str, Any], progress_queue: Queue):
+        """Execute the actual process"""
+        start_time = time.time()
+        
+        try:
+            # Update status to running
+            process_info = dict(self.process_registry[process_id])
+            process_info['status'] = ProcessStatus.RUNNING.value
+            process_info['started_at'] = datetime.now().isoformat()
+            self.process_registry[process_id] = process_info
+            
+            logger.info(f"Process {process_id} ({process_type.value}) started execution")
+            
+            # Get processor class and execute
+            processor_class = self.registry.get_process_class(process_type)
+            if not processor_class:
+                raise Exception(f"No processor found for {process_type.value}")
+            
+            processor = processor_class(process_id, progress_queue)
+            result = processor.execute(parameters)
+            
+            # Calculate duration
+            duration = time.time() - start_time
+            
+            # Update with successful result
+            process_info = dict(self.process_registry[process_id])
+            process_info['status'] = ProcessStatus.COMPLETED.value
+            process_info['completed_at'] = datetime.now().isoformat()
+            process_info['result'] = result
+            process_info['data_count'] = len(result.get('records', []))
+            process_info['duration_seconds'] = round(duration, 2)
+            self.process_registry[process_id] = process_info
+            
+            logger.info(f"Process {process_id} completed successfully")
+            
+        except Exception as e:
+            duration = time.time() - start_time
+            error_msg = f"Process failed: {str(e)}"
+            logger.error(f"Process {process_id} failed: {error_msg}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            process_info = dict(self.process_registry[process_id])
+            process_info['status'] = ProcessStatus.FAILED.value
+            process_info['completed_at'] = datetime.now().isoformat()
+            process_info['error'] = error_msg
+            process_info['duration_seconds'] = round(duration, 2)
+            self.process_registry[process_id] = process_info
+        
+        finally:
+            # Clean up progress queue
+            if process_id in self.progress_queues:
+                del self.progress_queues[process_id]
+    
+    def get_process_status(self, process_id: str) -> ProcessInfo:
+        """Get process status"""
+        if process_id not in self.process_registry:
+            raise HTTPException(status_code=404, detail="Process not found")
+        
+        process_info = dict(self.process_registry[process_id])
+        
+        # Get latest progress if available
+        if process_id in self.progress_queues:
+            try:
+                while not self.progress_queues[process_id].empty():
+                    progress_data = self.progress_queues[process_id].get_nowait()
+                    process_info['progress'] = progress_data
+            except:
+                pass
+        
+        # Convert dates
+        process_info['created_at'] = datetime.fromisoformat(process_info['created_at'])
+        if process_info['started_at']:
+            process_info['started_at'] = datetime.fromisoformat(process_info['started_at'])
+        if process_info['completed_at']:
+            process_info['completed_at'] = datetime.fromisoformat(process_info['completed_at'])
+        
+        return ProcessInfo(**process_info)
+    
+    def get_process_result(self, process_id: str) -> ProcessResult:
+        """Get process result"""
+        process_info = self.get_process_status(process_id)
+        
+        if process_info.status == ProcessStatus.RUNNING:
+            raise HTTPException(status_code=202, detail="Process still running")
+        elif process_info.status == ProcessStatus.FAILED:
+            raise HTTPException(status_code=500, detail=f"Process failed: {process_info.error}")
+        elif process_info.status == ProcessStatus.PENDING:
+            raise HTTPException(status_code=202, detail="Process not started yet")
+        
+        return ProcessResult(
+            process_id=process_id,
+            process_name=process_info.name,
+            status=process_info.status,
+            result=process_info.result,
+            data_count=process_info.data_count,
+            completed_at=process_info.completed_at,
+            duration_seconds=process_info.duration_seconds,
+            metadata={
+                "created_at": process_info.created_at.isoformat(),
+                "started_at": process_info.started_at.isoformat() if process_info.started_at else None,
+                "parameters": dict(self.process_registry[process_id])['parameters']
+            }
+        )
+    
+    def cancel_process(self, process_id: str) -> bool:
+        """Cancel a running process"""
+        if process_id not in self.process_registry:
+            raise HTTPException(status_code=404, detail="Process not found")
+        
+        if process_id in self.active_processes:
+            process = self.active_processes[process_id]
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.kill()
+                
+                process_info = dict(self.process_registry[process_id])
+                process_info['status'] = ProcessStatus.CANCELLED.value
+                process_info['completed_at'] = datetime.now().isoformat()
+                self.process_registry[process_id] = process_info
+                
+                return True
+        
+        return False
+    
+    def list_processes(self, status_filter: Optional[ProcessStatus] = None, 
+                      limit: int = 100, offset: int = 0) -> List[ProcessInfo]:
+        """List processes with pagination"""
+        processes = []
+        for process_id, info in self.process_registry.items():
+            process_info = dict(info)
+            
+            # Apply status filter
+            if status_filter and process_info['status'] != status_filter.value:
+                continue
+            
+            # Convert dates
+            process_info['created_at'] = datetime.fromisoformat(process_info['created_at'])
+            if process_info['started_at']:
+                process_info['started_at'] = datetime.fromisoformat(process_info['started_at'])
+            if process_info['completed_at']:
+                process_info['completed_at'] = datetime.fromisoformat(process_info['completed_at'])
+            
+            processes.append(ProcessInfo(**process_info))
+        
+        # Sort by creation date (newest first)
+        processes.sort(key=lambda x: x.created_at, reverse=True)
+        
+        # Apply pagination
+        return processes[offset:offset + limit]
+    
+    def cleanup_completed_processes(self):
+        """Clean up old processes"""
+        current_time = datetime.now()
+        cleanup_threshold = current_time - timedelta(seconds=self.cleanup_interval)
+        
+        # Clean up process objects
+        to_remove = []
+        for process_id, process in self.active_processes.items():
+            if not process.is_alive():
+                process.join(timeout=1)
+                to_remove.append(process_id)
+        
+        for process_id in to_remove:
+            del self.active_processes[process_id]
+        
+        # Clean up old registry entries (keep for longer for history)
+        to_remove_registry = []
+        for process_id, info in list(self.process_registry.items()):
+            if (info.get('completed_at') and 
+                datetime.fromisoformat(info['completed_at']) < cleanup_threshold):
+                to_remove_registry.append(process_id)
+        
+        for process_id in to_remove_registry:
+            del self.process_registry[process_id]
+
+# ============================================================================
+# FastAPI Application
+# ============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager"""
+    # Startup
+    logger.info("Starting up FastAPI application")
+    
+    # Start cleanup task
+    async def cleanup_task():
+        while True:
+            try:
+                process_manager.cleanup_completed_processes()
+                await asyncio.sleep(300)  # Run every 5 minutes
+            except Exception as e:
+                logger.error(f"Cleanup task error: {str(e)}")
+    
+    asyncio.create_task(cleanup_task())
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down FastAPI application")
+
+# Initialize managers
+process_manager = ProcessManager()
+connection_manager = ConnectionManager()
+
+# Create FastAPI app
+app = FastAPI(
+    title="Production Process Management API",
+    description="Comprehensive process management system with WebSocket support for React frontend",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",  # React dev server
+        "http://localhost:3001",  # Alternative React port
+        "https://your-frontend-domain.com"  # Production domain
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# ============================================================================
+# WebSocket Endpoints
+# ============================================================================
+
+@app.websocket("/ws/{process_id}")
+async def websocket_endpoint(websocket: WebSocket, process_id: str):
+    """WebSocket endpoint for real-time process updates"""
+    await connection_manager.connect(websocket, process_id)
+    
+    try:
+        # Send initial status
+        try:
+            status = process_manager.get_process_status(process_id)
+            await connection_manager.send_personal_message(
+                {
+                    "type": "status", 
+                    "data": status.dict(),
+                    "timestamp": datetime.now().isoformat()
+                }, 
+                process_id
+            )
+        except HTTPException:
+            await websocket.send_json({
+                "type": "error",
+                "message": "Process not found",
+                "timestamp": datetime.now().isoformat()
+            })
+            return
+        
+        # Monitor progress
+        while True:
+            try:
+                # Check for progress updates
+                if process_id in process_manager.progress_queues:
+                    try:
+                        progress_data = process_manager.progress_queues[process_id].get_nowait()
+                        await connection_manager.send_personal_message(
+                            {
+                                "type": "progress", 
+                                "data": progress_data,
+                                "timestamp": datetime.now().isoformat()
+                            }, 
+                            process_id
+                        )
+                    except:
+                        pass
+                
+                # Check if process is complete
+                current_status = process_manager.get_process_status(process_id)
+                if current_status.status in [ProcessStatus.COMPLETED, ProcessStatus.FAILED, ProcessStatus.CANCELLED]:
+                    await connection_manager.send_personal_message(
+                        {
+                            "type": "completed", 
+                            "data": current_status.dict(),
+                            "timestamp": datetime.now().isoformat()
+                        }, 
+                        process_id
+                    )
+                    break
+                
+                await asyncio.sleep(1)  # Check every second
+                
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.error(f"WebSocket error for process {process_id}: {e}")
+                break
+    
+    except WebSocketDisconnect:
+        pass
+    finally:
+        connection_manager.disconnect(websocket, process_id)
+
+# ============================================================================
+# API Endpoints
+# ============================================================================
+
+@app.get("/", tags=["Health"])
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "Production Process Management API",
+        "version": "2.0.0",
+        "status": "operational",
+        "timestamp": datetime.now().isoformat(),
+        "endpoints": {
+            "health": "/health",
+            "processes": "/processes",
+            "websocket": "/ws/{process_id}",
+            "docs": "/docs",
+            "process_types": "/processes/types"
+        }
+    }
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Comprehensive health check"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "system_info": {
+            "active_processes": process_manager.get_active_process_count(),
+            "max_concurrent_processes": process_manager.max_concurrent_processes,
+            "total_processes_tracked": len(process_manager.process_registry),
+            "websocket_connections": sum(len(conns) for conns in connection_manager.active_connections.values()),
+            "cpu_count": mp.cpu_count(),
+            "memory_usage_mb": "N/A",  # Could add psutil for memory monitoring
+            "uptime_seconds": "N/A"
+        },
+        "api_info": {
+            "available_process_types": [t.value for t in ProcessType],
+            "supported_operations": ["read", "transform", "enrich", "generate"]
+        }
+    }
+
+@app.get("/processes/types", response_model=APIResponse, tags=["Process Types"])
+async def get_process_types():
+    """Get all available process types and their schemas"""
+    try:
+        schemas = process_manager.registry.get_all_schemas()
+        return APIResponse(
+            success=True,
+            data=schemas,
+            metadata={
+                "total_types": len(schemas),
+                "retrieved_at": datetime.now().isoformat()
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error getting process types: {str(e)}")
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="FETCH_ERROR",
+                message="Failed to fetch process types",
+                details=str(e)
+            )
+        )
+
+@app.get("/processes/types/{process_name}/schema", response_model=APIResponse, tags=["Process Types"])
+async def get_process_schema(process_name: str):
+    """Get schema for a specific process type"""
+    try:
+        try:
+            process_type = ProcessType(process_name)
+        except ValueError:
+            return APIResponse(
+                success=False,
+                error=APIError(
+                    error_code="INVALID_PROCESS_TYPE",
+                    message=f"Invalid process type: {process_name}",
+                    suggestion=f"Available types: {[t.value for t in ProcessType]}"
+                )
+            )
+        
+        schema = process_manager.registry.get_process_schema(process_type)
+        if not schema:
+            return APIResponse(
+                success=False,
+                error=APIError(
+                    error_code="SCHEMA_NOT_FOUND",
+                    message=f"Schema not found for process type: {process_name}"
+                )
+            )
+        
+        return APIResponse(
+            success=True,
+            data=schema.dict(),
+            metadata={"retrieved_at": datetime.now().isoformat()}
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting process schema: {str(e)}")
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="FETCH_ERROR",
+                message="Failed to fetch process schema",
+                details=str(e)
+            )
+        )
+
+@app.post("/processes/{process_name}", response_model=APIResponse, tags=["Process Management"])
+async def trigger_process(process_name: str, request: ProcessRequest = ProcessRequest()):
+    """Trigger a new process"""
+    try:
+        process_id = process_manager.start_process(process_name, request.parameters)
+        
+        return APIResponse(
+            success=True,
+            data={
+                "process_id": process_id,
+                "process_name": process_name,
+                "status": ProcessStatus.PENDING.value,
+                "websocket_url": f"/ws/{process_id}",
+                "status_url": f"/processes/{process_id}/status",
+                "result_url": f"/processes/{process_id}/result"
+            },
+            metadata={
+                "created_at": datetime.now().isoformat(),
+                "parameters": request.parameters,
+                "estimated_duration": process_manager.registry.get_process_schema(ProcessType(process_name)).estimated_duration
+            }
+        )
+        
+    except HTTPException as he:
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="PROCESS_START_ERROR",
+                message=he.detail,
+                suggestion="Check process name and parameters"
+            )
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error starting process: {str(e)}")
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="INTERNAL_ERROR",
+                message="Internal server error",
+                details=str(e)
+            )
+        )
+
+@app.get("/processes/{process_id}/status", response_model=APIResponse, tags=["Process Management"])
+async def get_process_status(process_id: str):
+    """Get detailed process status"""
+    try:
+        status = process_manager.get_process_status(process_id)
+        
+        return APIResponse(
+            success=True,
+            data=status.dict(),
+            metadata={
+                "retrieved_at": datetime.now().isoformat(),
+                "websocket_url": f"/ws/{process_id}",
+                "result_available": status.status == ProcessStatus.COMPLETED
+            }
+        )
+        
+    except HTTPException as he:
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="PROCESS_NOT_FOUND",
+                message=he.detail,
+                suggestion="Check the process ID"
+            )
+        )
+    except Exception as e:
+        logger.error(f"Error getting process status: {str(e)}")
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="FETCH_ERROR",
+                message="Failed to fetch process status",
+                details=str(e)
+            )
+        )
+
+@app.get("/processes/{process_id}/result", response_model=APIResponse, tags=["Process Management"])
+async def get_process_result(process_id: str):
+    """Get process result"""
+    try:
+        result = process_manager.get_process_result(process_id)
+        
+        return APIResponse(
+            success=True,
+            data=result.dict(),
+            metadata={
+                "retrieved_at": datetime.now().isoformat(),
+                "data_size": len(result.result.get('records', [])) if result.result else 0,
+                "stream_available": True,
+                "stream_url": f"/processes/{process_id}/stream"
+            }
+        )
+        
+    except HTTPException as he:
+        if he.status_code == 202:
+            return APIResponse(
+                success=False,
+                error=APIError(
+                    error_code="PROCESS_NOT_READY",
+                    message=he.detail,
+                    suggestion="Process is still running. Use WebSocket for real-time updates."
+                )
+            )
+        else:
+            return APIResponse(
+                success=False,
+                error=APIError(
+                    error_code="PROCESS_ERROR",
+                    message=he.detail
+                )
+            )
+    except Exception as e:
+        logger.error(f"Error getting process result: {str(e)}")
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="FETCH_ERROR",
+                message="Failed to fetch process result",
+                details=str(e)
+            )
+        )
+
+@app.get("/processes/{process_id}/stream", tags=["Process Management"])
+async def stream_process_result(process_id: str):
+    """Stream process result for large datasets"""
+    try:
+        result = process_manager.get_process_result(process_id)
+        
+        def generate_stream():
+            yield f"data: {json.dumps({'type': 'start', 'total_records': result.data_count, 'process_id': process_id})}\n\n"
+            
+            if result.result and 'records' in result.result:
+                batch_size = 50  # Stream in batches
+                records = result.result['records']
+                total_batches = (len(records) + batch_size - 1) // batch_size
+                
+                for i in range(0, len(records), batch_size):
+                    batch = records[i:i + batch_size]
+                    batch_number = i // batch_size + 1
+                    
+                    yield f"data: {json.dumps({
+                        'type': 'batch', 
+                        'batch_number': batch_number,
+                        'total_batches': total_batches,
+                        'records': batch,
+                        'progress': round((batch_number / total_batches) * 100, 2)
+                    })}\n\n"
+                    
+            yield f"data: {json.dumps({
+                'type': 'end', 
+                'message': 'Stream completed',
+                'total_records_streamed': result.data_count
+            })}\n\n"
+        
+        return StreamingResponse(
+            generate_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*"
+            }
+        )
+        
+    except HTTPException as he:
+        return APIResponse(
+            success=False,
+            error=APIError(error_code="STREAM_ERROR", message=he.detail)
+        )
+    except Exception as e:
+        logger.error(f"Error streaming process result: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to stream result")
+
+@app.delete("/processes/{process_id}", response_model=APIResponse, tags=["Process Management"])
+async def cancel_process(process_id: str):
+    """Cancel a running process"""
+    try:
+        success = process_manager.cancel_process(process_id)
+        
+        if success:
+            return APIResponse(
+                success=True,
+                data={"message": f"Process {process_id} cancelled successfully"},
+                metadata={"cancelled_at": datetime.now().isoformat()}
+            )
+        else:
+            return APIResponse(
+                success=False,
+                error=APIError(
+                    error_code="CANCEL_FAILED",
+                    message=f"Process {process_id} could not be cancelled",
+                    suggestion="Process may already be completed or not running"
+                )
+            )
+            
+    except HTTPException as he:
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="PROCESS_NOT_FOUND",
+                message=he.detail
+            )
+        )
+    except Exception as e:
+        logger.error(f"Error cancelling process: {str(e)}")
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="CANCEL_ERROR",
+                message="Failed to cancel process",
+                details=str(e)
+            )
+        )
+
+@app.get("/processes", response_model=APIResponse, tags=["Process Management"])
+async def list_processes(
+    status: Optional[ProcessStatus] = Query(None, description="Filter by process status"),
+    limit: int = Query(100, ge=1, le=1000, description="Number of processes to return"),
+    offset: int = Query(0, ge=0, description="Number of processes to skip")
+):
+    """List processes with filtering and pagination"""
+    try:
+        processes = process_manager.list_processes(status, limit, offset)
+        
+        return APIResponse(
+            success=True,
+            data=[p.dict() for p in processes],
+            metadata={
+                "total_returned": len(processes),
+                "limit": limit,
+                "offset": offset,
+                "filter": {"status": status.value if status else None},
+                "retrieved_at": datetime.now().isoformat(),
+                "has_more": len(processes) == limit  # Simple check for pagination
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error listing processes: {str(e)}")
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="LIST_ERROR",
+                message="Failed to list processes",
+                details=str(e)
+            )
+        )
+
+@app.get("/processes/{process_id}/logs", response_model=APIResponse, tags=["Process Management"])
+async def get_process_logs(process_id: str):
+    """Get process execution logs"""
+    try:
+        status = process_manager.get_process_status(process_id)
+        
+        # Extract logs from progress data if available
+        logs = []
+        if status.progress and hasattr(status.progress, 'logs'):
+            logs = status.progress.logs
+        
+        return APIResponse(
+            success=True,
+            data={
+                "process_id": process_id,
+                "logs": logs,
+                "log_count": len(logs),
+                "last_updated": datetime.now().isoformat()
+            },
+            metadata={
+                "retrieved_at": datetime.now().isoformat()
+            }
+        )
+        
+    except HTTPException as he:
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="PROCESS_NOT_FOUND",
+                message=he.detail
+            )
+        )
+    except Exception as e:
+        logger.error(f"Error getting process logs: {str(e)}")
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="LOGS_ERROR",
+                message="Failed to fetch process logs",
+                details=str(e)
+            )
+        )
+
+# ============================================================================
+# Additional Utility Endpoints
+# ============================================================================
+
+@app.get("/processes/stats", response_model=APIResponse, tags=["Analytics"])
+async def get_process_statistics():
+    """Get process execution statistics"""
+    try:
+        processes = process_manager.list_processes(limit=1000)
+        
+        stats = {
+            "total_processes": len(processes),
+            "status_breakdown": {},
+            "avg_duration": 0,
+            "success_rate": 0,
+            "process_type_breakdown": {}
+        }
+        
+        durations = []
+        success_count = 0
+        
+        for process in processes:
+            # Status breakdown
+            status = process.status.value
+            stats["status_breakdown"][status] = stats["status_breakdown"].get(status, 0) + 1
+            
+            # Process type breakdown
+            process_type = process.name
+            stats["process_type_breakdown"][process_type] = stats["process_type_breakdown"].get(process_type, 0) + 1
+            
+            # Duration and success rate
+            if process.duration_seconds:
+                durations.append(process.duration_seconds)
+            
+            if process.status == ProcessStatus.COMPLETED:
+                success_count += 1
+        
+        # Calculate averages
+        if durations:
+            stats["avg_duration"] = round(sum(durations) / len(durations), 2)
+        
+        if len(processes) > 0:
+            stats["success_rate"] = round((success_count / len(processes)) * 100, 2)
+        
+        return APIResponse(
+            success=True,
+            data=stats,
+            metadata={
+                "calculated_at": datetime.now().isoformat(),
+                "sample_size": len(processes)
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error calculating statistics: {str(e)}")
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="STATS_ERROR",
+                message="Failed to calculate statistics",
+                details=str(e)
+            )
+        )
+
+@app.post("/processes/batch", response_model=APIResponse, tags=["Process Management"])
+async def trigger_batch_processes(requests: List[Dict[str, Any]]):
+    """Trigger multiple processes in batch"""
+    try:
+        results = []
+        errors = []
+        
+        for i, req in enumerate(requests):
+            try:
+                process_name = req.get("process_name")
+                parameters = req.get("parameters", {})
+                
+                if not process_name:
+                    errors.append(f"Request {i}: Missing process_name")
+                    continue
+                
+                process_id = process_manager.start_process(process_name, parameters)
+                results.append({
+                    "index": i,
+                    "process_id": process_id,
+                    "process_name": process_name,
+                    "status": ProcessStatus.PENDING.value
+                })
+                
+            except Exception as e:
+                errors.append(f"Request {i}: {str(e)}")
+        
+        return APIResponse(
+            success=len(errors) == 0,
+            data={
+                "successful": results,
+                "failed": errors,
+                "summary": {
+                    "total_requested": len(requests),
+                    "successful": len(results),
+                    "failed": len(errors)
+                }
+            },
+            metadata={
+                "batch_created_at": datetime.now().isoformat()
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in batch process creation: {str(e)}")
+        return APIResponse(
+            success=False,
+            error=APIError(
+                error_code="BATCH_ERROR",
+                message="Failed to create batch processes",
+                details=str(e)
+            )
+        )
+
+# ============================================================================
+# Application Startup
+# ============================================================================
+
+if __name__ == "__main__":
+    # Configuration for development
+    import os
+    
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", 8000))
+    debug = os.getenv("DEBUG", "True").lower() == "true"
+    
+    logger.info(f"Starting server on {host}:{port}")
+    logger.info(f"Debug mode: {debug}")
+    logger.info(f"Available process types: {[t.value for t in ProcessType]}")
+    
+    uvicorn.run(
+        "main:app",  # Assuming this file is named main.py
+        host=host,
+        port=port,
+        reload=debug,
+        log_level="info"
+    )
