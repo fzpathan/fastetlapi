@@ -1,0 +1,59 @@
+import pandas as pd
+import logging
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+# ------------ Utility to save DataFrame safely ------------
+def save_feather_safe(df: pd.DataFrame, file_path: str):
+    try:
+        df.reset_index(drop=True).to_feather(file_path)
+    except Exception as e:
+        logging.error(f"Feather save failed for {file_path}, converting to string. Error: {e}")
+        df = df.astype(str)
+        df.reset_index(drop=True).to_feather(file_path)
+
+# ------------ Worker Function ------------
+def rec_rule(file_path: str, log_file_path: str):
+    try:
+        df = pd.read_feather(file_path)
+    except Exception as e:
+        logging.error(f"Feather read failed for {file_path}, converting to string. Error: {e}")
+        df = pd.read_feather(file_path).astype(str)
+
+    logging.error(f"Processing {file_path} with {len(df)} rows")
+    # 👉 Do your heavy processing here
+    return df.shape  # Example: return size
+
+# ------------ Main Script ------------
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.ERROR)
+
+    # Example big dataframes (replace with your real ones)
+    house_df = pd.DataFrame({
+        "id": range(1_000_000),
+        "val": [f"text_{i}" for i in range(1_000_000)]
+    })
+    detrep_df = pd.DataFrame({
+        "id": range(1_000_000),
+        "val": [i * 0.1 for i in range(1_000_000)]
+    })
+
+    t1 = time.time()
+
+    # Save once to feather with fallback
+    house_file = "house_df.feather"
+    detrep_file = "detrep_df.feather"
+    save_feather_safe(house_df, house_file)
+    save_feather_safe(detrep_df, detrep_file)
+
+    # Run multiprocessing without passing heavy DataFrames
+    with ProcessPoolExecutor() as executor:
+        futures = [
+            executor.submit(rec_rule, house_file, "house_log.txt"),
+            executor.submit(rec_rule, detrep_file, "detrep_log.txt")
+        ]
+        results = [f.result() for f in futures]
+
+    t2 = time.time()
+    logging.error(f"Multiprocessing done in {(t2-t1)/60:.2f} min")
+    print("Results:", results)
