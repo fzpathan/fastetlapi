@@ -57,3 +57,30 @@ if __name__ == "__main__":
     t2 = time.time()
     logging.error(f"Multiprocessing done in {(t2-t1)/60:.2f} min")
     print("Results:", results)
+
+import polars as pl
+
+# Input
+csv_file = "data.csv"
+columns_to_read = ["col1", "col2", "col3"]   # 👈 only these columns will be read
+columns_to_combine = "col1,col2"             # 👈 columns to merge
+allowed_values = ["A_100", "B_200"]
+
+# Step 1: Scan only selected columns, force Utf8
+df = pl.scan_csv(csv_file, dtypes=pl.Utf8, columns=columns_to_read)
+
+# Step 2: Split comma-separated combine list
+cols = [c.strip() for c in columns_to_combine.split(",")]
+
+# Step 3: Concatenate selected columns into new one
+df = df.with_columns(
+    pl.concat_str([pl.col(c) for c in cols], separator="_").alias("combined_col")
+)
+
+# Step 4: Filter
+df = df.filter(pl.col("combined_col").is_in(allowed_values))
+
+# Step 5: Collect + convert to Pandas
+result = df.collect().to_pandas()
+
+print(result.head())
