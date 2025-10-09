@@ -1,0 +1,130 @@
+import psutil
+import time
+from datetime import datetime
+import os
+import signal
+import sys
+
+class CPUMonitor:
+    def __init__(self, log_file="cpu_usage.log", interval=30):
+        """
+        Initialize CPU Monitor
+        
+        Args:
+            log_file: Path to the log file
+            interval: Monitoring interval in seconds (default: 30)
+        """
+        self.log_file = log_file
+        self.interval = interval
+        self.running = True
+        
+    def signal_handler(self, sig, frame):
+        """Handle graceful shutdown on SIGINT (Ctrl+C)"""
+        print("\n[INFO] Stopping CPU monitoring...")
+        self.running = False
+        sys.exit(0)
+    
+    def get_cpu_metrics(self):
+        """Collect CPU metrics"""
+        # Overall CPU usage
+        cpu_percent = psutil.cpu_percent(interval=1)
+        
+        # Per-core CPU usage
+        cpu_per_core = psutil.cpu_percent(interval=1, percpu=True)
+        
+        # CPU frequency
+        cpu_freq = psutil.cpu_freq()
+        
+        # CPU count
+        cpu_count = psutil.cpu_count(logical=True)
+        physical_cores = psutil.cpu_count(logical=False)
+        
+        # Load average (Unix-like systems)
+        try:
+            load_avg = os.getloadavg()
+        except AttributeError:
+            load_avg = None  # Not available on Windows
+        
+        return {
+            'timestamp': datetime.now().isoformat(),
+            'cpu_percent': cpu_percent,
+            'cpu_per_core': cpu_per_core,
+            'cpu_freq_current': cpu_freq.current if cpu_freq else None,
+            'cpu_freq_min': cpu_freq.min if cpu_freq else None,
+            'cpu_freq_max': cpu_freq.max if cpu_freq else None,
+            'cpu_count': cpu_count,
+            'physical_cores': physical_cores,
+            'load_avg_1min': load_avg[0] if load_avg else None,
+            'load_avg_5min': load_avg[1] if load_avg else None,
+            'load_avg_15min': load_avg[2] if load_avg else None
+        }
+    
+    def format_log_entry(self, metrics):
+        """Format metrics into a log entry"""
+        log_entry = f"{metrics['timestamp']} | "
+        log_entry += f"CPU: {metrics['cpu_percent']:.2f}% | "
+        log_entry += f"Cores: {metrics['physical_cores']}P/{metrics['cpu_count']}L | "
+        
+        if metrics['cpu_freq_current']:
+            log_entry += f"Freq: {metrics['cpu_freq_current']:.0f}MHz | "
+        
+        if metrics['load_avg_1min']:
+            log_entry += f"Load: {metrics['load_avg_1min']:.2f}/{metrics['load_avg_5min']:.2f}/{metrics['load_avg_15min']:.2f} | "
+        
+        # Per-core usage (simplified)
+        core_usage = ", ".join([f"{usage:.1f}%" for usage in metrics['cpu_per_core']])
+        log_entry += f"Per-Core: [{core_usage}]"
+        
+        return log_entry
+    
+    def write_header(self):
+        """Write header to log file"""
+        with open(self.log_file, 'a') as f:
+            f.write("\n" + "="*100 + "\n")
+            f.write(f"CPU Monitoring Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("="*100 + "\n")
+    
+    def log_metrics(self, metrics):
+        """Write metrics to log file"""
+        log_entry = self.format_log_entry(metrics)
+        
+        with open(self.log_file, 'a') as f:
+            f.write(log_entry + "\n")
+        
+        # Also print to console
+        print(log_entry)
+    
+    def run(self):
+        """Main monitoring loop"""
+        # Set up signal handler for graceful shutdown
+        signal.signal(signal.SIGINT, self.signal_handler)
+        
+        print(f"[INFO] Starting CPU monitoring...")
+        print(f"[INFO] Logging to: {os.path.abspath(self.log_file)}")
+        print(f"[INFO] Interval: {self.interval} seconds")
+        print(f"[INFO] Press Ctrl+C to stop\n")
+        
+        # Write header
+        self.write_header()
+        
+        try:
+            while self.running:
+                # Collect and log metrics
+                metrics = self.get_cpu_metrics()
+                self.log_metrics(metrics)
+                
+                # Wait for next interval
+                time.sleep(self.interval)
+                
+        except Exception as e:
+            print(f"[ERROR] An error occurred: {e}")
+            self.running = False
+
+if __name__ == "__main__":
+    # Configuration
+    LOG_FILE = "cpu_usage.log"
+    INTERVAL = 30  # seconds
+    
+    # Create and run monitor
+    monitor = CPUMonitor(log_file=LOG_FILE, interval=INTERVAL)
+    monitor.run()
