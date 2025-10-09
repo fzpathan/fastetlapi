@@ -59,20 +59,56 @@ class CPUMonitor:
             'load_avg_15min': load_avg[2] if load_avg else None
         }
     
-    def format_log_entry(self, metrics):
+    def get_memory_metrics(self):
+        """Collect memory metrics"""
+        # Virtual memory (RAM)
+        mem = psutil.virtual_memory()
+        
+        # Swap memory
+        swap = psutil.swap_memory()
+        
+        return {
+            'mem_total': mem.total,
+            'mem_available': mem.available,
+            'mem_used': mem.used,
+            'mem_percent': mem.percent,
+            'mem_free': mem.free,
+            'swap_total': swap.total,
+            'swap_used': swap.used,
+            'swap_percent': swap.percent
+        }
+    
+    def format_bytes(self, bytes_value):
+        """Convert bytes to human readable format"""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if bytes_value < 1024.0:
+                return f"{bytes_value:.2f}{unit}"
+            bytes_value /= 1024.0
+        return f"{bytes_value:.2f}PB"
+    
+    def format_log_entry(self, cpu_metrics, mem_metrics):
         """Format metrics into a log entry"""
-        log_entry = f"{metrics['timestamp']} | "
-        log_entry += f"CPU: {metrics['cpu_percent']:.2f}% | "
-        log_entry += f"Cores: {metrics['physical_cores']}P/{metrics['cpu_count']}L | "
+        log_entry = f"{cpu_metrics['timestamp']} | "
+        log_entry += f"CPU: {cpu_metrics['cpu_percent']:.2f}% | "
+        log_entry += f"Cores: {cpu_metrics['physical_cores']}P/{cpu_metrics['cpu_count']}L | "
         
-        if metrics['cpu_freq_current']:
-            log_entry += f"Freq: {metrics['cpu_freq_current']:.0f}MHz | "
+        if cpu_metrics['cpu_freq_current']:
+            log_entry += f"Freq: {cpu_metrics['cpu_freq_current']:.0f}MHz | "
         
-        if metrics['load_avg_1min']:
-            log_entry += f"Load: {metrics['load_avg_1min']:.2f}/{metrics['load_avg_5min']:.2f}/{metrics['load_avg_15min']:.2f} | "
+        if cpu_metrics['load_avg_1min']:
+            log_entry += f"Load: {cpu_metrics['load_avg_1min']:.2f}/{cpu_metrics['load_avg_5min']:.2f}/{cpu_metrics['load_avg_15min']:.2f} | "
+        
+        # Memory metrics
+        log_entry += f"MEM: {mem_metrics['mem_percent']:.1f}% | "
+        log_entry += f"Used: {self.format_bytes(mem_metrics['mem_used'])} | "
+        log_entry += f"Avail: {self.format_bytes(mem_metrics['mem_available'])} | "
+        log_entry += f"Total: {self.format_bytes(mem_metrics['mem_total'])} | "
+        
+        if mem_metrics['swap_total'] > 0:
+            log_entry += f"SWAP: {mem_metrics['swap_percent']:.1f}% | "
         
         # Per-core usage (simplified)
-        core_usage = ", ".join([f"{usage:.1f}%" for usage in metrics['cpu_per_core']])
+        core_usage = ", ".join([f"{usage:.1f}%" for usage in cpu_metrics['cpu_per_core']])
         log_entry += f"Per-Core: [{core_usage}]"
         
         return log_entry
@@ -80,13 +116,13 @@ class CPUMonitor:
     def write_header(self):
         """Write header to log file"""
         with open(self.log_file, 'a') as f:
-            f.write("\n" + "="*100 + "\n")
-            f.write(f"CPU Monitoring Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("="*100 + "\n")
+            f.write("\n" + "="*120 + "\n")
+            f.write(f"CPU & Memory Monitoring Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("="*120 + "\n")
     
-    def log_metrics(self, metrics):
+    def log_metrics(self, cpu_metrics, mem_metrics):
         """Write metrics to log file"""
-        log_entry = self.format_log_entry(metrics)
+        log_entry = self.format_log_entry(cpu_metrics, mem_metrics)
         
         with open(self.log_file, 'a') as f:
             f.write(log_entry + "\n")
@@ -99,7 +135,7 @@ class CPUMonitor:
         # Set up signal handler for graceful shutdown
         signal.signal(signal.SIGINT, self.signal_handler)
         
-        print(f"[INFO] Starting CPU monitoring...")
+        print(f"[INFO] Starting CPU & Memory monitoring...")
         print(f"[INFO] Logging to: {os.path.abspath(self.log_file)}")
         print(f"[INFO] Interval: {self.interval} seconds")
         print(f"[INFO] Press Ctrl+C to stop\n")
@@ -110,8 +146,9 @@ class CPUMonitor:
         try:
             while self.running:
                 # Collect and log metrics
-                metrics = self.get_cpu_metrics()
-                self.log_metrics(metrics)
+                cpu_metrics = self.get_cpu_metrics()
+                mem_metrics = self.get_memory_metrics()
+                self.log_metrics(cpu_metrics, mem_metrics)
                 
                 # Wait for next interval
                 time.sleep(self.interval)
