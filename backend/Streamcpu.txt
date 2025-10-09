@@ -1,0 +1,309 @@
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime, timedelta
+import re
+import os
+
+# Page configuration
+st.set_page_config(
+    page_title="CPU Monitoring Dashboard",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS
+st.markdown("""
+    <style>
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 20px;
+        border-radius: 10px;
+        margin: 10px 0;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+def parse_log_file(log_file):
+    """Parse the CPU usage log file"""
+    data = []
+    
+    if not os.path.exists(log_file):
+        return pd.DataFrame()
+    
+    with open(log_file, 'r') as f:
+        for line in f:
+            # Skip header lines and empty lines
+            if line.startswith('=') or line.strip() == '' or 'CPU Monitoring Started' in line:
+                continue
+            
+            # Parse log entry
+            try:
+                parts = line.strip().split(' | ')
+                if len(parts) < 3:
+                    continue
+                
+                timestamp_str = parts[0].strip()
+                timestamp = pd.to_datetime(timestamp_str)
+                
+                # Extract CPU percentage
+                cpu_match = re.search(r'CPU:\s+([\d.]+)%', line)
+                cpu_percent = float(cpu_match.group(1)) if cpu_match else None
+                
+                # Extract frequency
+                freq_match = re.search(r'Freq:\s+([\d.]+)MHz', line)
+                freq = float(freq_match.group(1)) if freq_match else None
+                
+                # Extract load averages
+                load_match = re.search(r'Load:\s+([\d.]+)/([\d.]+)/([\d.]+)', line)
+                load_1min = float(load_match.group(1)) if load_match else None
+                load_5min = float(load_match.group(2)) if load_match else None
+                load_15min = float(load_match.group(3)) if load_match else None
+                
+                # Extract per-core usage
+                core_match = re.search(r'Per-Core:\s+\[(.*?)\]', line)
+                core_usage = []
+                if core_match:
+                    core_str = core_match.group(1)
+                    core_usage = [float(x.strip('%')) for x in core_str.split(',')]
+                
+                data.append({
+                    'timestamp': timestamp,
+                    'cpu_percent': cpu_percent,
+                    'frequency': freq,
+                    'load_1min': load_1min,
+                    'load_5min': load_5min,
+                    'load_15min': load_15min,
+                    'core_usage': core_usage
+                })
+            except Exception as e:
+                continue
+    
+    return pd.DataFrame(data)
+
+def main():
+    st.title("📊 CPU Monitoring Dashboard")
+    st.markdown("Real-time system CPU utilization analysis")
+    
+    # Sidebar
+    st.sidebar.header("⚙️ Configuration")
+    
+    log_file = st.sidebar.text_input("Log File Path", value="cpu_usage.log")
+    
+    # Auto-refresh option
+    auto_refresh = st.sidebar.checkbox("Auto-refresh (every 30s)", value=True)
+    if auto_refresh:
+        st.sidebar.info("Dashboard will refresh automatically")
+        # Auto refresh every 30 seconds
+        st.rerun()
+    
+    # Time range filter
+    st.sidebar.subheader("Time Range")
+    time_range = st.sidebar.selectbox(
+        "Select Range",
+        ["Last 1 Hour", "Last 6 Hours", "Last 12 Hours", "Last 24 Hours", "All Data"]
+    )
+    
+    # Load data
+    df = parse_log_file(log_file)
+    
+    if df.empty:
+        st.error(f"❌ No data found in '{log_file}'. Make sure the monitoring script is running!")
+        st.info("💡 Start the CPU monitoring script first: `python cpu_monitor.py`")
+        return
+    
+    # Filter by time range
+    now = datetime.now()
+    if time_range == "Last 1 Hour":
+        df = df[df['timestamp'] >= now - timedelta(hours=1)]
+    elif time_range == "Last 6 Hours":
+        df = df[df['timestamp'] >= now - timedelta(hours=6)]
+    elif time_range == "Last 12 Hours":
+        df = df[df['timestamp'] >= now - timedelta(hours=12)]
+    elif time_range == "Last 24 Hours":
+        df = df[df['timestamp'] >= now - timedelta(hours=24)]
+    
+    # Summary metrics
+    st.header("📈 Current Statistics")
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    if not df.empty:
+        latest = df.iloc[-1]
+        
+        with col1:
+            st.metric(
+                "Current CPU Usage",
+                f"{latest['cpu_percent']:.1f}%",
+                delta=f"{latest['cpu_percent'] - df.iloc[-2]['cpu_percent']:.1f}%" if len(df) > 1 else None
+            )
+        
+        with col2:
+            st.metric(
+                "Average CPU",
+                f"{df['cpu_percent'].mean():.1f}%"
+            )
+        
+        with col3:
+            st.metric(
+                "Peak CPU",
+                f"{df['cpu_percent'].max():.1f}%"
+            )
+        
+        with col4:
+            if latest['frequency']:
+                st.metric(
+                    "Current Frequency",
+                    f"{latest['frequency']:.0f} MHz"
+                )
+        
+        with col5:
+            if latest['load_1min']:
+                st.metric(
+                    "Load Avg (1m)",
+                    f"{latest['load_1min']:.2f}"
+                )
+    
+    # Charts
+    st.header("📉 CPU Usage Over Time")
+    
+    # Main CPU usage chart
+    fig_cpu = go.Figure()
+    fig_cpu.add_trace(go.Scatter(
+        x=df['timestamp'],
+        y=df['cpu_percent'],
+        mode='lines',
+        name='CPU Usage',
+        line=dict(color='#1f77b4', width=2),
+        fill='tozeroy',
+        fillcolor='rgba(31, 119, 180, 0.2)'
+    ))
+    
+    fig_cpu.update_layout(
+        title="CPU Utilization (%)",
+        xaxis_title="Time",
+        yaxis_title="CPU Usage (%)",
+        hovermode='x unified',
+        height=400,
+        yaxis=dict(range=[0, 100])
+    )
+    
+    st.plotly_chart(fig_cpu, use_container_width=True)
+    
+    # Two column layout for additional charts
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # CPU Frequency chart
+        if df['frequency'].notna().any():
+            st.subheader("🔄 CPU Frequency")
+            fig_freq = go.Figure()
+            fig_freq.add_trace(go.Scatter(
+                x=df['timestamp'],
+                y=df['frequency'],
+                mode='lines',
+                name='Frequency',
+                line=dict(color='#ff7f0e', width=2)
+            ))
+            fig_freq.update_layout(
+                xaxis_title="Time",
+                yaxis_title="Frequency (MHz)",
+                hovermode='x unified',
+                height=300
+            )
+            st.plotly_chart(fig_freq, use_container_width=True)
+    
+    with col2:
+        # Load average chart
+        if df['load_1min'].notna().any():
+            st.subheader("⚖️ Load Average")
+            fig_load = go.Figure()
+            fig_load.add_trace(go.Scatter(
+                x=df['timestamp'],
+                y=df['load_1min'],
+                mode='lines',
+                name='1 min',
+                line=dict(color='#2ca02c')
+            ))
+            fig_load.add_trace(go.Scatter(
+                x=df['timestamp'],
+                y=df['load_5min'],
+                mode='lines',
+                name='5 min',
+                line=dict(color='#d62728')
+            ))
+            fig_load.add_trace(go.Scatter(
+                x=df['timestamp'],
+                y=df['load_15min'],
+                mode='lines',
+                name='15 min',
+                line=dict(color='#9467bd')
+            ))
+            fig_load.update_layout(
+                xaxis_title="Time",
+                yaxis_title="Load",
+                hovermode='x unified',
+                height=300
+            )
+            st.plotly_chart(fig_load, use_container_width=True)
+    
+    # Per-core usage heatmap
+    st.header("🔥 Per-Core CPU Usage")
+    
+    if df['core_usage'].notna().any() and len(df['core_usage'].iloc[-1]) > 0:
+        # Create matrix for heatmap
+        core_data = []
+        timestamps = []
+        for idx, row in df.iterrows():
+            if row['core_usage']:
+                core_data.append(row['core_usage'])
+                timestamps.append(row['timestamp'])
+        
+        if core_data:
+            core_matrix = pd.DataFrame(core_data, index=timestamps)
+            
+            fig_heatmap = go.Figure(data=go.Heatmap(
+                z=core_matrix.T.values,
+                x=core_matrix.index,
+                y=[f"Core {i}" for i in range(len(core_matrix.columns))],
+                colorscale='RdYlGn_r',
+                zmid=50,
+                zmin=0,
+                zmax=100,
+                colorbar=dict(title="CPU %")
+            ))
+            
+            fig_heatmap.update_layout(
+                xaxis_title="Time",
+                yaxis_title="CPU Core",
+                height=300
+            )
+            st.plotly_chart(fig_heatmap, use_container_width=True)
+    
+    # Statistics table
+    st.header("📊 Detailed Statistics")
+    
+    stats_df = pd.DataFrame({
+        'Metric': ['Average CPU', 'Minimum CPU', 'Maximum CPU', 'Std Deviation', 'Data Points'],
+        'Value': [
+            f"{df['cpu_percent'].mean():.2f}%",
+            f"{df['cpu_percent'].min():.2f}%",
+            f"{df['cpu_percent'].max():.2f}%",
+            f"{df['cpu_percent'].std():.2f}%",
+            len(df)
+        ]
+    })
+    
+    st.dataframe(stats_df, use_container_width=True, hide_index=True)
+    
+    # Raw data
+    with st.expander("📋 View Raw Data"):
+        st.dataframe(df.tail(100), use_container_width=True)
+    
+    # Footer
+    st.markdown("---")
+    st.markdown(f"**Last Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | **Total Records:** {len(df)}")
+
+if __name__ == "__main__":
+    main()
