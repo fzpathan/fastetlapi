@@ -19,7 +19,7 @@ lf_right = df_right.lazy()
 lf_result = (
     pl.from_pandas(df_left)
     .lazy()
-    .with_row_index("row_id")  # Add unique row identifier
+    .with_row_index("row_id")
     .with_columns(
         # Only split if colA is valid, otherwise set to null
         pl.when(
@@ -31,13 +31,16 @@ lf_result = (
         .otherwise(pl.lit(None))
         .alias("key")
     )
+    .with_columns(
+        # Track if this row had valid colA for lookup
+        pl.col("key").is_not_null().alias("had_valid_colA")
+    )
     .explode("key")
     .with_columns(
         pl.when(pl.col("key").is_not_null())
         .then(pl.col("key").str.strip_chars())
         .otherwise(pl.col("key"))
     )
-    # Only join if key is valid (not null and not empty after strip)
     .with_columns(
         pl.when(
             pl.col("key").is_not_null() & 
@@ -51,26 +54,31 @@ lf_result = (
     .drop("valid_key", "key")
     .group_by("row_id", "colA", "id", "name", maintain_order=True)
     .agg([
-        pl.when(pl.col("val").is_not_null().any())
-        .then(
-            pl.col("val")
-            .cast(pl.Utf8)
-            .fill_null("NOTFOUND")
-            .str.concat(",")
-        )
+        pl.col("had_valid_colA").first().alias("had_valid_colA"),
+        pl.col("val")
+        .cast(pl.Utf8)
+        .fill_null("NOTFOUND")
+        .str.concat(",")
+        .alias("lookup_val"),
+        
+        pl.col("category")
+        .fill_null("NOTFOUND")
+        .str.concat(",")
+        .alias("lookup_category")
+    ])
+    .with_columns([
+        # If colA was invalid, set lookup columns to None
+        pl.when(pl.col("had_valid_colA"))
+        .then(pl.col("lookup_val"))
         .otherwise(pl.lit(None))
         .alias("lookup_val"),
         
-        pl.when(pl.col("category").is_not_null().any())
-        .then(
-            pl.col("category")
-            .fill_null("NOTFOUND")
-            .str.concat(",")
-        )
+        pl.when(pl.col("had_valid_colA"))
+        .then(pl.col("lookup_category"))
         .otherwise(pl.lit(None))
         .alias("lookup_category")
     ])
-    .drop("row_id")
+    .drop("row_id", "had_valid_colA")
 )
 
 # Collect result
