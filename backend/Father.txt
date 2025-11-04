@@ -1,22 +1,78 @@
 import polars as pl
 import pandas as pd
 
-# Example data
-df_left = pd.DataFrame({"colA": ["A,B,C", "X,Y", "M", "Q,Z"]})
-df_right = pl.DataFrame({"key": ["A", "B", "C", "M", "N", "X", "Y"], "val": [10, 20, 30, 40, 50, 60, 70]})
+# Example data with None, null, and empty values
+df_left = pd.DataFrame({
+    "colA": ["A,B,C", "X,Y", "M", "A,B,C", "Q,Z", None, "", "  "],
+    "id": [1, 2, 3, 4, 5, 6, 7, 8],
+    "name": ["Alice", "Bob", "Charlie", "David", "Eve", "Frank", "Grace", "Henry"]
+})
+
+df_right = pl.DataFrame({
+    "key": ["A", "B", "C", "M", "N", "X", "Y"], 
+    "val": [10, 20, 30, 40, 50, 60, 70],
+    "category": ["cat1", "cat2", "cat1", "cat3", "cat2", "cat1", "cat2"]
+})
 lf_right = df_right.lazy()
 
 # Optimized Polars pipeline
 lf_result = (
     pl.from_pandas(df_left)
-    .with_columns(pl.col("colA").str.split(",").alias("key"))
+    .lazy()
+    .with_row_index("row_id")  # Add unique row identifier
+    .with_columns(
+        # Only split if colA is valid, otherwise set to null
+        pl.when(
+            pl.col("colA").is_not_null() & 
+            (pl.col("colA") != "") & 
+            (pl.col("colA").str.strip_chars() != "")
+        )
+        .then(pl.col("colA").str.split(","))
+        .otherwise(pl.lit(None))
+        .alias("key")
+    )
     .explode("key")
-    .with_columns(pl.col("key").str.strip_chars())
-    .join(lf_right, on="key", how="left")
-    .group_by("colA", maintain_order=True)
-    .agg(pl.col("val").fill_null("NOTFOUND").cast(pl.Utf8).list.join(",").alias("lookup_val"))
+    .with_columns(
+        pl.when(pl.col("key").is_not_null())
+        .then(pl.col("key").str.strip_chars())
+        .otherwise(pl.col("key"))
+    )
+    # Only join if key is valid (not null and not empty after strip)
+    .with_columns(
+        pl.when(
+            pl.col("key").is_not_null() & 
+            (pl.col("key") != "")
+        )
+        .then(pl.col("key"))
+        .otherwise(pl.lit(None))
+        .alias("valid_key")
+    )
+    .join(lf_right, left_on="valid_key", right_on="key", how="left")
+    .drop("valid_key", "key")
+    .group_by("row_id", "colA", "id", "name", maintain_order=True)
+    .agg([
+        pl.when(pl.col("val").is_not_null().any())
+        .then(
+            pl.col("val")
+            .cast(pl.Utf8)
+            .fill_null("NOTFOUND")
+            .str.concat(",")
+        )
+        .otherwise(pl.lit(None))
+        .alias("lookup_val"),
+        
+        pl.when(pl.col("category").is_not_null().any())
+        .then(
+            pl.col("category")
+            .fill_null("NOTFOUND")
+            .str.concat(",")
+        )
+        .otherwise(pl.lit(None))
+        .alias("lookup_category")
+    ])
+    .drop("row_id")
 )
 
-# Streaming collect
-df_result = lf_result.collect(streaming=True).to_pandas()
+# Collect result
+df_result = lf_result.collect().to_pandas()
 print(df_result)
