@@ -1,104 +1,148 @@
-# Performance Self-Assessment – FY2025  
-**Name:** [Your Name]  
-**Role:** [Your Role / Team Name]  
-**Department:** FinTech / Trade & Transaction Reporting (T&TR)  
-**Manager:** [Manager Name]  
-**Period:** FY2025  
 
----
+With 12 series having vastly different ranges, you need a different strategy. Here are the best approaches:
+1. Normalization/Indexing (Most Practical)
+This is the cleanest way to compare 12 series with different scales:
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
 
-## **1. Risk Compliance and Goal**
-- Proactively managed and mitigated key risks, ensuring **zero overdue control breaches** and full alignment with regulatory standards.  
-- Enhanced governance through improved **risk reporting accuracy** and support for Enterprise and Financial Crime risk reviews.  
-- Demonstrated strong ownership and accountability by escalating and resolving material concerns in a timely and compliant manner.  
+# Sample data with 12 series
+dates = pd.date_range('2024-01-01', periods=50, freq='D')
+data = {'date': dates}
 
----
+# Create 12 series with different ranges
+ranges = [100000, 50000, 10000, 5000, 1000, 500, 100, 50, 10, 5, 1, 0.1]
+for i, range_val in enumerate(ranges, 1):
+    data[f'series_{i}'] = np.random.randn(50).cumsum() + range_val
 
-## **2. Team Values**
-- Delivered on all commitments with a **results-oriented and collaborative approach**, reinforcing a culture of trust and reliability.  
-- Led by example, ensuring high-quality deliverables and maintaining the principle of **“no balls dropped.”**  
-- Promoted inclusivity and teamwork, encouraging open dialogue and valuing diverse perspectives across stakeholders.  
+df = pd.DataFrame(data)
 
----
+# METHOD 1: Index to starting value (base = 100)
+plt.figure(figsize=(14, 8))
+for i in range(1, 13):
+    col = f'series_{i}'
+    indexed = (df[col] / df[col].iloc[0]) * 100
+    plt.plot(df['date'], indexed, label=col, linewidth=2)
 
-## **3. Personal Development**
-- Deepened regulatory knowledge of **Trade Reporting frameworks** and contributed to process efficiency enhancements.  
-- Built a strong professional network across T&TR and related teams, improving collaboration and delivery efficiency.  
-- Strengthened technical proficiency in **Python and automation**, driving innovation and operational excellence.  
+plt.xlabel('Date', fontsize=12)
+plt.ylabel('Indexed Value (Base = 100)', fontsize=12)
+plt.title('12 Series Normalized to Starting Value', fontsize=14, fontweight='bold')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+2. Percent Change from First Value
+Show relative performance:
+plt.figure(figsize=(14, 8))
+for i in range(1, 13):
+    col = f'series_{i}'
+    pct_change = ((df[col] - df[col].iloc[0]) / df[col].iloc[0]) * 100
+    plt.plot(df['date'], pct_change, label=col, linewidth=2)
 
----
+plt.xlabel('Date', fontsize=12)
+plt.ylabel('Percent Change from Start (%)', fontsize=12)
+plt.title('12 Series - Percentage Change', fontsize=14, fontweight='bold')
+plt.axhline(y=0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+3. Z-Score Normalization
+Show how many standard deviations each value is from its mean:
+from scipy import stats
 
-## **4. Generic Control Framework & Production Stability**
-- **Successfully completed the StratPy migration** with minimal disruption and maintained full production stability.  
-- Delivered key **regulatory control initiatives** (CSA, HKMA, SFTR, MIFID) on schedule, ensuring compliance and readiness.  
-- Implemented automation in **SDLC processes**, including regression testing and documentation hygiene improvements.  
-- Ensured production reliability through proactive issue management, root cause elimination, and timely resolution of control failures.  
+plt.figure(figsize=(14, 8))
+for i in range(1, 13):
+    col = f'series_{i}'
+    z_scores = stats.zscore(df[col])
+    plt.plot(df['date'], z_scores, label=col, linewidth=2, alpha=0.8)
 
----
+plt.xlabel('Date', fontsize=12)
+plt.ylabel('Z-Score (Standard Deviations)', fontsize=12)
+plt.title('12 Series Standardized (Z-Scores)', fontsize=14, fontweight='bold')
+plt.axhline(y=0, color='black', linestyle='--', linewidth=1)
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+4. Grouped Subplots (3x4 or 4x3 Grid)
+If you need to see actual values:
+fig, axes = plt.subplots(4, 3, figsize=(16, 12), sharex=True)
+axes = axes.flatten()
 
-## **5. Overall Contribution**
-- Delivered **exceptional results across all objectives**, consistently exceeding expectations in delivery, compliance, and quality.  
-- Balanced strong **technical leadership and collaboration**, achieving measurable improvements in process control and stability.  
-- Recognized for **smooth execution of critical migrations** and for driving sustainable enhancements to control frameworks.  
+for i in range(1, 13):
+    col = f'series_{i}'
+    ax = axes[i-1]
+    ax.plot(df['date'], df[col], linewidth=2, color=f'C{i-1}')
+    ax.set_title(f'{col} (range ~{ranges[i-1]:,.0f})', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(axis='x', rotation=45)
+    
+    # Format y-axis
+    ax.ticklabel_format(style='plain', axis='y')
 
----
+# Set common labels
+fig.text(0.5, 0.02, 'Date', ha='center', fontsize=12, fontweight='bold')
+fig.text(0.02, 0.5, 'Value', va='center', rotation='vertical', fontsize=12, fontweight='bold')
+plt.suptitle('12 Series with Different Value Ranges', fontsize=14, fontweight='bold', y=0.995)
+plt.tight_layout(rect=[0.03, 0.03, 1, 0.99])
+plt.show()
+5. Interactive Plot with Plotly (Best for Exploration)
+Allows toggling series on/off:
+import plotly.graph_objects as go
 
-**Summary:**  
-Demonstrated exceptional performance throughout the year with proven leadership, technical excellence, and a strong commitment to risk control and regulatory compliance. Continuously contributed to team success, process optimization, and innovation within the FinTech control environment.
+# Normalize data
+fig = go.Figure()
 
----
+for i in range(1, 13):
+    col = f'series_{i}'
+    indexed = (df[col] / df[col].iloc[0]) * 100
+    
+    fig.add_trace(go.Scatter(
+        x=df['date'],
+        y=indexed,
+        name=col,
+        mode='lines',
+        line=dict(width=2)
+    ))
 
+fig.update_layout(
+    title='12 Series Normalized (Click legend to toggle)',
+    xaxis_title='Date',
+    yaxis_title='Indexed Value (Base = 100)',
+    hight=600,
+    hovermode='x unified',
+    legend=dict(
+        yanchor="top",
+        y=0.99,
+        xanchor="left",
+        x=1.01
+    )
+)
 
-# Performance Self-Assessment – FY2025  
-**Name:** [Your Name]  
-**Role:** [Your Role / Team Name]  
-**Department:** FinTech / Trade & Transaction Reporting (T&TR)  
-**Manager:** [Manager Name]  
-**Period:** FY2025  
+fig.show()
+6. Min-Max Scaling (0-1 range)
+Scale each series to 0-1:
+from sklearn.preprocessing import MinMaxScaler
 
----
+plt.figure(figsize=(14, 8))
+scaler = MinMaxScaler()
 
-## **1. Risk Compliance and Goal**
-- Proactively managed and mitigated key risks, ensuring **zero overdue control breaches** and full adherence to regulatory requirements.  
-- Enhanced governance and transparency through **accurate risk reporting** and audit preparedness.  
-- Demonstrated accountability in identifying, escalating, and resolving material issues in a timely and compliant manner.  
+for i in range(1, 13):
+    col = f'series_{i}'
+    scaled = scaler.fit_transform(df[col].values.reshape(-1, 1)).flatten()
+    plt.plot(df['date'], scaled, label=col, linewidth=2, alpha=0.8)
 
----
-
-## **2. Team Values**
-- Consistently delivered with a **results-driven mindset**, ensuring on-time and high-quality completion of deliverables.  
-- Promoted a collaborative and inclusive environment, fostering cross-team cooperation and knowledge sharing.  
-- Led by example, maintaining strong ownership and accountability across all assigned initiatives.  
-
----
-
-## **3. Personal Development**
-- Deepened subject-matter expertise in **Trade Reporting regulations**, applying insights to streamline compliance processes.  
-- Expanded cross-functional collaboration within T&TR, Business, and Technology teams to enhance delivery efficiency.  
-- Advanced technical proficiency in **Python, API design, and automation frameworks**, contributing to modernization efforts.  
-
----
-
-## **4. Generic Control Framework & Production Stability**
-- **Completed 90% migration from the legacy platform to a new Python-based framework**, ensuring seamless functionality and stability.  
-- **Spearheaded the end-to-end testing strategy** to validate migration accuracy, control performance, and production readiness.  
-- **Designed and implemented backend architecture** for multiple frontend applications, ensuring scalability and performance optimization.  
-- **Created the overall architecture blueprint** integrating backend and frontend components for improved development efficiency.  
-- **Led technical discussions with the DevOps team** to troubleshoot and resolve environment and deployment issues effectively.  
-- Delivered major **regulatory and control initiatives (CSA, HKMA, SFTR, MIFID)** on schedule with strong focus on quality assurance.  
-- Enhanced automation within SDLC processes, including regression testing and deployment pipelines, ensuring robust delivery governance.  
-
----
-
-## **5. Overall Contribution**
-- Delivered **exceptional results across all core objectives**, exceeding expectations in technical delivery, compliance, and collaboration.  
-- Recognized for **driving strategic modernization**, improving both system efficiency and production stability.  
-- Balanced technical leadership with effective stakeholder communication, ensuring smooth execution of complex cross-functional initiatives.  
-- Demonstrated innovation, accountability, and commitment to excellence across all assigned programs and initiatives.  
-
----
-
-**Summary:**  
-A high-performing year marked by significant achievements, including the successful migration to a Python-based platform, end-to-end architecture design, and enhanced collaboration with DevOps and compliance teams. Consistently delivered with precision, innovation, and ownership—strengthening the FinTech control environment and driving long-term operational excellence.
-
----
+plt.xlabel('Date', fontsize=12)
+plt.ylabel('Normalized Value (0-1 scale)', fontsize=12)
+plt.title('12 Series Min-Max Normalized', fontsize=14, fontweight='bold')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+My Recommendation for 12 Series:
+If comparing trends: Use indexed values (Method 1) or percent change (Method 2)
+If exploring data: Use Plotly interactive (Method 5) - you can toggle series on/off
+If actual values matter: Use grouped subplots (Method 4) in a 3×4 or 4×3 grid
+The normalization approaches work best because they put all series on a comparable scale while preserving the shape and trends of the data. The interactive Plotly option is particularly useful for 12 series since you can selectively show/hide series by clicking the legend.
+Which approach fits your use case best?
