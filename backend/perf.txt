@@ -146,3 +146,27 @@ If exploring data: Use Plotly interactive (Method 5) - you can toggle series on/
 If actual values matter: Use grouped subplots (Method 4) in a 3×4 or 4×3 grid
 The normalization approaches work best because they put all series on a comparable scale while preserving the shape and trends of the data. The interactive Plotly option is particularly useful for 12 series since you can selectively show/hide series by clicking the legend.
 Which approach fits your use case best?
+
+#!/bin/bash
+
+PROCESS_PATTERN="generic_controller.py"
+THRESHOLD=86400   # 24 hours in seconds
+
+echo "Checking processes older than 24 hours..."
+echo "-----------------------------------------"
+
+ps -eo pid,etimes,args --no-headers | \
+awk -v t="$THRESHOLD" -v p="$PROCESS_PATTERN" '
+$2 > t && $0 ~ p {
+    printf "PID=%s | Runtime=%s seconds | CMD=%s\n", $1, $2, substr($0, index($0,$3))
+}
+'
+
+echo
+echo "Killing processes older than 24 hours..."
+echo "-----------------------------------------"
+
+ps -eo pid,etimes,args --no-headers | \
+awk -v t="$THRESHOLD" -v p="$PROCESS_PATTERN" '
+$2 > t && $0 ~ p { print $1 }
+' | xargs -r sudo kill -9
