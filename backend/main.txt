@@ -1,1528 +1,1351 @@
-import asyncio
-import json
+"""
+Config Validator Router
+Handles Excel config file validation via subprocess execution.
+Validates configs across sheets and produces a Validation sheet with errors.
+"""
+from fastapi import APIRouter, HTTPException
+from pathlib import Path as _Path
+import json as _json
+from typing import Optional as _Optional
+from datetime import datetime
 import logging
-import multiprocessing as mp
-import signal
-import time
-import traceback
-import uuid
-from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
-from enum import Enum
-from multiprocessing import Manager, Process, Queue
-from typing import Any, Dict, List, Optional, Union
+import sys
+import os
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, validator
-import uvicorn
+sys.path.insert(0, str(_Path(__file__).parent.parent))
+from control_execution.control_runner import control_runner
+from control_execution.task_persistence import TASK_STORAGE_DIR
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# Data Models
-# ============================================================================
+router = APIRouter(prefix="/api/config-validator", tags=["config-validator"])
 
-class ProcessStatus(str, Enum):
-    PENDING = "PENDING"
-    RUNNING = "RUNNING" 
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
-    CANCELLED = "CANCELLED"
+# Results storage directory
+RESULTS_DIR = TASK_STORAGE_DIR / "config_validator_results"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-class ProcessType(str, Enum):
-    READ = "read"
-    TRANSFORM = "transform"
-    ENRICH = "enrich"
-    GENERATE = "generate"
 
-class APIError(BaseModel):
-    error_code: str
-    message: str
-    details: Optional[str] = None
-    suggestion: Optional[str] = None
+@router.post("/validate")
+async def start_validation(request: dict):
+    """
+    Start config validation by invoking config_validator_script.py as a subprocess.
 
-class APIResponse(BaseModel):
-    success: bool
-    data: Optional[Any] = None
-    error: Optional[APIError] = None
-    metadata: Optional[Dict[str, Any]] = None
+    Request body:
+        - file_path: Path to the Excel config file on the server
+    """
+    try:
+        file_path = request.get("file_path", "").strip()
+        if not file_path:
+            raise HTTPException(status_code=400, detail="file_path is required")
 
-class ProcessProgress(BaseModel):
-    process_id: str
-    progress_percentage: float = Field(ge=0, le=100)
-    current_stage: str
-    estimated_completion: Optional[datetime] = None
-    logs: List[str] = []
-    stages_completed: List[str] = []
-    current_stage_details: Optional[str] = None
+        # Validate file exists and is an Excel file
+        path = _Path(file_path)
+        if not path.exists():
+            raise HTTPException(status_code=400, detail=f"File not found: {file_path}")
+        if path.suffix.lower() not in (".xlsx", ".xls"):
+            raise HTTPException(status_code=400, detail="File must be .xlsx or .xls")
 
-class ProcessSchema(BaseModel):
-    name: str
-    description: str
-    parameters: Dict[str, Any]
-    estimated_duration: int  # in seconds
-    output_format: str
-    stages: List[str]
-    required_params: List[str] = []
+        logger.info(f"[ConfigValidator] Starting validation for: {file_path}")
 
-class ProcessRequest(BaseModel):
-    parameters: Dict[str, Any] = {}
-    
-    @validator('parameters')
-    def validate_parameters(cls, v):
-        return v
+        python_script_path = "api/config_validator_script.py"
 
-class ProcessInfo(BaseModel):
-    process_id: str
-    name: str
-    status: ProcessStatus
-    created_at: datetime
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
-    data_count: Optional[int] = None
-    progress: Optional[ProcessProgress] = None
-    duration_seconds: Optional[float] = None
-
-class ProcessResult(BaseModel):
-    process_id: str
-    process_name: str
-    status: ProcessStatus
-    result: Optional[Dict[str, Any]] = None
-    data_count: Optional[int] = None
-    completed_at: Optional[datetime] = None
-    duration_seconds: Optional[float] = None
-    metadata: Dict[str, Any] = {}
-
-# ============================================================================
-# Process Implementations
-# ============================================================================
-
-class DataProcessor:
-    """Base class for all data processors"""
-    
-    def __init__(self, process_id: str, progress_queue: Queue):
-        self.process_id = process_id
-        self.progress_queue = progress_queue
-        self.stages = []
-        
-    def update_progress(self, stage: str, percentage: float, details: str = None, logs: List[str] = None):
-        """Update process progress"""
-        try:
-            progress = {
-                'process_id': self.process_id,
-                'current_stage': stage,
-                'progress_percentage': percentage,
-                'current_stage_details': details,
-                'logs': logs or [],
-                'timestamp': datetime.now().isoformat()
-            }
-            self.progress_queue.put(progress)
-        except Exception as e:
-            logger.error(f"Failed to update progress: {e}")
-
-class ReadProcessor(DataProcessor):
-    """Data reading processor"""
-    
-    def __init__(self, process_id: str, progress_queue: Queue):
-        super().__init__(process_id, progress_queue)
-        self.stages = ["initializing", "connecting", "reading", "validating", "completed"]
-    
-    def execute(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute read process"""
-        
-        # Stage 1: Initializing
-        self.update_progress("initializing", 10, "Setting up data source connections")
-        time.sleep(1)
-        
-        # Stage 2: Connecting
-        self.update_progress("connecting", 25, "Establishing connection to data source")
-        time.sleep(2)
-        
-        # Stage 3: Reading
-        self.update_progress("reading", 60, "Reading data from source")
-        
-        # Simulate reading data
-        source_type = parameters.get('source_type', 'database')
-        batch_size = parameters.get('batch_size', 100)
-        total_records = parameters.get('total_records', 1000)
-        
-        data = []
-        for i in range(total_records):
-            if i % (total_records // 4) == 0:
-                progress = 60 + (i / total_records) * 30
-                self.update_progress("reading", progress, f"Read {i}/{total_records} records")
-            
-            record = {
-                "id": i,
-                "source_type": source_type,
-                "data_field_1": f"value_{i}",
-                "data_field_2": i * 1.5,
-                "timestamp": datetime.now().isoformat(),
-                "batch_id": i // batch_size,
-                "record_metadata": {
-                    "created_by": "read_processor",
-                    "version": "1.0",
-                    "quality_score": round(0.8 + (i % 20) / 100, 2)
-                }
-            }
-            data.append(record)
-            
-            if i % 100 == 0:
-                time.sleep(0.1)
-        
-        # Stage 4: Validating
-        self.update_progress("validating", 95, "Validating read data")
-        time.sleep(1)
-        
-        # Stage 5: Completed
-        self.update_progress("completed", 100, f"Successfully read {len(data)} records")
-        
-        return {
-            "operation": "read",
-            "source_type": source_type,
-            "records": data,
-            "metadata": {
-                "total_records": len(data),
-                "batch_size": batch_size,
-                "source_info": {
-                    "type": source_type, 
-                    "connected_at": datetime.now().isoformat(),
-                    "connection_id": f"conn_{uuid.uuid4().hex[:8]}"
-                },
-                "data_quality": {
-                    "completeness": 99.5,
-                    "accuracy": 98.2,
-                    "validity": 99.8
-                }
-            }
-        }
-
-class TransformProcessor(DataProcessor):
-    """Data transformation processor"""
-    
-    def __init__(self, process_id: str, progress_queue: Queue):
-        super().__init__(process_id, progress_queue)
-        self.stages = ["preparing", "analyzing", "transforming", "optimizing", "completed"]
-    
-    def execute(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute transform process"""
-        
-        # Stage 1: Preparing
-        self.update_progress("preparing", 15, "Preparing transformation rules")
-        time.sleep(1)
-        
-        # Stage 2: Analyzing
-        self.update_progress("analyzing", 30, "Analyzing data structure")
-        time.sleep(2)
-        
-        # Stage 3: Transforming
-        self.update_progress("transforming", 70, "Applying transformations")
-        
-        # Simulate transformation
-        transform_type = parameters.get('transform_type', 'normalize')
-        total_records = parameters.get('total_records', 1000)
-        
-        transformed_data = []
-        for i in range(total_records):
-            if i % (total_records // 5) == 0:
-                progress = 30 + (i / total_records) * 40
-                self.update_progress("transforming", progress, f"Transformed {i}/{total_records} records")
-            
-            record = {
-                "transformed_id": f"T_{i:06d}",
-                "original_id": i,
-                "transform_type": transform_type,
-                "normalized_value": round((i * 2.5) / 100, 4),
-                "category": f"cat_{i % 10}",
-                "processed_at": datetime.now().isoformat(),
-                "transformation_rules": ["normalize", "categorize", "timestamp"],
-                "data_lineage": {
-                    "source_system": "read_processor",
-                    "transformation_id": f"trans_{uuid.uuid4().hex[:8]}",
-                    "applied_rules": ["rule_1", "rule_2", "rule_3"]
-                },
-                "quality_metrics": {
-                    "transformation_confidence": round(0.9 + (i % 10) / 100, 3),
-                    "data_integrity": True,
-                    "validation_status": "passed"
-                }
-            }
-            transformed_data.append(record)
-            
-            if i % 50 == 0:
-                time.sleep(0.05)
-        
-        # Stage 4: Optimizing
-        self.update_progress("optimizing", 85, "Optimizing transformed data")
-        time.sleep(1)
-        
-        # Stage 5: Completed
-        self.update_progress("completed", 100, f"Successfully transformed {len(transformed_data)} records")
-        
-        return {
-            "operation": "transform",
-            "transform_type": transform_type,
-            "records": transformed_data,
-            "metadata": {
-                "total_records": len(transformed_data),
-                "transformation_summary": {
-                    "rules_applied": ["normalize", "categorize", "timestamp"],
-                    "success_rate": 99.8,
-                    "failed_records": 2,
-                    "processed_at": datetime.now().isoformat(),
-                    "performance_metrics": {
-                        "avg_processing_time_ms": 1.2,
-                        "throughput_records_per_sec": 833
-                    }
-                }
-            }
-        }
-
-class EnrichProcessor(DataProcessor):
-    """Data enrichment processor"""
-    
-    def __init__(self, process_id: str, progress_queue: Queue):
-        super().__init__(process_id, progress_queue)
-        self.stages = ["loading", "matching", "enriching", "validating", "completed"]
-    
-    def execute(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute enrich process"""
-        
-        # Stage 1: Loading
-        self.update_progress("loading", 20, "Loading enrichment sources")
-        time.sleep(1.5)
-        
-        # Stage 2: Matching
-        self.update_progress("matching", 40, "Matching records with enrichment data")
-        time.sleep(2)
-        
-        # Stage 3: Enriching
-        self.update_progress("enriching", 75, "Applying data enrichment")
-        
-        # Simulate enrichment
-        enrichment_type = parameters.get('enrichment_type', 'demographic')
-        total_records = parameters.get('total_records', 1000)
-        
-        enriched_data = []
-        for i in range(total_records):
-            if i % (total_records // 3) == 0:
-                progress = 40 + (i / total_records) * 35
-                self.update_progress("enriching", progress, f"Enriched {i}/{total_records} records")
-            
-            record = {
-                "enriched_id": f"E_{i:06d}",
-                "base_id": i,
-                "enrichment_type": enrichment_type,
-                "demographic_data": {
-                    "age_group": f"group_{i % 5}",
-                    "location": f"region_{i % 20}",
-                    "segment": f"segment_{i % 8}",
-                    "income_bracket": f"bracket_{i % 6}"
-                },
-                "behavioral_data": {
-                    "activity_score": round(i * 0.1 % 10, 2),
-                    "engagement_level": ["low", "medium", "high"][i % 3],
-                    "last_activity": datetime.now().isoformat(),
-                    "interaction_count": i % 50,
-                    "preference_category": f"pref_{i % 12}"
-                },
-                "enrichment_confidence": round(0.7 + (i % 30) / 100, 2),
-                "enriched_at": datetime.now().isoformat(),
-                "enrichment_sources": [
-                    "demographic_service",
-                    "behavioral_analytics",
-                    "location_service"
-                ],
-                "data_completeness": {
-                    "demographic": round(0.8 + (i % 20) / 100, 2),
-                    "behavioral": round(0.9 + (i % 10) / 100, 2),
-                    "overall": round(0.85 + (i % 15) / 100, 2)
-                }
-            }
-            enriched_data.append(record)
-            
-            if i % 75 == 0:
-                time.sleep(0.08)
-        
-        # Stage 4: Validating
-        self.update_progress("validating", 90, "Validating enriched data quality")
-        time.sleep(1)
-        
-        # Stage 5: Completed
-        self.update_progress("completed", 100, f"Successfully enriched {len(enriched_data)} records")
-        
-        return {
-            "operation": "enrich",
-            "enrichment_type": enrichment_type,
-            "records": enriched_data,
-            "metadata": {
-                "total_records": len(enriched_data),
-                "enrichment_summary": {
-                    "sources_used": ["demographic_db", "behavioral_db", "location_service"],
-                    "avg_confidence": 0.85,
-                    "match_rate": 95.2,
-                    "enrichment_coverage": {
-                        "demographic": 92.3,
-                        "behavioral": 87.1,
-                        "location": 96.8
-                    },
-                    "processed_at": datetime.now().isoformat(),
-                    "api_calls_made": 1500,
-                    "cache_hit_rate": 78.5
-                }
-            }
-        }
-
-class GenerateProcessor(DataProcessor):
-    """Report/output generation processor"""
-    
-    def __init__(self, process_id: str, progress_queue: Queue):
-        super().__init__(process_id, progress_queue)
-        self.stages = ["planning", "aggregating", "formatting", "generating", "completed"]
-    
-    def execute(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute generate process"""
-        
-        # Stage 1: Planning
-        self.update_progress("planning", 18, "Planning report structure")
-        time.sleep(1)
-        
-        # Stage 2: Aggregating
-        self.update_progress("aggregating", 40, "Aggregating source data")
-        time.sleep(2)
-        
-        # Stage 3: Formatting
-        self.update_progress("formatting", 65, "Formatting output structure")
-        time.sleep(1.5)
-        
-        # Stage 4: Generating
-        self.update_progress("generating", 85, "Generating final output")
-        
-        # Simulate generation
-        output_type = parameters.get('output_type', 'summary_report')
-        total_records = parameters.get('total_records', 1000)
-        
-        generated_data = []
-        for i in range(total_records):
-            if i % (total_records // 2) == 0:
-                progress = 65 + (i / total_records) * 20
-                self.update_progress("generating", progress, f"Generated {i}/{total_records} output records")
-            
-            record = {
-                "report_id": f"R_{i:06d}",
-                "generated_at": datetime.now().isoformat(),
-                "output_type": output_type,
-                "summary_metrics": {
-                    "total_processed": i + 1,
-                    "success_rate": round(95 + (i % 5), 2),
-                    "avg_processing_time": round(2.5 + (i % 10) * 0.1, 2),
-                    "data_volume_mb": round((i + 1) * 0.001, 3)
-                },
-                "detailed_results": {
-                    "category_breakdown": {f"cat_{j}": i % (j + 1) for j in range(5)},
-                    "quality_scores": [round(0.8 + (i + j) * 0.01 % 0.2, 3) for j in range(3)],
-                    "trend_analysis": f"trend_{i % 4}",
-                    "anomaly_count": i % 15,
-                    "confidence_intervals": {
-                        "lower": round(0.7 + (i % 20) / 100, 2),
-                        "upper": round(0.9 + (i % 10) / 100, 2)
-                    }
-                },
-                "output_files": {
-                    "main_report": f"{output_type}_{i}.json",
-                    "summary": f"{output_type}_summary_{i}.csv",
-                    "charts": f"{output_type}_charts_{i}.png",
-                    "raw_data": f"{output_type}_raw_{i}.parquet"
-                },
-                "export_metadata": {
-                    "format": "multi-format",
-                    "compression": "gzip",
-                    "file_size_kb": round((i + 1) * 0.5, 1),
-                    "checksum": f"sha256_{uuid.uuid4().hex[:16]}"
-                },
-                "export_ready": True
-            }
-            generated_data.append(record)
-            
-            if i % 100 == 0:
-                time.sleep(0.05)
-        
-        # Stage 5: Completed
-        self.update_progress("completed", 100, f"Successfully generated {len(generated_data)} output records")
-        
-        return {
-            "operation": "generate",
-            "output_type": output_type,
-            "records": generated_data,
-            "metadata": {
-                "total_records": len(generated_data),
-                "generation_summary": {
-                    "output_formats": ["json", "csv", "png", "parquet"],
-                    "total_file_size_mb": round(len(generated_data) * 0.001, 2),
-                    "generation_time_seconds": 15.2,
-                    "export_ready": True,
-                    "generated_at": datetime.now().isoformat(),
-                    "report_sections": ["executive_summary", "detailed_analysis", "recommendations", "appendix"],
-                    "visualization_count": 12,
-                    "data_sources": ["read", "transform", "enrich"]
-                }
-            }
-        }
-
-# ============================================================================
-# Process Registry
-# ============================================================================
-
-class ProcessRegistry:
-    """Registry for all available processes"""
-    
-    def __init__(self):
-        self.processes = {
-            ProcessType.READ: {
-                "class": ReadProcessor,
-                "schema": ProcessSchema(
-                    name="Data Read",
-                    description="Read data from various sources (database, files, APIs)",
-                    parameters={
-                        "source_type": "database",
-                        "batch_size": 100,
-                        "total_records": 1000
-                    },
-                    estimated_duration=30,
-                    output_format="json",
-                    stages=["initializing", "connecting", "reading", "validating", "completed"],
-                    required_params=["source_type"]
-                )
+        control_params = {
+            "control_name": "config_validator",
+            "task_name": f"Config Validation - {path.name}",
+            "run_env": "DEV",
+            "expected_run_date": datetime.now().strftime("%Y-%m-%d"),
+            "python_script_path": python_script_path,
+            "script_arguments": [file_path],
+            "environment_variables": {
+                "FILE_PATH": file_path,
+                "RESULTS_DIR": str(RESULTS_DIR),
             },
-            ProcessType.TRANSFORM: {
-                "class": TransformProcessor,
-                "schema": ProcessSchema(
-                    name="Data Transform",
-                    description="Transform and normalize data according to business rules",
-                    parameters={
-                        "transform_type": "normalize",
-                        "total_records": 1000
-                    },
-                    estimated_duration=25,
-                    output_format="json",
-                    stages=["preparing", "analyzing", "transforming", "optimizing", "completed"],
-                    required_params=["transform_type"]
-                )
-            },
-            ProcessType.ENRICH: {
-                "class": EnrichProcessor,
-                "schema": ProcessSchema(
-                    name="Data Enrich",
-                    description="Enrich data with additional information from external sources",
-                    parameters={
-                        "enrichment_type": "demographic",
-                        "total_records": 1000
-                    },
-                    estimated_duration=35,
-                    output_format="json",
-                    stages=["loading", "matching", "enriching", "validating", "completed"],
-                    required_params=["enrichment_type"]
-                )
-            },
-            ProcessType.GENERATE: {
-                "class": GenerateProcessor,
-                "schema": ProcessSchema(
-                    name="Generate Report",
-                    description="Generate reports and final outputs from processed data",
-                    parameters={
-                        "output_type": "summary_report",
-                        "total_records": 1000
-                    },
-                    estimated_duration=20,
-                    output_format="json",
-                    stages=["planning", "aggregating", "formatting", "generating", "completed"],
-                    required_params=["output_type"]
-                )
-            }
+            "control_id": "config_validator",
         }
-    
-    def get_process_class(self, process_type: ProcessType):
-        return self.processes.get(process_type, {}).get("class")
-    
-    def get_process_schema(self, process_type: ProcessType):
-        return self.processes.get(process_type, {}).get("schema")
-    
-    def get_all_schemas(self):
-        return {k.value: v["schema"] for k, v in self.processes.items()}
 
-# ============================================================================
-# WebSocket Connection Manager
-# ============================================================================
+        result = control_runner.run_control_task(control_params)
+        result["file_path"] = file_path
 
-class ConnectionManager:
-    """WebSocket connection manager"""
-    
-    def __init__(self):
-        self.active_connections: Dict[str, List[WebSocket]] = {}
-    
-    async def connect(self, websocket: WebSocket, process_id: str):
-        await websocket.accept()
-        if process_id not in self.active_connections:
-            self.active_connections[process_id] = []
-        self.active_connections[process_id].append(websocket)
-        logger.info(f"WebSocket connected for process {process_id}")
-    
-    def disconnect(self, websocket: WebSocket, process_id: str):
-        if process_id in self.active_connections:
-            if websocket in self.active_connections[process_id]:
-                self.active_connections[process_id].remove(websocket)
-            if not self.active_connections[process_id]:
-                del self.active_connections[process_id]
-        logger.info(f"WebSocket disconnected for process {process_id}")
-    
-    async def send_personal_message(self, message: dict, process_id: str):
-        if process_id in self.active_connections:
-            disconnected = []
-            for connection in self.active_connections[process_id]:
-                try:
-                    await connection.send_json(message)
-                except Exception as e:
-                    logger.error(f"Failed to send message to WebSocket: {e}")
-                    disconnected.append(connection)
-            
-            # Remove disconnected connections
-            for conn in disconnected:
-                if conn in self.active_connections[process_id]:
-                    self.active_connections[process_id].remove(conn)
+        logger.info(f"[ConfigValidator] Task started: {result.get('task_id')}")
+        return result
 
-# ============================================================================
-# Process Manager
-# ============================================================================
-
-class ProcessManager:
-    def __init__(self):
-        self.manager = Manager()
-        self.process_registry = self.manager.dict()
-        self.progress_queues = {}
-        self.active_processes = {}
-        self.max_concurrent_processes = mp.cpu_count()
-        self.cleanup_interval = 3600
-        self.registry = ProcessRegistry()
-        
-    def generate_process_id(self) -> str:
-        return str(uuid.uuid4())
-    
-    def get_active_process_count(self) -> int:
-        return len([p for p in self.active_processes.values() if p.is_alive()])
-    
-    def start_process(self, process_name: str, parameters: Dict[str, Any]) -> str:
-        """Start a new process"""
-        try:
-            # Validate process type
-            try:
-                process_type = ProcessType(process_name)
-            except ValueError:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid process type: {process_name}. Available types: {[t.value for t in ProcessType]}"
-                )
-            
-            # Check capacity
-            if self.get_active_process_count() >= self.max_concurrent_processes:
-                raise HTTPException(
-                    status_code=429,
-                    detail="Maximum concurrent processes reached"
-                )
-            
-            process_id = self.generate_process_id()
-            
-            # Create progress queue
-            progress_queue = Queue()
-            self.progress_queues[process_id] = progress_queue
-            
-            # Initialize process info
-            process_info = {
-                'process_id': process_id,
-                'name': process_name,
-                'status': ProcessStatus.PENDING.value,
-                'created_at': datetime.now().isoformat(),
-                'started_at': None,
-                'completed_at': None,
-                'result': None,
-                'error': None,
-                'data_count': None,
-                'parameters': parameters,
-                'progress': None,
-                'duration_seconds': None
-            }
-            
-            self.process_registry[process_id] = process_info
-            
-            # Start process
-            process = Process(
-                target=self._execute_process,
-                args=(process_id, process_type, parameters, progress_queue)
-            )
-            process.start()
-            self.active_processes[process_id] = process
-            
-            logger.info(f"Started process {process_id} for {process_name}")
-            return process_id
-            
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to start process {process_name}: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to start process: {str(e)}")
-    
-    def _execute_process(self, process_id: str, process_type: ProcessType, 
-                        parameters: Dict[str, Any], progress_queue: Queue):
-        """Execute the actual process"""
-        start_time = time.time()
-        
-        try:
-            # Update status to running
-            process_info = dict(self.process_registry[process_id])
-            process_info['status'] = ProcessStatus.RUNNING.value
-            process_info['started_at'] = datetime.now().isoformat()
-            self.process_registry[process_id] = process_info
-            
-            logger.info(f"Process {process_id} ({process_type.value}) started execution")
-            
-            # Get processor class and execute
-            processor_class = self.registry.get_process_class(process_type)
-            if not processor_class:
-                raise Exception(f"No processor found for {process_type.value}")
-            
-            processor = processor_class(process_id, progress_queue)
-            result = processor.execute(parameters)
-            
-            # Calculate duration
-            duration = time.time() - start_time
-            
-            # Update with successful result
-            process_info = dict(self.process_registry[process_id])
-            process_info['status'] = ProcessStatus.COMPLETED.value
-            process_info['completed_at'] = datetime.now().isoformat()
-            process_info['result'] = result
-            process_info['data_count'] = len(result.get('records', []))
-            process_info['duration_seconds'] = round(duration, 2)
-            self.process_registry[process_id] = process_info
-            
-            logger.info(f"Process {process_id} completed successfully")
-            
-        except Exception as e:
-            duration = time.time() - start_time
-            error_msg = f"Process failed: {str(e)}"
-            logger.error(f"Process {process_id} failed: {error_msg}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            process_info = dict(self.process_registry[process_id])
-            process_info['status'] = ProcessStatus.FAILED.value
-            process_info['completed_at'] = datetime.now().isoformat()
-            process_info['error'] = error_msg
-            process_info['duration_seconds'] = round(duration, 2)
-            self.process_registry[process_id] = process_info
-        
-        finally:
-            # Clean up progress queue
-            if process_id in self.progress_queues:
-                del self.progress_queues[process_id]
-    
-    def get_process_status(self, process_id: str) -> ProcessInfo:
-        """Get process status"""
-        if process_id not in self.process_registry:
-            raise HTTPException(status_code=404, detail="Process not found")
-        
-        process_info = dict(self.process_registry[process_id])
-        
-        # Get latest progress if available
-        if process_id in self.progress_queues:
-            try:
-                while not self.progress_queues[process_id].empty():
-                    progress_data = self.progress_queues[process_id].get_nowait()
-                    process_info['progress'] = progress_data
-            except:
-                pass
-        
-        # Convert dates
-        process_info['created_at'] = datetime.fromisoformat(process_info['created_at'])
-        if process_info['started_at']:
-            process_info['started_at'] = datetime.fromisoformat(process_info['started_at'])
-        if process_info['completed_at']:
-            process_info['completed_at'] = datetime.fromisoformat(process_info['completed_at'])
-        
-        return ProcessInfo(**process_info)
-    
-    def get_process_result(self, process_id: str) -> ProcessResult:
-        """Get process result"""
-        process_info = self.get_process_status(process_id)
-        
-        if process_info.status == ProcessStatus.RUNNING:
-            raise HTTPException(status_code=202, detail="Process still running")
-        elif process_info.status == ProcessStatus.FAILED:
-            raise HTTPException(status_code=500, detail=f"Process failed: {process_info.error}")
-        elif process_info.status == ProcessStatus.PENDING:
-            raise HTTPException(status_code=202, detail="Process not started yet")
-        
-        return ProcessResult(
-            process_id=process_id,
-            process_name=process_info.name,
-            status=process_info.status,
-            result=process_info.result,
-            data_count=process_info.data_count,
-            completed_at=process_info.completed_at,
-            duration_seconds=process_info.duration_seconds,
-            metadata={
-                "created_at": process_info.created_at.isoformat(),
-                "started_at": process_info.started_at.isoformat() if process_info.started_at else None,
-                "parameters": dict(self.process_registry[process_id])['parameters']
-            }
-        )
-    
-    def cancel_process(self, process_id: str) -> bool:
-        """Cancel a running process"""
-        if process_id not in self.process_registry:
-            raise HTTPException(status_code=404, detail="Process not found")
-        
-        if process_id in self.active_processes:
-            process = self.active_processes[process_id]
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-                if process.is_alive():
-                    process.kill()
-                
-                process_info = dict(self.process_registry[process_id])
-                process_info['status'] = ProcessStatus.CANCELLED.value
-                process_info['completed_at'] = datetime.now().isoformat()
-                self.process_registry[process_id] = process_info
-                
-                return True
-        
-        return False
-    
-    def list_processes(self, status_filter: Optional[ProcessStatus] = None, 
-                      limit: int = 100, offset: int = 0) -> List[ProcessInfo]:
-        """List processes with pagination"""
-        processes = []
-        for process_id, info in self.process_registry.items():
-            process_info = dict(info)
-            
-            # Apply status filter
-            if status_filter and process_info['status'] != status_filter.value:
-                continue
-            
-            # Convert dates
-            process_info['created_at'] = datetime.fromisoformat(process_info['created_at'])
-            if process_info['started_at']:
-                process_info['started_at'] = datetime.fromisoformat(process_info['started_at'])
-            if process_info['completed_at']:
-                process_info['completed_at'] = datetime.fromisoformat(process_info['completed_at'])
-            
-            processes.append(ProcessInfo(**process_info))
-        
-        # Sort by creation date (newest first)
-        processes.sort(key=lambda x: x.created_at, reverse=True)
-        
-        # Apply pagination
-        return processes[offset:offset + limit]
-    
-    def cleanup_completed_processes(self):
-        """Clean up old processes"""
-        current_time = datetime.now()
-        cleanup_threshold = current_time - timedelta(seconds=self.cleanup_interval)
-        
-        # Clean up process objects
-        to_remove = []
-        for process_id, process in self.active_processes.items():
-            if not process.is_alive():
-                process.join(timeout=1)
-                to_remove.append(process_id)
-        
-        for process_id in to_remove:
-            del self.active_processes[process_id]
-        
-        # Clean up old registry entries (keep for longer for history)
-        to_remove_registry = []
-        for process_id, info in list(self.process_registry.items()):
-            if (info.get('completed_at') and 
-                datetime.fromisoformat(info['completed_at']) < cleanup_threshold):
-                to_remove_registry.append(process_id)
-        
-        for process_id in to_remove_registry:
-            del self.process_registry[process_id]
-
-# ============================================================================
-# FastAPI Application
-# ============================================================================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan manager"""
-    # Startup
-    logger.info("Starting up FastAPI application")
-    
-    # Start cleanup task
-    async def cleanup_task():
-        while True:
-            try:
-                process_manager.cleanup_completed_processes()
-                await asyncio.sleep(300)  # Run every 5 minutes
-            except Exception as e:
-                logger.error(f"Cleanup task error: {str(e)}")
-    
-    asyncio.create_task(cleanup_task())
-    
-    yield
-    
-    # Shutdown
-    logger.info("Shutting down FastAPI application")
-
-# Initialize managers
-process_manager = ProcessManager()
-connection_manager = ConnectionManager()
-
-# Create FastAPI app
-app = FastAPI(
-    title="Production Process Management API",
-    description="Comprehensive process management system with WebSocket support for React frontend",
-    version="2.0.0",
-    lifespan=lifespan
-)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",  # React dev server
-        "http://localhost:3001",  # Alternative React port
-        "https://your-frontend-domain.com"  # Production domain
-    ],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-# ============================================================================
-# WebSocket Endpoints
-# ============================================================================
-
-@app.websocket("/ws/{process_id}")
-async def websocket_endpoint(websocket: WebSocket, process_id: str):
-    """WebSocket endpoint for real-time process updates"""
-    await connection_manager.connect(websocket, process_id)
-    
-    try:
-        # Send initial status
-        try:
-            status = process_manager.get_process_status(process_id)
-            await connection_manager.send_personal_message(
-                {
-                    "type": "status", 
-                    "data": status.dict(),
-                    "timestamp": datetime.now().isoformat()
-                }, 
-                process_id
-            )
-        except HTTPException:
-            await websocket.send_json({
-                "type": "error",
-                "message": "Process not found",
-                "timestamp": datetime.now().isoformat()
-            })
-            return
-        
-        # Monitor progress
-        while True:
-            try:
-                # Check for progress updates
-                if process_id in process_manager.progress_queues:
-                    try:
-                        progress_data = process_manager.progress_queues[process_id].get_nowait()
-                        await connection_manager.send_personal_message(
-                            {
-                                "type": "progress", 
-                                "data": progress_data,
-                                "timestamp": datetime.now().isoformat()
-                            }, 
-                            process_id
-                        )
-                    except:
-                        pass
-                
-                # Check if process is complete
-                current_status = process_manager.get_process_status(process_id)
-                if current_status.status in [ProcessStatus.COMPLETED, ProcessStatus.FAILED, ProcessStatus.CANCELLED]:
-                    await connection_manager.send_personal_message(
-                        {
-                            "type": "completed", 
-                            "data": current_status.dict(),
-                            "timestamp": datetime.now().isoformat()
-                        }, 
-                        process_id
-                    )
-                    break
-                
-                await asyncio.sleep(1)  # Check every second
-                
-            except WebSocketDisconnect:
-                break
-            except Exception as e:
-                logger.error(f"WebSocket error for process {process_id}: {e}")
-                break
-    
-    except WebSocketDisconnect:
-        pass
-    finally:
-        connection_manager.disconnect(websocket, process_id)
-
-# ============================================================================
-# API Endpoints
-# ============================================================================
-
-@app.get("/", tags=["Health"])
-async def root():
-    """Root endpoint"""
-    return {
-        "message": "Production Process Management API",
-        "version": "2.0.0",
-        "status": "operational",
-        "timestamp": datetime.now().isoformat(),
-        "endpoints": {
-            "health": "/health",
-            "processes": "/processes",
-            "websocket": "/ws/{process_id}",
-            "docs": "/docs",
-            "process_types": "/processes/types"
-        }
-    }
-
-@app.get("/health", tags=["Health"])
-async def health_check():
-    """Comprehensive health check"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "system_info": {
-            "active_processes": process_manager.get_active_process_count(),
-            "max_concurrent_processes": process_manager.max_concurrent_processes,
-            "total_processes_tracked": len(process_manager.process_registry),
-            "websocket_connections": sum(len(conns) for conns in connection_manager.active_connections.values()),
-            "cpu_count": mp.cpu_count(),
-            "memory_usage_mb": "N/A",  # Could add psutil for memory monitoring
-            "uptime_seconds": "N/A"
-        },
-        "api_info": {
-            "available_process_types": [t.value for t in ProcessType],
-            "supported_operations": ["read", "transform", "enrich", "generate"]
-        }
-    }
-
-@app.get("/processes/types", response_model=APIResponse, tags=["Process Types"])
-async def get_process_types():
-    """Get all available process types and their schemas"""
-    try:
-        schemas = process_manager.registry.get_all_schemas()
-        return APIResponse(
-            success=True,
-            data=schemas,
-            metadata={
-                "total_types": len(schemas),
-                "retrieved_at": datetime.now().isoformat()
-            }
-        )
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error getting process types: {str(e)}")
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="FETCH_ERROR",
-                message="Failed to fetch process types",
-                details=str(e)
-            )
-        )
+        logger.error(f"[ConfigValidator] Error starting validation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/processes/types/{process_name}/schema", response_model=APIResponse, tags=["Process Types"])
-async def get_process_schema(process_name: str):
-    """Get schema for a specific process type"""
+
+@router.get("/{task_id}/status")
+async def get_validation_status(task_id: str):
+    """Get status for a specific config validation task."""
     try:
-        try:
-            process_type = ProcessType(process_name)
-        except ValueError:
-            return APIResponse(
-                success=False,
-                error=APIError(
-                    error_code="INVALID_PROCESS_TYPE",
-                    message=f"Invalid process type: {process_name}",
-                    suggestion=f"Available types: {[t.value for t in ProcessType]}"
-                )
-            )
-        
-        schema = process_manager.registry.get_process_schema(process_type)
-        if not schema:
-            return APIResponse(
-                success=False,
-                error=APIError(
-                    error_code="SCHEMA_NOT_FOUND",
-                    message=f"Schema not found for process type: {process_name}"
-                )
-            )
-        
-        return APIResponse(
-            success=True,
-            data=schema.dict(),
-            metadata={"retrieved_at": datetime.now().isoformat()}
-        )
-        
+        result = control_runner.get_task_status(task_id)
+        return result
     except Exception as e:
-        logger.error(f"Error getting process schema: {str(e)}")
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="FETCH_ERROR",
-                message="Failed to fetch process schema",
-                details=str(e)
-            )
-        )
+        logger.error(f"[ConfigValidator] Error getting status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/processes/{process_name}", response_model=APIResponse, tags=["Process Management"])
-async def trigger_process(process_name: str, request: ProcessRequest = ProcessRequest()):
-    """Trigger a new process"""
+
+@router.get("/{task_id}/results")
+async def get_validation_results(task_id: str):
+    """
+    Get validation results after completion.
+    Reads the results JSON written by the subprocess script.
+    """
     try:
-        process_id = process_manager.start_process(process_name, request.parameters)
-        
-        return APIResponse(
-            success=True,
-            data={
-                "process_id": process_id,
-                "process_name": process_name,
-                "status": ProcessStatus.PENDING.value,
-                "websocket_url": f"/ws/{process_id}",
-                "status_url": f"/processes/{process_id}/status",
-                "result_url": f"/processes/{process_id}/result"
-            },
-            metadata={
-                "created_at": datetime.now().isoformat(),
-                "parameters": request.parameters,
-                "estimated_duration": process_manager.registry.get_process_schema(ProcessType(process_name)).estimated_duration
-            }
-        )
-        
-    except HTTPException as he:
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="PROCESS_START_ERROR",
-                message=he.detail,
-                suggestion="Check process name and parameters"
+        results_file = RESULTS_DIR / f"{task_id}.json"
+        if not results_file.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Results not found for task {task_id}. Task may still be running."
             )
-        )
-    except Exception as e:
-        logger.error(f"Unexpected error starting process: {str(e)}")
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="INTERNAL_ERROR",
-                message="Internal server error",
-                details=str(e)
-            )
-        )
 
-@app.get("/processes/{process_id}/status", response_model=APIResponse, tags=["Process Management"])
-async def get_process_status(process_id: str):
-    """Get detailed process status"""
-    try:
-        status = process_manager.get_process_status(process_id)
-        
-        return APIResponse(
-            success=True,
-            data=status.dict(),
-            metadata={
-                "retrieved_at": datetime.now().isoformat(),
-                "websocket_url": f"/ws/{process_id}",
-                "result_available": status.status == ProcessStatus.COMPLETED
-            }
-        )
-        
-    except HTTPException as he:
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="PROCESS_NOT_FOUND",
-                message=he.detail,
-                suggestion="Check the process ID"
-            )
-        )
-    except Exception as e:
-        logger.error(f"Error getting process status: {str(e)}")
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="FETCH_ERROR",
-                message="Failed to fetch process status",
-                details=str(e)
-            )
-        )
+        with open(results_file, "r", encoding="utf-8") as f:
+            results = _json.load(f)
 
-@app.get("/processes/{process_id}/result", response_model=APIResponse, tags=["Process Management"])
-async def get_process_result(process_id: str):
-    """Get process result"""
-    try:
-        result = process_manager.get_process_result(process_id)
-        
-        return APIResponse(
-            success=True,
-            data=result.dict(),
-            metadata={
-                "retrieved_at": datetime.now().isoformat(),
-                "data_size": len(result.result.get('records', [])) if result.result else 0,
-                "stream_available": True,
-                "stream_url": f"/processes/{process_id}/stream"
-            }
-        )
-        
-    except HTTPException as he:
-        if he.status_code == 202:
-            return APIResponse(
-                success=False,
-                error=APIError(
-                    error_code="PROCESS_NOT_READY",
-                    message=he.detail,
-                    suggestion="Process is still running. Use WebSocket for real-time updates."
-                )
-            )
-        else:
-            return APIResponse(
-                success=False,
-                error=APIError(
-                    error_code="PROCESS_ERROR",
-                    message=he.detail
-                )
-            )
-    except Exception as e:
-        logger.error(f"Error getting process result: {str(e)}")
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="FETCH_ERROR",
-                message="Failed to fetch process result",
-                details=str(e)
-            )
-        )
+        results["task_id"] = task_id
+        results["retrieved_at"] = datetime.now().isoformat()
+        return results
 
-@app.get("/processes/{process_id}/stream", tags=["Process Management"])
-async def stream_process_result(process_id: str):
-    """Stream process result for large datasets"""
-    try:
-        result = process_manager.get_process_result(process_id)
-        
-        def generate_stream():
-            yield f"data: {json.dumps({'type': 'start', 'total_records': result.data_count, 'process_id': process_id})}\n\n"
-            
-            if result.result and 'records' in result.result:
-                batch_size = 50  # Stream in batches
-                records = result.result['records']
-                total_batches = (len(records) + batch_size - 1) // batch_size
-                
-                for i in range(0, len(records), batch_size):
-                    batch = records[i:i + batch_size]
-                    batch_number = i // batch_size + 1
-                    
-                    yield f"data: {json.dumps({
-                        'type': 'batch', 
-                        'batch_number': batch_number,
-                        'total_batches': total_batches,
-                        'records': batch,
-                        'progress': round((batch_number / total_batches) * 100, 2)
-                    })}\n\n"
-                    
-            yield f"data: {json.dumps({
-                'type': 'end', 
-                'message': 'Stream completed',
-                'total_records_streamed': result.data_count
-            })}\n\n"
-        
-        return StreamingResponse(
-            generate_stream(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "*"
-            }
-        )
-        
-    except HTTPException as he:
-        return APIResponse(
-            success=False,
-            error=APIError(error_code="STREAM_ERROR", message=he.detail)
-        )
+    except HTTPException:
+        raise
+    except _json.JSONDecodeError as e:
+        logger.error(f"[ConfigValidator] Invalid JSON in results file: {e}")
+        raise HTTPException(status_code=500, detail="Results file is corrupted")
     except Exception as e:
-        logger.error(f"Error streaming process result: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to stream result")
+        logger.error(f"[ConfigValidator] Error getting results: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/processes/{process_id}", response_model=APIResponse, tags=["Process Management"])
-async def cancel_process(process_id: str):
-    """Cancel a running process"""
-    try:
-        success = process_manager.cancel_process(process_id)
-        
-        if success:
-            return APIResponse(
-                success=True,
-                data={"message": f"Process {process_id} cancelled successfully"},
-                metadata={"cancelled_at": datetime.now().isoformat()}
-            )
-        else:
-            return APIResponse(
-                success=False,
-                error=APIError(
-                    error_code="CANCEL_FAILED",
-                    message=f"Process {process_id} could not be cancelled",
-                    suggestion="Process may already be completed or not running"
-                )
-            )
-            
-    except HTTPException as he:
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="PROCESS_NOT_FOUND",
-                message=he.detail
-            )
-        )
-    except Exception as e:
-        logger.error(f"Error cancelling process: {str(e)}")
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="CANCEL_ERROR",
-                message="Failed to cancel process",
-                details=str(e)
-            )
-        )
 
-@app.get("/processes", response_model=APIResponse, tags=["Process Management"])
-async def list_processes(
-    status: Optional[ProcessStatus] = Query(None, description="Filter by process status"),
-    limit: int = Query(100, ge=1, le=1000, description="Number of processes to return"),
-    offset: int = Query(0, ge=0, description="Number of processes to skip")
+@router.get("/{task_id}/logs")
+async def get_validation_logs(
+    task_id: str,
+    log_type: str = "execution",
+    lines: int = 200,
+    from_line: int = 0
 ):
-    """List processes with filtering and pagination"""
+    """Get logs for a specific config validation task."""
     try:
-        processes = process_manager.list_processes(status, limit, offset)
-        
-        return APIResponse(
-            success=True,
-            data=[p.dict() for p in processes],
-            metadata={
-                "total_returned": len(processes),
-                "limit": limit,
-                "offset": offset,
-                "filter": {"status": status.value if status else None},
-                "retrieved_at": datetime.now().isoformat(),
-                "has_more": len(processes) == limit  # Simple check for pagination
-            }
-        )
-        
+        result = control_runner.get_task_logs(task_id, log_type, lines, from_line)
+        return result
     except Exception as e:
-        logger.error(f"Error listing processes: {str(e)}")
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="LIST_ERROR",
-                message="Failed to list processes",
-                details=str(e)
-            )
-        )
+        logger.error(f"[ConfigValidator] Error getting logs: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/processes/{process_id}/logs", response_model=APIResponse, tags=["Process Management"])
-async def get_process_logs(process_id: str):
-    """Get process execution logs"""
+
+@router.get("/history")
+async def get_validation_history(limit: int = 20):
+    """Get recent config validation runs."""
     try:
-        status = process_manager.get_process_status(process_id)
-        
-        # Extract logs from progress data if available
-        logs = []
-        if status.progress and hasattr(status.progress, 'logs'):
-            logs = status.progress.logs
-        
-        return APIResponse(
-            success=True,
-            data={
-                "process_id": process_id,
-                "logs": logs,
-                "log_count": len(logs),
-                "last_updated": datetime.now().isoformat()
-            },
-            metadata={
-                "retrieved_at": datetime.now().isoformat()
-            }
-        )
-        
-    except HTTPException as he:
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="PROCESS_NOT_FOUND",
-                message=he.detail
-            )
-        )
-    except Exception as e:
-        logger.error(f"Error getting process logs: {str(e)}")
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="LOGS_ERROR",
-                message="Failed to fetch process logs",
-                details=str(e)
-            )
-        )
+        tasks = control_runner.task_persistence.get_all_tasks(limit=10000) or []
+        enriched = []
 
-# ============================================================================
-# Additional Utility Endpoints
-# ============================================================================
+        for t in tasks:
+            state = control_runner.task_persistence.get_task_state(t.get("task_id"))
+            if not state:
+                continue
+            if state.get("control_name") != "config_validator":
+                continue
+            enriched.append(state)
 
-@app.get("/processes/stats", response_model=APIResponse, tags=["Analytics"])
-async def get_process_statistics():
-    """Get process execution statistics"""
-    try:
-        processes = process_manager.list_processes(limit=1000)
-        
-        stats = {
-            "total_processes": len(processes),
-            "status_breakdown": {},
-            "avg_duration": 0,
-            "success_rate": 0,
-            "process_type_breakdown": {}
-        }
-        
-        durations = []
-        success_count = 0
-        
-        for process in processes:
-            # Status breakdown
-            status = process.status.value
-            stats["status_breakdown"][status] = stats["status_breakdown"].get(status, 0) + 1
-            
-            # Process type breakdown
-            process_type = process.name
-            stats["process_type_breakdown"][process_type] = stats["process_type_breakdown"].get(process_type, 0) + 1
-            
-            # Duration and success rate
-            if process.duration_seconds:
-                durations.append(process.duration_seconds)
-            
-            if process.status == ProcessStatus.COMPLETED:
-                success_count += 1
-        
-        # Calculate averages
-        if durations:
-            stats["avg_duration"] = round(sum(durations) / len(durations), 2)
-        
-        if len(processes) > 0:
-            stats["success_rate"] = round((success_count / len(processes)) * 100, 2)
-        
-        return APIResponse(
-            success=True,
-            data=stats,
-            metadata={
-                "calculated_at": datetime.now().isoformat(),
-                "sample_size": len(processes)
-            }
-        )
-        
-    except Exception as e:
-        logger.error(f"Error calculating statistics: {str(e)}")
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="STATS_ERROR",
-                message="Failed to calculate statistics",
-                details=str(e)
-            )
-        )
-
-@app.post("/processes/batch", response_model=APIResponse, tags=["Process Management"])
-async def trigger_batch_processes(requests: List[Dict[str, Any]]):
-    """Trigger multiple processes in batch"""
-    try:
-        results = []
-        errors = []
-        
-        for i, req in enumerate(requests):
+        # Sort: running first, then by updated_at desc
+        def _sort_key(s):
             try:
-                process_name = req.get("process_name")
-                parameters = req.get("parameters", {})
-                
-                if not process_name:
-                    errors.append(f"Request {i}: Missing process_name")
-                    continue
-                
-                process_id = process_manager.start_process(process_name, parameters)
-                results.append({
-                    "index": i,
-                    "process_id": process_id,
-                    "process_name": process_name,
-                    "status": ProcessStatus.PENDING.value
-                })
-                
-            except Exception as e:
-                errors.append(f"Request {i}: {str(e)}")
-        
-        return APIResponse(
-            success=len(errors) == 0,
-            data={
-                "successful": results,
-                "failed": errors,
-                "summary": {
-                    "total_requested": len(requests),
-                    "successful": len(results),
-                    "failed": len(errors)
-                }
-            },
-            metadata={
-                "batch_created_at": datetime.now().isoformat()
-            }
-        )
-        
-    except Exception as e:
-        logger.error(f"Error in batch process creation: {str(e)}")
-        return APIResponse(
-            success=False,
-            error=APIError(
-                error_code="BATCH_ERROR",
-                message="Failed to create batch processes",
-                details=str(e)
-            )
-        )
+                status = (s.get("status") or "").lower()
+                is_running = status in ["running", "started"]
+                updated_at = s.get("updated_at") or s.get("started_at") or ""
+                return (1 if is_running else 0, updated_at)
+            except Exception:
+                return (0, "")
 
-# ============================================================================
-# Application Startup
-# ============================================================================
+        enriched.sort(key=_sort_key, reverse=True)
+        recent = enriched[:limit]
+
+        # Check for results availability
+        history = []
+        for s in recent:
+            task_id = s.get("task_id")
+            results_file = RESULTS_DIR / f"{task_id}.json"
+            has_results = results_file.exists()
+
+            # Try to read summary from results
+            validation_passed = None
+            total_errors = None
+            if has_results:
+                try:
+                    with open(results_file, "r", encoding="utf-8") as f:
+                        res = _json.load(f)
+                    validation_passed = res.get("validation_passed")
+                    total_errors = res.get("summary", {}).get("total_errors")
+                except Exception:
+                    pass
+
+            script_args = s.get("script_arguments", [])
+            file_path = script_args[0] if script_args else "unknown"
+
+            history.append({
+                "task_id": task_id,
+                "file_path": file_path,
+                "task_name": s.get("task_name", "Config Validation"),
+                "status": s.get("status") or "unknown",
+                "validation_passed": validation_passed,
+                "total_errors": total_errors,
+                "has_results": has_results,
+                "created_at": s.get("created_at"),
+                "updated_at": s.get("updated_at"),
+                "started_at": s.get("started_at"),
+                "completed_at": s.get("completed_at") or s.get("ended_at"),
+                "return_code": s.get("return_code"),
+            })
+
+        return {
+            "history": history,
+            "limit": limit,
+            "retrieved_at": datetime.now().isoformat(),
+        }
+
+    except Exception as e:
+        logger.error(f"[ConfigValidator] Error getting history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+#Validator
+
+
+"""
+Config Validator Script
+Runs as a subprocess to validate Excel config files.
+Reads the Excel, validates each sheet, and writes results JSON + validated Excel.
+
+Environment variables:
+    TASK_ID: Unique task identifier
+    FILE_PATH: Path to the Excel config file
+    RESULTS_DIR: Directory to write results JSON
+    TASK_FILE_PATH: Path to task state file (set by control_runner)
+"""
+import os
+import sys
+import json
+import traceback
+from pathlib import Path
+from datetime import datetime
+from copy import copy
+
+try:
+    import openpyxl
+except ImportError:
+    print("ERROR: openpyxl is required. Install with: pip install openpyxl")
+    sys.exit(1)
+
+
+def get_env(name, default=None):
+    value = os.environ.get(name, default)
+    if value is None:
+        print(f"WARNING: Environment variable {name} not set")
+    return value
+
+
+def read_excel_sheets(file_path):
+    """Read all sheets from an Excel file using openpyxl. Returns dict of sheet_name -> list of row dicts."""
+    print(f"Reading Excel file: {file_path}")
+    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+    sheet_names = wb.sheetnames
+    print(f"Found {len(sheet_names)} sheets: {sheet_names}")
+
+    sheets_data = {}
+    for sheet_name in sheet_names:
+        ws = wb[sheet_name]
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            sheets_data[sheet_name] = {"columns": [], "data": [], "row_count": 0}
+            continue
+
+        # First row is header
+        headers = [str(h) if h is not None else f"Column_{i}" for i, h in enumerate(rows[0])]
+        data = []
+        for row in rows[1:]:
+            row_dict = {}
+            for i, val in enumerate(row):
+                col_name = headers[i] if i < len(headers) else f"Column_{i}"
+                # Convert to JSON-safe types
+                if val is None:
+                    row_dict[col_name] = None
+                elif isinstance(val, datetime):
+                    row_dict[col_name] = val.isoformat()
+                elif isinstance(val, (int, float, bool)):
+                    row_dict[col_name] = val
+                else:
+                    row_dict[col_name] = str(val)
+            data.append(row_dict)
+
+        sheets_data[sheet_name] = {
+            "columns": headers,
+            "data": data,
+            "row_count": len(data),
+        }
+        print(f"  Sheet '{sheet_name}': {len(headers)} columns, {len(data)} rows")
+
+    wb.close()
+    return sheet_names, sheets_data
+
+
+def validate_config(sheet_names, sheets_data):
+    """
+    Validate the config across all sheets.
+    Returns a list of validation error dicts.
+
+    ========================================================
+    ADD YOUR CUSTOM VALIDATION LOGIC HERE.
+    Each error should be a dict with these keys:
+        - Sheet: name of the sheet containing the error
+        - Row: 1-based row number (relative to data, not header)
+        - Column: column name where the error was found
+        - Error_Type: category (MISSING_VALUE, INVALID_REFERENCE, DUPLICATE, etc.)
+        - Severity: ERROR or WARNING
+        - Error_Message: human-readable description
+        - Expected_Value: what was expected (optional)
+        - Actual_Value: what was found (optional)
+    ========================================================
+    """
+    errors = []
+    print("Running validation checks...")
+
+    def add_error(sheet, row, col, error_type, severity, message, expected="", actual=""):
+        errors.append({
+            "Sheet": sheet,
+            "Row": row,
+            "Column": col,
+            "Error_Type": error_type,
+            "Severity": severity,
+            "Error_Message": message,
+            "Expected_Value": expected,
+            "Actual_Value": actual,
+        })
+
+    # --- Define required columns per sheet ---
+    # Map sheet name -> list of columns that must not be empty
+    required_columns = {
+        "InputFiles": ["SourceName", "FilePath", "FileType", "Encoding", "Active"],
+        "Rules": ["RuleID", "RuleName", "SourceField", "TargetField", "MatchType", "Active"],
+        "Enrichment": ["EnrichmentID", "SourceSheet", "LookupField", "LookupSource", "OutputField", "Active"],
+        "FieldOperations": ["OperationID", "InputField", "Operation", "OutputField", "Active"],
+        "OutputRules": ["OutputID", "OutputName", "OutputPath", "Format", "Active"],
+    }
+
+    for sheet_name in sheet_names:
+        sheet_info = sheets_data.get(sheet_name, {})
+        data = sheet_info.get("data", [])
+        columns = sheet_info.get("columns", [])
+
+        if not data:
+            continue
+
+        req_cols = required_columns.get(sheet_name, [])
+
+        # Rule 1: Check required columns for empty/null values (ERROR severity)
+        for row_idx, row in enumerate(data):
+            for col in req_cols:
+                if col not in columns:
+                    continue
+                val = row.get(col)
+                if val is None or (isinstance(val, str) and val.strip() == ""):
+                    add_error(
+                        sheet_name, row_idx + 2, col,
+                        "MISSING_VALUE", "ERROR",
+                        f"Required field '{col}' is empty",
+                        "Non-empty value",
+                        "(null)" if val is None else "(empty)",
+                    )
+
+        # Rule 2: Check optional columns for empty/null values (WARNING severity)
+        for row_idx, row in enumerate(data):
+            for col in columns:
+                if col in req_cols:
+                    continue  # Already checked above
+                val = row.get(col)
+                if val is None or (isinstance(val, str) and val.strip() == ""):
+                    add_error(
+                        sheet_name, row_idx + 2, col,
+                        "MISSING_VALUE", "WARNING",
+                        f"Optional field '{col}' is empty",
+                        "Non-empty value",
+                        "(null)" if val is None else "(empty)",
+                    )
+
+    # Rule 3: Cross-sheet reference validation (Enrichment.SourceSheet must be a valid sheet name)
+    enrichment = sheets_data.get("Enrichment", {})
+    enr_data = enrichment.get("data", [])
+    enr_cols = enrichment.get("columns", [])
+    if "SourceSheet" in enr_cols:
+        for row_idx, row in enumerate(enr_data):
+            ref = row.get("SourceSheet")
+            if ref and isinstance(ref, str) and ref.strip() and ref not in sheet_names:
+                add_error(
+                    "Enrichment", row_idx + 2, "SourceSheet",
+                    "INVALID_REFERENCE", "ERROR",
+                    f"SourceSheet '{ref}' does not exist in workbook",
+                    f"One of: {', '.join(sheet_names)}",
+                    ref,
+                )
+
+    # Rule 4: Duplicate detection in Rules sheet (same SourceField + TargetField)
+    rules = sheets_data.get("Rules", {})
+    rules_data = rules.get("data", [])
+    rules_cols = rules.get("columns", [])
+    if "SourceField" in rules_cols and "TargetField" in rules_cols:
+        seen = {}
+        for row_idx, row in enumerate(rules_data):
+            src = row.get("SourceField", "")
+            tgt = row.get("TargetField", "")
+            if src and tgt:
+                key = f"{src}|{tgt}"
+                if key in seen:
+                    add_error(
+                        "Rules", row_idx + 2, "SourceField",
+                        "DUPLICATE", "ERROR",
+                        f"Duplicate rule: SourceField='{src}' + TargetField='{tgt}' already defined at row {seen[key]}",
+                        "Unique SourceField+TargetField combination",
+                        f"Duplicate of row {seen[key]}",
+                    )
+                else:
+                    seen[key] = row_idx + 2
+
+    print(f"Validation complete. Found {len(errors)} issues.")
+    return errors
+
+
+def build_summary(errors, sheet_names):
+    """Build validation summary statistics."""
+    total_errors = sum(1 for e in errors if e["Severity"] == "ERROR")
+    total_warnings = sum(1 for e in errors if e["Severity"] == "WARNING")
+
+    errors_by_sheet = {}
+    for e in errors:
+        sheet = e["Sheet"]
+        errors_by_sheet[sheet] = errors_by_sheet.get(sheet, 0) + 1
+
+    errors_by_type = {}
+    for e in errors:
+        etype = e["Error_Type"]
+        errors_by_type[etype] = errors_by_type.get(etype, 0) + 1
+
+    errors_by_severity = {}
+    for e in errors:
+        sev = e["Severity"]
+        errors_by_severity[sev] = errors_by_severity.get(sev, 0) + 1
+
+    return {
+        "total_errors": total_errors,
+        "total_warnings": total_warnings,
+        "total_issues": len(errors),
+        "errors_by_sheet": errors_by_sheet,
+        "errors_by_type": errors_by_type,
+        "errors_by_severity": errors_by_severity,
+        "sheets_validated": sheet_names,
+        "validation_duration_seconds": 0,  # Updated below
+    }
+
+
+def write_validated_excel(original_path, errors):
+    """
+    Create a copy of the Excel file with an added 'Validation' sheet containing errors.
+    Returns the path to the validated file.
+    """
+    if not errors:
+        return None
+
+    original = Path(original_path)
+    validated_path = original.parent / f"{original.stem}_validated{original.suffix}"
+    print(f"Writing validated Excel to: {validated_path}")
+
+    wb = openpyxl.load_workbook(original_path)
+
+    # Remove existing Validation sheet if present
+    if "Validation" in wb.sheetnames:
+        del wb["Validation"]
+
+    ws = wb.create_sheet("Validation")
+
+    # Write header
+    validation_columns = [
+        "Sheet", "Row", "Column", "Error_Type", "Severity",
+        "Error_Message", "Expected_Value", "Actual_Value"
+    ]
+    for col_idx, col_name in enumerate(validation_columns, 1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = openpyxl.styles.Font(bold=True)
+
+    # Write error rows
+    for row_idx, error in enumerate(errors, 2):
+        for col_idx, col_name in enumerate(validation_columns, 1):
+            val = error.get(col_name, "")
+            ws.cell(row=row_idx, column=col_idx, value=val)
+
+    # Auto-fit column widths (approximate)
+    for col_idx, col_name in enumerate(validation_columns, 1):
+        max_len = len(col_name)
+        for row_idx in range(2, min(len(errors) + 2, 102)):  # Check first 100 rows
+            cell_val = str(ws.cell(row=row_idx, column=col_idx).value or "")
+            max_len = max(max_len, len(cell_val))
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 2, 50)
+
+    wb.save(validated_path)
+    wb.close()
+    print(f"Validated Excel written with {len(errors)} error rows")
+    return str(validated_path)
+
+
+def main():
+    start_time = datetime.now()
+    task_id = get_env("TASK_ID", "unknown")
+    file_path = get_env("FILE_PATH")
+    results_dir = get_env("RESULTS_DIR")
+
+    print("=" * 70)
+    print(f"Config Validator Script")
+    print(f"Task ID: {task_id}")
+    print(f"File: {file_path}")
+    print(f"Results Dir: {results_dir}")
+    print(f"Started: {start_time.isoformat()}")
+    print("=" * 70)
+
+    if not file_path:
+        print("ERROR: FILE_PATH environment variable is required")
+        sys.exit(1)
+
+    if not Path(file_path).exists():
+        print(f"ERROR: File not found: {file_path}")
+        sys.exit(1)
+
+    try:
+        # Step 1: Read Excel
+        print("\n[Step 1/4] Reading Excel file...")
+        sheet_names, sheets_data = read_excel_sheets(file_path)
+
+        # Step 2: Validate
+        print("\n[Step 2/4] Running validation...")
+        errors = validate_config(sheet_names, sheets_data)
+
+        # Step 3: Build summary
+        print("\n[Step 3/4] Building summary...")
+        validation_passed = len([e for e in errors if e["Severity"] == "ERROR"]) == 0
+        summary = build_summary(errors, sheet_names)
+
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        summary["validation_duration_seconds"] = round(duration, 2)
+
+        # Step 4: Write outputs
+        print("\n[Step 4/4] Writing outputs...")
+
+        # Write validated Excel (only if errors exist)
+        validated_file_path = None
+        if errors:
+            validated_file_path = write_validated_excel(file_path, errors)
+
+        # Build validation sheet data for results JSON
+        validation_sheet = None
+        if errors:
+            validation_columns = [
+                "Sheet", "Row", "Column", "Error_Type", "Severity",
+                "Error_Message", "Expected_Value", "Actual_Value"
+            ]
+            validation_sheet = {
+                "columns": validation_columns,
+                "data": errors,
+                "row_count": len(errors),
+                "error_count": len(errors),
+            }
+
+        # Add error_count per sheet
+        for sheet_name in sheet_names:
+            sheet_errors = sum(1 for e in errors if e["Sheet"] == sheet_name)
+            sheets_data[sheet_name]["error_count"] = sheet_errors
+
+        # Build results JSON
+        results = {
+            "status": "completed",
+            "file_path": file_path,
+            "validation_passed": validation_passed,
+            "summary": summary,
+            "sheet_names": sheet_names,
+            "sheets": sheets_data,
+            "completed_at": end_time.isoformat(),
+        }
+
+        # Add validation sheet to results if errors exist
+        if validation_sheet:
+            results["sheets"]["Validation"] = validation_sheet
+            results["validated_file_path"] = validated_file_path
+
+        # Write results JSON
+        if results_dir:
+            results_path = Path(results_dir) / f"{task_id}.json"
+            results_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(results_path, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2, default=str)
+            print(f"Results written to: {results_path}")
+
+        # Print summary
+        print("\n" + "=" * 70)
+        print(f"VALIDATION {'PASSED' if validation_passed else 'FAILED'}")
+        print(f"Total Issues: {len(errors)}")
+        print(f"  Errors: {summary['total_errors']}")
+        print(f"  Warnings: {summary['total_warnings']}")
+        if summary["errors_by_sheet"]:
+            print(f"  By Sheet: {summary['errors_by_sheet']}")
+        if summary["errors_by_type"]:
+            print(f"  By Type: {summary['errors_by_type']}")
+        print(f"Duration: {duration:.2f}s")
+        if validated_file_path:
+            print(f"Validated Excel: {validated_file_path}")
+        print("=" * 70)
+
+    except Exception as e:
+        print(f"\nFATAL ERROR: {e}")
+        traceback.print_exc()
+
+        # Write error results
+        if results_dir:
+            error_results = {
+                "status": "failed",
+                "file_path": file_path,
+                "validation_passed": None,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+                "completed_at": datetime.now().isoformat(),
+            }
+            results_path = Path(results_dir) / f"{task_id}.json"
+            results_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(results_path, "w", encoding="utf-8") as f:
+                json.dump(error_results, f, indent=2)
+
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    # Configuration for development
-    import os
-    
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", 8000))
-    debug = os.getenv("DEBUG", "True").lower() == "true"
-    
-    logger.info(f"Starting server on {host}:{port}")
-    logger.info(f"Debug mode: {debug}")
-    logger.info(f"Available process types: {[t.value for t in ProcessType]}")
-    
-    uvicorn.run(
-        "main:app",  # Assuming this file is named main.py
-        host=host,
-        port=port,
-        reload=debug,
-        log_level="info"
-    )
+    main()
+  ### PAGE JS
+
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { AgGridReact } from 'ag-grid-react';
+import 'ag-grid-community/styles/ag-grid.css';
+import 'ag-grid-community/styles/ag-theme-alpine.css';
+import ApiService from '../../services/api';
+import HSBCLogo from '../../components/HSBCLogo';
+import ValidationSummary from './ValidationSummary';
+import { FaCheckCircle, FaPlay, FaTimes, FaTimesCircle, FaSpinner, FaHistory, FaExclamationTriangle } from 'react-icons/fa';
+
+const ConfigValidatorPage = () => {
+    // Input state
+    const [filePath, setFilePath] = useState('');
+
+    // Validation state
+    const [validationState, setValidationState] = useState('idle'); // idle | validating | completed | failed | error
+    const [taskId, setTaskId] = useState(null);
+    const [results, setResults] = useState(null);
+    const [error, setError] = useState(null);
+
+    // Sheet display state
+    const [activeSheet, setActiveSheet] = useState('');
+    const [sheetNames, setSheetNames] = useState([]);
+
+    // History state
+    const [history, setHistory] = useState([]);
+    const [showHistory, setShowHistory] = useState(false);
+
+    // Polling ref
+    const pollingRef = useRef(null);
+
+    // Load history on mount
+    useEffect(() => {
+        loadHistory();
+    }, []);
+
+    // Cleanup polling on unmount
+    useEffect(() => {
+        return () => {
+            if (pollingRef.current) {
+                clearInterval(pollingRef.current);
+            }
+        };
+    }, []);
+
+    const loadHistory = async () => {
+        try {
+            const response = await ApiService.getConfigValidationHistory(20);
+            setHistory(response.history || []);
+        } catch (err) {
+            // History loading is non-critical
+        }
+    };
+
+    const handleValidate = async () => {
+        if (!filePath.trim()) {
+            setError('Please enter a file path');
+            return;
+        }
+
+        setError(null);
+        setResults(null);
+        setValidationState('validating');
+        setSheetNames([]);
+        setActiveSheet('');
+
+        try {
+            const response = await ApiService.startConfigValidation(filePath.trim());
+            const newTaskId = response.task_id;
+            setTaskId(newTaskId);
+
+            // Start polling for status
+            pollingRef.current = setInterval(async () => {
+                try {
+                    const status = await ApiService.getConfigValidationStatus(newTaskId);
+                    const taskStatus = (status.status || '').toLowerCase();
+
+                    if (taskStatus === 'completed' || taskStatus === 'success') {
+                        clearInterval(pollingRef.current);
+                        pollingRef.current = null;
+                        await fetchResults(newTaskId);
+                    } else if (taskStatus === 'failed' || taskStatus === 'error') {
+                        clearInterval(pollingRef.current);
+                        pollingRef.current = null;
+                        setValidationState('error');
+                        setError(`Validation process failed. Check logs for task ${newTaskId}`);
+                        // Still try to fetch results (might have partial data)
+                        try {
+                            await fetchResults(newTaskId);
+                        } catch {
+                            // No results available
+                        }
+                    }
+                } catch (err) {
+                    // Polling error - keep trying
+                }
+            }, 2000);
+
+        } catch (err) {
+            setValidationState('error');
+            setError(err.message);
+        }
+    };
+
+    const fetchResults = async (tid) => {
+        try {
+            const data = await ApiService.getConfigValidationResults(tid);
+
+            if (data.status === 'failed' && data.error) {
+                setValidationState('error');
+                setError(data.error);
+                return;
+            }
+
+            setResults(data);
+
+            // Build sheet names list
+            const names = data.sheet_names || [];
+            const allNames = [...names];
+            // Show Validation tab whenever it exists with data (errors OR warnings)
+            if (data.sheets && data.sheets['Validation'] && data.sheets['Validation'].row_count > 0) {
+                allNames.push('Validation');
+            }
+            setSheetNames(allNames);
+
+            // Set first sheet as active
+            if (allNames.length > 0) {
+                setActiveSheet(allNames[0]);
+            }
+
+            // Determine state: failed if any issues exist, completed if clean
+            const hasIssues = data.summary && (data.summary.total_issues > 0 || data.summary.total_errors > 0 || data.summary.total_warnings > 0);
+            setValidationState(hasIssues ? 'failed' : 'completed');
+            loadHistory(); // Refresh history
+        } catch (err) {
+            setValidationState('error');
+            setError(`Failed to fetch results: ${err.message}`);
+        }
+    };
+
+    const handleClear = () => {
+        if (pollingRef.current) {
+            clearInterval(pollingRef.current);
+            pollingRef.current = null;
+        }
+        setFilePath('');
+        setValidationState('idle');
+        setTaskId(null);
+        setResults(null);
+        setError(null);
+        setSheetNames([]);
+        setActiveSheet('');
+    };
+
+    const handleHistoryClick = async (item) => {
+        setFilePath(item.file_path || '');
+        setShowHistory(false);
+
+        if (item.has_results && item.task_id) {
+            setTaskId(item.task_id);
+            setValidationState('validating');
+            await fetchResults(item.task_id);
+        }
+    };
+
+    const handleKeyPress = (e) => {
+        if (e.key === 'Enter' && validationState !== 'validating') {
+            handleValidate();
+        }
+    };
+
+    // AG Grid data for active sheet
+    const activeSheetData = useMemo(() => {
+        if (!results || !results.sheets || !activeSheet) return [];
+        const sheet = results.sheets[activeSheet];
+        return sheet ? (sheet.data || []) : [];
+    }, [results, activeSheet]);
+
+    // AG Grid column definitions for active sheet
+    const columnDefs = useMemo(() => {
+        if (!results || !results.sheets || !activeSheet) return [];
+        const sheet = results.sheets[activeSheet];
+        if (!sheet || !sheet.columns) return [];
+
+        return sheet.columns.map(col => ({
+            headerName: col,
+            field: col,
+            minWidth: 120,
+            flex: 1,
+            resizable: true,
+            sortable: true,
+            filter: true,
+        }));
+    }, [results, activeSheet]);
+
+    const defaultColDef = useMemo(() => ({
+        sortable: true,
+        filter: true,
+        resizable: true,
+        minWidth: 100,
+    }), []);
+
+    // Row styling for Validation sheet
+    const getRowStyle = useCallback((params) => {
+        if (activeSheet !== 'Validation') return null;
+        const severity = params.data?.Severity;
+        if (severity === 'ERROR') {
+            return { backgroundColor: '#FEE2E2' };
+        }
+        if (severity === 'WARNING') {
+            return { backgroundColor: '#FEF3C7' };
+        }
+        if (severity === 'INFO') {
+            return { backgroundColor: '#DBEAFE' };
+        }
+        return null;
+    }, [activeSheet]);
+
+    // Get error count badge for a sheet tab
+    const getSheetErrorCount = (sheetName) => {
+        if (!results || !results.sheets) return 0;
+        const sheet = results.sheets[sheetName];
+        return sheet?.error_count || 0;
+    };
+
+    return (
+        <div className="min-h-screen bg-gray-100">
+            {/* Loading Overlay */}
+            {validationState === 'validating' && (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                    <div className="bg-white rounded-lg p-8 flex flex-col items-center shadow-xl">
+                        <div className="animate-spin rounded-full h-16 w-16 border-4 border-red-500 border-t-transparent mb-4"></div>
+                        <p className="text-gray-700 text-lg font-medium">Validating config...</p>
+                        <p className="text-gray-500 text-sm mt-1">{filePath.split(/[/\\]/).pop()}</p>
+                    </div>
+                </div>
+            )}
+
+            {/* Header */}
+            <div className="border-b border-slate-200 px-8 py-4"
+                style={{
+                    backgroundColor: 'white',
+                    height: '80px',
+                    boxShadow: '0 4px 8px rgba(0,0,0,0.15), 0 8px 16px rgba(0,0,0,0.1), 0 2px 4px rgba(0,0,0,0.1), inset 0 2px 0 rgba(255,255,255,0.8), inset 0 -2px 0 rgba(0,0,0,0.1)'
+                }}>
+                <div className="flex items-center justify-between h-full">
+                    <div className="flex items-center flex-shrink-0">
+                        <HSBCLogo height={64} className="mr-4" />
+                    </div>
+                    <div className="flex-1 flex justify-center">
+                        <h1 className="text-2xl font-bold text-black text-center">
+                            CONFIG VALIDATOR
+                        </h1>
+                    </div>
+                    <div className="flex-shrink-0 flex items-center gap-2">
+                        <button
+                            onClick={() => setShowHistory(!showHistory)}
+                            className="flex items-center gap-2 px-3 py-1.5 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors text-sm font-medium"
+                        >
+                            <FaHistory />
+                            History
+                        </button>
+                        <div className="px-3 py-1 rounded-lg text-sm font-medium bg-gray-100 text-gray-700">
+                            {new Date().toLocaleDateString()}
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {/* Main Content */}
+            <div className="px-6 py-4">
+                {/* File Path Input */}
+                <div className="bg-white rounded-lg shadow-sm p-4 mb-4">
+                    <div className="flex items-center gap-3">
+                        <label className="text-sm font-medium text-gray-700 whitespace-nowrap">
+                            File Path:
+                        </label>
+                        <input
+                            type="text"
+                            value={filePath}
+                            onChange={(e) => setFilePath(e.target.value)}
+                            onKeyDown={handleKeyPress}
+                            placeholder="Enter path to Excel config file (e.g., /path/to/config.xlsx)"
+                            className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 text-sm"
+                            disabled={validationState === 'validating'}
+                        />
+                        <button
+                            onClick={handleValidate}
+                            disabled={validationState === 'validating' || !filePath.trim()}
+                            className="flex items-center gap-2 px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed text-sm font-medium"
+                        >
+                            {validationState === 'validating' ? (
+                                <FaSpinner className="animate-spin" />
+                            ) : (
+                                <FaPlay />
+                            )}
+                            Validate
+                        </button>
+                        <button
+                            onClick={handleClear}
+                            className="flex items-center gap-2 px-4 py-2 bg-gray-500 text-white rounded-lg hover:bg-gray-600 transition-colors text-sm font-medium"
+                        >
+                            <FaTimes />
+                            Clear
+                        </button>
+                    </div>
+                </div>
+
+                {/* Error Display */}
+                {error && (
+                    <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mb-4">
+                        {error}
+                    </div>
+                )}
+
+                {/* Validation Summary */}
+                {results && results.summary && (
+                    <ValidationSummary
+                        summary={results.summary}
+                        validationPassed={results.validation_passed}
+                        onSheetClick={(sheet) => setActiveSheet(sheet)}
+                    />
+                )}
+
+                {/* Sheet Tabs + Grid */}
+                {sheetNames.length > 0 && (
+                    <div className="bg-white rounded-lg shadow-sm">
+                        {/* Sheet Tabs */}
+                        <div className="flex items-center border-b border-gray-200 px-2 pt-2 overflow-x-auto">
+                            {sheetNames.map((name) => {
+                                const isValidation = name === 'Validation';
+                                const errorCount = getSheetErrorCount(name);
+                                const isActive = activeSheet === name;
+
+                                return (
+                                    <button
+                                        key={name}
+                                        onClick={() => setActiveSheet(name)}
+                                        className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-t-lg transition-colors whitespace-nowrap ${
+                                            isActive
+                                                ? isValidation
+                                                    ? 'bg-red-50 text-red-700 border border-b-0 border-red-200'
+                                                    : 'bg-white text-gray-900 border border-b-0 border-gray-200'
+                                                : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'
+                                        }`}
+                                    >
+                                        {isValidation && (
+                                            <FaExclamationTriangle className="text-red-500" />
+                                        )}
+                                        {name}
+                                        {errorCount > 0 && !isValidation && (
+                                            <span className="px-1.5 py-0.5 text-xs rounded-full bg-red-100 text-red-600 font-bold">
+                                                {errorCount}
+                                            </span>
+                                        )}
+                                        {isValidation && results?.sheets?.Validation && (
+                                            <span className="px-1.5 py-0.5 text-xs rounded-full bg-red-500 text-white font-bold">
+                                                {results.sheets.Validation.row_count}
+                                            </span>
+                                        )}
+                                    </button>
+                                );
+                            })}
+                        </div>
+
+                        {/* Sheet Info Bar */}
+                        <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between text-sm text-gray-500">
+                            <span>
+                                {activeSheet}
+                                {results?.sheets?.[activeSheet] && (
+                                    <> - {results.sheets[activeSheet].row_count} rows, {results.sheets[activeSheet].columns?.length || 0} columns</>
+                                )}
+                            </span>
+                            {results?.validated_file_path && (
+                                <span className="text-gray-400">
+                                    Validated file: {results.validated_file_path}
+                                </span>
+                            )}
+                        </div>
+
+                        {/* AG Grid */}
+                        <div className="ag-theme-alpine" style={{ height: 'calc(100vh - 400px)', minHeight: '400px', width: '100%' }}>
+                            <AgGridReact
+                                rowData={activeSheetData}
+                                columnDefs={columnDefs}
+                                defaultColDef={defaultColDef}
+                                animateRows={true}
+                                pagination={false}
+                                enableCellTextSelection={true}
+                                ensureDomOrder={true}
+                                getRowStyle={getRowStyle}
+                            />
+                        </div>
+                    </div>
+                )}
+
+                {/* Initial State */}
+                {validationState === 'idle' && !results && !error && (
+                    <div className="bg-white rounded-lg shadow-sm p-12 text-center">
+                        <FaCheckCircle className="text-6xl text-gray-300 mx-auto mb-4" />
+                        <h3 className="text-lg font-medium text-gray-700 mb-2">Ready to Validate</h3>
+                        <p className="text-gray-500 max-w-md mx-auto">
+                            Enter the path to an Excel configuration file above and click Validate to check for errors across all sheets.
+                        </p>
+                    </div>
+                )}
+
+                {/* History Panel */}
+                {showHistory && history.length > 0 && (
+                    <div className="mt-4 bg-white rounded-lg shadow-sm">
+                        <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
+                            <span className="font-medium text-gray-700 flex items-center gap-2">
+                                <FaHistory className="text-gray-400" />
+                                Recent Validations
+                            </span>
+                            <button
+                                onClick={() => setShowHistory(false)}
+                                className="text-gray-400 hover:text-gray-600"
+                            >
+                                <FaTimes />
+                            </button>
+                        </div>
+                        <div className="divide-y divide-gray-100 max-h-64 overflow-y-auto">
+                            {history.map((item) => {
+                                const fileName = item.file_path?.split(/[/\\]/).pop() || 'unknown';
+                                const status = (item.status || '').toLowerCase();
+                                const passed = item.validation_passed;
+                                const timeAgo = getTimeAgo(item.completed_at || item.created_at);
+
+                                return (
+                                    <button
+                                        key={item.task_id}
+                                        onClick={() => handleHistoryClick(item)}
+                                        className="w-full px-4 py-3 text-left hover:bg-gray-50 transition-colors flex items-center justify-between"
+                                    >
+                                        <div className="flex items-center gap-3">
+                                            {passed === true && (
+                                                <FaCheckCircle className="text-green-500 flex-shrink-0" />
+                                            )}
+                                            {passed === false && (
+                                                <FaTimesCircle className="text-red-500 flex-shrink-0" />
+                                            )}
+                                            {passed === null && (
+                                                <FaSpinner className={`text-gray-400 flex-shrink-0 ${status === 'running' ? 'animate-spin' : ''}`} />
+                                            )}
+                                            <div>
+                                                <div className="text-sm font-medium text-gray-800">{fileName}</div>
+                                                <div className="text-xs text-gray-500">{item.file_path}</div>
+                                            </div>
+                                        </div>
+                                        <div className="text-right flex-shrink-0">
+                                            {item.total_errors !== null && item.total_errors !== undefined && (
+                                                <div className="text-xs text-red-500 font-medium">{item.total_errors} errors</div>
+                                            )}
+                                            <div className="text-xs text-gray-400">{timeAgo}</div>
+                                        </div>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+function getTimeAgo(isoString) {
+    if (!isoString) return '';
+    try {
+        const date = new Date(isoString);
+        const now = new Date();
+        const diffMs = now - date;
+        const diffMins = Math.floor(diffMs / 60000);
+        if (diffMins < 1) return 'just now';
+        if (diffMins < 60) return `${diffMins}m ago`;
+        const diffHours = Math.floor(diffMins / 60);
+        if (diffHours < 24) return `${diffHours}h ago`;
+        const diffDays = Math.floor(diffHours / 24);
+        return `${diffDays}d ago`;
+    } catch {
+        return '';
+    }
+}
+
+export default ConfigValidatorPage;
+  ### Val Summ
+
+import { FaCheckCircle, FaTimesCircle, FaExclamationTriangle } from 'react-icons/fa';
+
+const ValidationSummary = ({ summary, validationPassed, onSheetClick }) => {
+    if (!summary) return null;
+
+    const {
+        total_errors = 0,
+        total_warnings = 0,
+        total_issues = 0,
+        errors_by_sheet = {},
+        errors_by_type = {},
+        validation_duration_seconds = 0,
+    } = summary;
+
+    const hasIssues = total_issues > 0 || total_errors > 0 || total_warnings > 0;
+    const hasErrors = total_errors > 0;
+
+    // Three states: clean (green), warnings only (yellow), errors (red)
+    const bgClass = !hasIssues
+        ? 'bg-green-50 border-green-200'
+        : hasErrors
+            ? 'bg-red-50 border-red-200'
+            : 'bg-yellow-50 border-yellow-200';
+
+    const statusIcon = !hasIssues
+        ? <FaCheckCircle className="text-green-500 text-2xl" />
+        : hasErrors
+            ? <FaTimesCircle className="text-red-500 text-2xl" />
+            : <FaExclamationTriangle className="text-yellow-500 text-2xl" />;
+
+    const statusText = !hasIssues
+        ? 'VALIDATION PASSED'
+        : hasErrors
+            ? 'VALIDATION FAILED'
+            : 'VALIDATION PASSED WITH WARNINGS';
+
+    const statusColor = !hasIssues
+        ? 'text-green-700'
+        : hasErrors
+            ? 'text-red-700'
+            : 'text-yellow-700';
+
+    return (
+        <div className={`rounded-lg border p-4 mb-4 ${bgClass}`}>
+            <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-3">
+                    {statusIcon}
+                    <span className={`text-lg font-bold ${statusColor}`}>
+                        {statusText}
+                    </span>
+                </div>
+                <div className="flex items-center gap-4 text-sm">
+                    {total_errors > 0 && (
+                        <span className="flex items-center gap-1 text-red-600 font-medium">
+                            <FaTimesCircle />
+                            {total_errors} {total_errors === 1 ? 'Error' : 'Errors'}
+                        </span>
+                    )}
+                    {total_warnings > 0 && (
+                        <span className="flex items-center gap-1 text-yellow-600 font-medium">
+                            <FaExclamationTriangle />
+                            {total_warnings} {total_warnings === 1 ? 'Warning' : 'Warnings'}
+                        </span>
+                    )}
+                    {validation_duration_seconds > 0 && (
+                        <span className="text-gray-500">
+                            {validation_duration_seconds.toFixed(1)}s
+                        </span>
+                    )}
+                </div>
+            </div>
+
+            {hasIssues && (
+                <div className="flex flex-wrap gap-4 text-sm">
+                    {/* Issues by Sheet */}
+                    {Object.keys(errors_by_sheet).length > 0 && (
+                        <div>
+                            <span className="text-gray-600 font-medium mr-2">By Sheet:</span>
+                            {Object.entries(errors_by_sheet).map(([sheet, count]) => (
+                                <button
+                                    key={sheet}
+                                    onClick={() => onSheetClick && onSheetClick(sheet)}
+                                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded mr-1 hover:opacity-80 transition-colors cursor-pointer ${
+                                        hasErrors ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-700'
+                                    }`}
+                                >
+                                    {sheet}
+                                    <span className="font-bold">({count})</span>
+                                </button>
+                            ))}
+                        </div>
+                    )}
+
+                    {/* Issues by Type */}
+                    {Object.keys(errors_by_type).length > 0 && (
+                        <div>
+                            <span className="text-gray-600 font-medium mr-2">By Type:</span>
+                            {Object.entries(errors_by_type).map(([type, count]) => (
+                                <span
+                                    key={type}
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-gray-100 text-gray-700 mr-1"
+                                >
+                                    {type}
+                                    <span className="font-bold">({count})</span>
+                                </span>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+};
+
+export default ValidationSummary;
+
+    // ==========================================
+    // Config Validator Methods
+    // ==========================================
+
+    static async startConfigValidation(filePath) {
+        return this.retryRequest(async () => {
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/config-validator/validate`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ file_path: filePath }),
+                }
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to start validation: ${response.statusText}`);
+            }
+
+            return await response.json();
+        });
+    }
+
+    static async getConfigValidationStatus(taskId) {
+        return this.retryRequest(async () => {
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/config-validator/${taskId}/status`
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to get validation status: ${response.statusText}`);
+            }
+
+            return await response.json();
+        });
+    }
+
+    static async getConfigValidationResults(taskId) {
+        return this.retryRequest(async () => {
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/config-validator/${taskId}/results`
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to get validation results: ${response.statusText}`);
+            }
+
+            return await response.json();
+        });
+    }
+
+    static async getConfigValidationLogs(taskId, logType = 'execution', lines = 200) {
+        return this.retryRequest(async () => {
+            const params = new URLSearchParams({
+                log_type: logType,
+                lines: lines.toString(),
+            });
+
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/config-validator/${taskId}/logs?${params.toString()}`
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to get validation logs: ${response.statusText}`);
+            }
+
+            return await response.json();
+        });
+    }
+
+    static async getConfigValidationHistory(limit = 20) {
+        return this.retryRequest(async () => {
+            const params = new URLSearchParams({ limit: limit.toString() });
+
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/config-validator/history?${params.toString()}`
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to get validation history: ${response.statusText}`);
+            }
+
+            return await response.json();
+        });
+    }
+
+#### PAGEJS
+import { FaChartLine, FaCheckCircle, FaCog, FaServer, FaDesktop, FaFlask, FaRobot, FaChartBar, FaSearch, FaFileAlt } from 'react-icons/fa';
+
+  const openConfigValidator = () => {
+    window.open('/config-validator', '_blank');
+  };
+
+            {/* Feature 12 - Config Validator */}
+            <div
+              onClick={openConfigValidator}
+              className="group rounded-lg border border-slate-200 p-6 transition-all duration-300 ease-in-out bg-white hover:scale-105 hover:shadow-xl hover:shadow-slate-700/10 cursor-pointer transform-gpu"
+            >
+              <div className="flex items-center gap-4 mb-4">
+                <div className="p-3 rounded-lg bg-white text-red-500 transition-colors">
+                  <FaFileAlt size={32} />
+                </div>
+                <h3 className="text-lg font-semibold text-black">CONFIG VALIDATOR</h3>
+              </div>
+              <p className="mt-2 text-black">
+                Validate Excel configuration files across all sheets. Identify missing values, invalid references, and data issues with detailed error reporting.
+              </p>
+            </div>
+
+# INDEX
+
+import ConfigValidatorPage from './controls/config-validator/page';
+<Route path="/config-validator" element={<ConfigValidatorPage />} />
