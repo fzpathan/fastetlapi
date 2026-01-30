@@ -1,0 +1,394 @@
+import pandas as pd
+import numpy as np
+import json
+import time
+from typing import List, Dict, Any
+
+# Generate sample data
+def generate_sample_data(n_rows: int = 1000) -> pd.DataFrame:
+    """Generate sample DataFrame with JSON/list columns"""
+    np.random.seed(42)
+    
+    data = {
+        'id': range(n_rows),
+        'name': [f'Item_{i}' for i in range(n_rows)],
+        'value': np.random.randint(1, 100, n_rows),
+    }
+    
+    # Create various types of JSON columns
+    json_data = []
+    for i in range(n_rows):
+        # Randomly create different structures
+        rand = np.random.rand()
+        if rand < 0.3:
+            # List of dictionaries
+            json_data.append([
+                {'product': f'prod_{i}_1', 'price': np.random.randint(10, 100), 'quantity': np.random.randint(1, 5)},
+                {'product': f'prod_{i}_2', 'price': np.random.randint(10, 100), 'quantity': np.random.randint(1, 5)},
+            ])
+        elif rand < 0.5:
+            # Single dictionary
+            json_data.append({'product': f'prod_{i}', 'price': np.random.randint(10, 100)})
+        elif rand < 0.7:
+            # List of dictionaries with more items
+            json_data.append([
+                {'product': f'prod_{i}_{j}', 'price': np.random.randint(10, 100), 'quantity': np.random.randint(1, 5)}
+                for j in range(np.random.randint(1, 4))
+            ])
+        else:
+            # None/null value
+            json_data.append(None)
+    
+    data['orders'] = json_data
+    
+    return pd.DataFrame(data)
+
+
+# Original approach (from your image)
+def normalised_and_expand_original(df: pd.DataFrame, json_col: str) -> pd.DataFrame:
+    """Original approach - slower due to apply with lambda"""
+    original_index_name = "original_index"
+    df[original_index_name] = df.index
+    df = df.copy()
+    prefix = json_col + "_"
+    
+    df[json_col] = df[json_col].apply(lambda x: x if isinstance(x, list) else ([x] if pd.isna(x) else [x]))
+    exploded = df.explode(json_col, ignore_index=True)
+    normalise = pd.json_normalize(exploded[json_col], sep='_').add_prefix(prefix)
+    normalise[original_index_name] = exploded[original_index_name].values
+    
+    def join_non_null(series):
+        return ';'.join(series.dropna().astype(str))
+    
+    aggregated = normalise.groupby(original_index_name).agg(join_non_null).reset_index()
+    
+    df.set_index(original_index_name, inplace=True)
+    aggregated.set_index(original_index_name, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    
+    for col in aggregated.columns:
+        if col in df.columns:
+            df[col] = df[col].combine_first(aggregated[col])
+        else:
+            df[col] = aggregated[col]
+    
+    return df
+
+
+# Optimized approach 1: Reduced apply() calls
+def normalised_and_expand_optimized_v1(df: pd.DataFrame, json_col: str) -> pd.DataFrame:
+    """Optimized version 1 - minimize apply() calls"""
+    original_index_name = "original_index"
+    df = df.copy()
+    df[original_index_name] = df.index
+    prefix = json_col + "_"
+    
+    # More efficient: vectorized check for lists
+    mask_not_list = ~df[json_col].apply(lambda x: isinstance(x, list))
+    df.loc[mask_not_list, json_col] = df.loc[mask_not_list, json_col].apply(
+        lambda x: [x] if not pd.isna(x) else [None]
+    )
+    
+    # Explode
+    exploded = df.explode(json_col, ignore_index=True)
+    
+    # Normalize - filter out nulls first
+    valid_mask = exploded[json_col].notna()
+    if valid_mask.any():
+        normalise = pd.json_normalize(
+            exploded.loc[valid_mask, json_col],
+            sep='_'
+        ).add_prefix(prefix)
+        normalise[original_index_name] = exploded.loc[valid_mask, original_index_name].values
+        
+        # Efficient aggregation
+        agg_dict = {col: lambda x: ';'.join(x.astype(str)) for col in normalise.columns if col != original_index_name}
+        aggregated = normalise.groupby(original_index_name).agg(agg_dict).reset_index()
+        
+        # Merge back
+        df.set_index(original_index_name, inplace=True)
+        aggregated.set_index(original_index_name, inplace=True)
+        
+        for col in aggregated.columns:
+            if col in df.columns:
+                df[col] = df[col].combine_first(aggregated[col])
+            else:
+                df[col] = aggregated[col]
+        
+        df.reset_index(drop=True, inplace=True)
+    
+    return df
+
+
+# Optimized approach 2: Fully vectorized
+def normalised_and_expand_optimized_v2(df: pd.DataFrame, json_col: str) -> pd.DataFrame:
+    """Optimized version 2 - fully vectorized where possible"""
+    df = df.copy()
+    original_index_name = "original_index"
+    df[original_index_name] = df.index
+    prefix = json_col + "_"
+    
+    # Prepare data for explosion
+    json_series = df[json_col].copy()
+    
+    # Vectorized approach: handle non-lists
+    is_list = json_series.apply(type) == list
+    non_list_mask = ~is_list & json_series.notna()
+    
+    if non_list_mask.any():
+        json_series.loc[non_list_mask] = json_series.loc[non_list_mask].apply(lambda x: [x])
+    
+    # Handle nulls
+    null_mask = json_series.isna()
+    if null_mask.any():
+        json_series.loc[null_mask] = json_series.loc[null_mask].apply(lambda x: [None])
+    
+    # Create temp dataframe for explosion
+    temp_df = pd.DataFrame({
+        original_index_name: df[original_index_name],
+        json_col: json_series
+    })
+    
+    # Explode
+    exploded = temp_df.explode(json_col, ignore_index=True)
+    
+    # Normalize valid entries only
+    valid_mask = exploded[json_col].notna() & (exploded[json_col] != None)
+    
+    if valid_mask.sum() > 0:
+        # Normalize in batch
+        normalized_data = pd.json_normalize(
+            exploded.loc[valid_mask, json_col].tolist(),
+            sep='_'
+        ).add_prefix(prefix)
+        
+        # Create result dataframe
+        result = pd.DataFrame(index=exploded.index)
+        result[original_index_name] = exploded[original_index_name]
+        
+        # Add normalized columns
+        for col in normalized_data.columns:
+            result.loc[valid_mask, col] = normalized_data[col].values
+        
+        # Group and aggregate with semicolon
+        groupby_cols = [col for col in result.columns if col != original_index_name]
+        
+        def semicolon_join(x):
+            valid = x.dropna().astype(str)
+            return ';'.join(valid) if len(valid) > 0 else None
+        
+        agg_dict = {col: semicolon_join for col in groupby_cols}
+        aggregated = result.groupby(original_index_name).agg(agg_dict)
+        
+        # Merge with original dataframe
+        df_result = df.drop(columns=[json_col]).set_index(original_index_name)
+        df_result = df_result.join(aggregated, how='left')
+        df_result.reset_index(drop=True, inplace=True)
+        
+        return df_result
+    
+    return df.drop(columns=[json_col])
+
+
+# Optimized approach 3: Maximum performance
+def normalised_and_expand_optimized_v3(df: pd.DataFrame, json_col: str) -> pd.DataFrame:
+    """Optimized version 3 - maximum performance with minimal overhead"""
+    df = df.copy()
+    prefix = json_col + "_"
+    
+    # Store original index as column
+    df['_orig_idx'] = df.index
+    
+    # Fast type checking and conversion
+    col_data = df[json_col]
+    
+    # Vectorized preparation
+    prepared = []
+    for val in col_data:
+        if isinstance(val, list):
+            prepared.append(val)
+        elif pd.isna(val) or val is None:
+            prepared.append([None])
+        else:
+            prepared.append([val])
+    
+    df[json_col] = prepared
+    
+    # Explode
+    exploded = df.explode(json_col, ignore_index=False).reset_index(drop=True)
+    
+    # Filter valid entries
+    valid_data = []
+    valid_indices = []
+    orig_indices = []
+    
+    for idx, (val, orig_idx) in enumerate(zip(exploded[json_col], exploded['_orig_idx'])):
+        if val is not None and not pd.isna(val):
+            if isinstance(val, dict):
+                valid_data.append(val)
+                valid_indices.append(idx)
+                orig_indices.append(orig_idx)
+    
+    if len(valid_data) > 0:
+        # Batch normalize
+        normalized = pd.json_normalize(valid_data, sep='_').add_prefix(prefix)
+        normalized['_orig_idx'] = orig_indices
+        
+        # Aggregate with semicolon
+        agg_funcs = {col: lambda x: ';'.join(x.astype(str)) 
+                     for col in normalized.columns if col != '_orig_idx'}
+        
+        aggregated = normalized.groupby('_orig_idx').agg(agg_funcs)
+        
+        # Join back with original
+        result = df.drop(columns=[json_col, '_orig_idx']).join(aggregated, how='left')
+        
+        return result
+    
+    return df.drop(columns=[json_col, '_orig_idx'])
+
+
+def run_performance_test(n_rows: int = 1000):
+    """Run performance comparison"""
+    print(f"\n{'='*80}")
+    print(f"Performance Test with {n_rows} rows")
+    print(f"{'='*80}\n")
+    
+    # Generate test data
+    print("Generating sample data...")
+    df_original = generate_sample_data(n_rows)
+    print(f"✓ Generated {len(df_original)} rows with JSON column 'orders'\n")
+    
+    # Show sample data
+    print("Sample data (first 3 rows):")
+    print(df_original.head(3))
+    print("\nSample 'orders' column content:")
+    for i in range(min(3, len(df_original))):
+        print(f"  Row {i}: {df_original.loc[i, 'orders']}")
+    print()
+    
+    results = {}
+    
+    # Test 1: Original approach
+    print("-" * 80)
+    print("Test 1: Original Approach (with apply lambda)")
+    print("-" * 80)
+    df_test = df_original.copy()
+    start = time.time()
+    try:
+        df_result_original = normalised_and_expand_original(df_test, 'orders')
+        elapsed = time.time() - start
+        results['Original'] = elapsed
+        print(f"✓ Completed in {elapsed:.4f} seconds")
+        print(f"  Result shape: {df_result_original.shape}")
+        print(f"  New columns: {[col for col in df_result_original.columns if col.startswith('orders_')]}")
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        results['Original'] = None
+    print()
+    
+    # Test 2: Optimized v1
+    print("-" * 80)
+    print("Test 2: Optimized v1 (Reduced apply calls)")
+    print("-" * 80)
+    df_test = df_original.copy()
+    start = time.time()
+    try:
+        df_result_v1 = normalised_and_expand_optimized_v1(df_test, 'orders')
+        elapsed = time.time() - start
+        results['Optimized v1'] = elapsed
+        print(f"✓ Completed in {elapsed:.4f} seconds")
+        print(f"  Result shape: {df_result_v1.shape}")
+        speedup = results['Original'] / elapsed if results['Original'] else 0
+        print(f"  Speedup: {speedup:.2f}x faster")
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        results['Optimized v1'] = None
+    print()
+    
+    # Test 3: Optimized v2
+    print("-" * 80)
+    print("Test 3: Optimized v2 (Fully vectorized)")
+    print("-" * 80)
+    df_test = df_original.copy()
+    start = time.time()
+    try:
+        df_result_v2 = normalised_and_expand_optimized_v2(df_test, 'orders')
+        elapsed = time.time() - start
+        results['Optimized v2'] = elapsed
+        print(f"✓ Completed in {elapsed:.4f} seconds")
+        print(f"  Result shape: {df_result_v2.shape}")
+        speedup = results['Original'] / elapsed if results['Original'] else 0
+        print(f"  Speedup: {speedup:.2f}x faster")
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        results['Optimized v2'] = None
+    print()
+    
+    # Test 4: Optimized v3
+    print("-" * 80)
+    print("Test 4: Optimized v3 (Maximum performance)")
+    print("-" * 80)
+    df_test = df_original.copy()
+    start = time.time()
+    try:
+        df_result_v3 = normalised_and_expand_optimized_v3(df_test, 'orders')
+        elapsed = time.time() - start
+        results['Optimized v3'] = elapsed
+        print(f"✓ Completed in {elapsed:.4f} seconds")
+        print(f"  Result shape: {df_result_v3.shape}")
+        speedup = results['Original'] / elapsed if results['Original'] else 0
+        print(f"  Speedup: {speedup:.2f}x faster")
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        results['Optimized v3'] = None
+    print()
+    
+    # Summary
+    print("=" * 80)
+    print("PERFORMANCE SUMMARY")
+    print("=" * 80)
+    print(f"\n{'Method':<20} {'Time (seconds)':<20} {'Speedup':<15}")
+    print("-" * 55)
+    
+    for method, elapsed in results.items():
+        if elapsed:
+            speedup = results['Original'] / elapsed if results['Original'] and method != 'Original' else 1.0
+            print(f"{method:<20} {elapsed:<20.4f} {speedup:<15.2f}x")
+        else:
+            print(f"{method:<20} {'Failed':<20} {'-':<15}")
+    
+    print("\n" + "=" * 80)
+    
+    # Show sample output
+    if 'df_result_v3' in locals():
+        print("\nSample output (first 2 rows):")
+        print(df_result_v3.head(2))
+        print("\nExample of flattened data:")
+        if len(df_result_v3) > 0:
+            sample_row = df_result_v3.iloc[0]
+            order_cols = [col for col in df_result_v3.columns if col.startswith('orders_')]
+            for col in order_cols[:5]:  # Show first 5 order columns
+                print(f"  {col}: {sample_row[col]}")
+    
+    return results
+
+
+if __name__ == "__main__":
+    # Run tests with different sizes
+    print("\n" + "=" * 80)
+    print("JSON FLATTENING PERFORMANCE COMPARISON")
+    print("=" * 80)
+    
+    # Small dataset
+    run_performance_test(n_rows=500)
+    
+    # Medium dataset
+    run_performance_test(n_rows=2000)
+    
+    # Large dataset
+    run_performance_test(n_rows=5000)
+    
+    print("\n" + "=" * 80)
+    print("All tests completed!")
+    print("=" * 80)
