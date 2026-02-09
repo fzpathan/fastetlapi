@@ -25,12 +25,7 @@ router = APIRouter(prefix="/api/supervisory", tags=["supervisory"])
 DATA_FILE = "dummy_controls_data.parquet"
 CACHE_TTL = 300  # 5 minutes
 SAVED_FILTERS_FILE = os.path.join(Path(__file__).parent.parent, "data", "supervisory_saved_filters.json")
-
-# Cache for filter options
-_filter_options_cache = {
-    "data": None,
-    "timestamp": None
-}
+CACHE_FILE = os.path.join(Path(__file__).parent.parent, "data", "supervisory_filter_cache.json")
 
 # Column mappings (display name -> actual column name in parquet)
 FILTER_COLUMNS = {
@@ -100,12 +95,32 @@ def get_data_file_path() -> str:
     return str(Path(__file__).parent.parent.parent / DATA_FILE)
 
 
-def is_cache_valid() -> bool:
-    """Check if filter options cache is still valid"""
-    if _filter_options_cache["data"] is None or _filter_options_cache["timestamp"] is None:
-        return False
-    elapsed = (datetime.now() - _filter_options_cache["timestamp"]).total_seconds()
-    return elapsed < CACHE_TTL
+def load_cache() -> Optional[Dict[str, Any]]:
+    """Load cached filter options from disk. Returns None if cache is missing or expired."""
+    if not os.path.exists(CACHE_FILE):
+        return None
+    try:
+        with open(CACHE_FILE, "r") as f:
+            cached = json.load(f)
+        timestamp = datetime.fromisoformat(cached.get("cached_at", ""))
+        elapsed = (datetime.now() - timestamp).total_seconds()
+        if elapsed >= CACHE_TTL:
+            return None
+        return cached.get("data")
+    except Exception as e:
+        logger.warning(f"Failed to read filter cache: {e}")
+        return None
+
+
+def write_cache(data: Dict[str, Any]) -> None:
+    """Persist filter options cache to disk."""
+    try:
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        payload = {"cached_at": datetime.now().isoformat(), "data": data}
+        with open(CACHE_FILE, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to write filter cache: {e}")
 
 
 def ensure_age_buckets(lazy_df: pl.LazyFrame) -> pl.LazyFrame:
@@ -172,13 +187,12 @@ async def get_filter_options() -> Dict[str, Any]:
     Get unique values for all filter columns
     Returns cached results if available and valid
     """
-    global _filter_options_cache
-
     try:
         # Return cached data if valid
-        if is_cache_valid():
+        cached = load_cache()
+        if cached is not None:
             logger.info("Returning cached filter options")
-            return _filter_options_cache["data"]
+            return cached
 
         file_path = get_data_file_path()
         logger.info(f"Loading filter options from: {file_path}")
@@ -224,8 +238,7 @@ async def get_filter_options() -> Dict[str, Any]:
         }
 
         # Update cache
-        _filter_options_cache["data"] = result
-        _filter_options_cache["timestamp"] = datetime.now()
+        write_cache(result)
 
         return result
 
@@ -505,8 +518,11 @@ async def get_details(request: DetailsRequest) -> Dict[str, Any]:
 @router.post("/cache/clear")
 async def clear_cache() -> Dict[str, Any]:
     """Clear the filter options cache"""
-    global _filter_options_cache
-    _filter_options_cache = {"data": None, "timestamp": None}
+    try:
+        if os.path.exists(CACHE_FILE):
+            os.remove(CACHE_FILE)
+    except Exception as e:
+        logger.warning(f"Failed to remove cache file: {e}")
     logger.info("Supervisory dashboard cache cleared")
     return {"success": True, "message": "Cache cleared"}
 
