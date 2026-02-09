@@ -1,1351 +1,1846 @@
-"""
-Config Validator Router
-Handles Excel config file validation via subprocess execution.
-Validates configs across sheets and produces a Validation sheet with errors.
-"""
-from fastapi import APIRouter, HTTPException
-from pathlib import Path as _Path
-import json as _json
-from typing import Optional as _Optional
-from datetime import datetime
-import logging
-import sys
-import os
+Supervisory
 
-sys.path.insert(0, str(_Path(__file__).parent.parent))
-from control_execution.control_runner import control_runner
-from control_execution.task_persistence import TASK_STORAGE_DIR
+"""
+Supervisory Dashboard Router
+Provides aggregated data views for supervisory monitoring with filtering and age bucket analysis
+"""
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Any, List, Optional
+import polars as pl
+import pyarrow.parquet as pq
+import logging
+from datetime import datetime
+from pathlib import Path
+import json
+import uuid
+import os
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/config-validator", tags=["config-validator"])
+router = APIRouter(prefix="/api/supervisory", tags=["supervisory"])
 
-# Results storage directory
-RESULTS_DIR = TASK_STORAGE_DIR / "config_validator_results"
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+# Configuration
+DATA_FILE = "dummy_controls_data.parquet"
+CACHE_TTL = 300  # 5 minutes
+SAVED_FILTERS_FILE = os.path.join(Path(__file__).parent.parent, "data", "supervisory_saved_filters.json")
+
+# Cache for filter options
+_filter_options_cache = {
+    "data": None,
+    "timestamp": None
+}
+
+# Column mappings (display name -> actual column name in parquet)
+FILTER_COLUMNS = {
+    "regulation": "Regulation",
+    "asset_class": "AssetClass",
+    "control_type": "Control Type",
+    "data_type": "Data Type",
+    "sub_control_type": "Sub-ControlType",
+    "remediation_status": "RemediationStatus",
+    "explain_issue": "ExplainIssue",
+    "explain_issue_notification": "ExplainIssueNotification",
+    "explain_issue_detail": "ExplainIssueDetail"
+}
+
+AGE_BUCKET_COLUMNS = ["0-3", "3-7", "7-14", "14-30", "30-60"]
+
+# Remediation plans that indicate "unremediated" status
+UNREMEDIATED_PLANS = [
+    'Investigate and fix root cause',
+    'Manual override and re-process',
+    'Update configuration',
+    'Escalate to support team',
+    'Patch deployment scheduled'
+]
+
+REMEDIATED_PLANS = ['No action required']
 
 
-@router.post("/validate")
-async def start_validation(request: dict):
-    """
-    Start config validation by invoking config_validator_script.py as a subprocess.
+class AggregationRequest(BaseModel):
+    filters: Optional[Dict[str, List[str]]] = None
+    group_by: Optional[List[str]] = None
+    include_remediation_split: bool = True  # Whether to split by remediation status
 
-    Request body:
-        - file_path: Path to the Excel config file on the server
-    """
+
+class DetailsRequest(BaseModel):
+    filters: Optional[Dict[str, List[str]]] = None
+    page: int = 1
+    page_size: int = 50
+    sort_column: Optional[str] = None
+    sort_direction: str = "desc"
+    bucket: Optional[str] = None
+    bucket_scope: Optional[str] = None
+
+
+class SavedFilterRequest(BaseModel):
+    name: str
+    filters: Dict[str, List[str]]
+    group_by: List[str]
+    created_by: Optional[str] = None
+    created_by_name: Optional[str] = None
+
+
+def get_data_file_path() -> str:
+    """Get the path to the data file"""
+    # Check multiple possible locations
+    possible_paths = [
+        Path(DATA_FILE),  # Current directory
+        Path("..") / DATA_FILE,  # Parent directory
+        Path(__file__).parent.parent.parent / DATA_FILE,  # Project root
+    ]
+
+    for path in possible_paths:
+        if path.exists():
+            return str(path.resolve())
+
+    # Default to project root
+    return str(Path(__file__).parent.parent.parent / DATA_FILE)
+
+
+def is_cache_valid() -> bool:
+    """Check if filter options cache is still valid"""
+    if _filter_options_cache["data"] is None or _filter_options_cache["timestamp"] is None:
+        return False
+    elapsed = (datetime.now() - _filter_options_cache["timestamp"]).total_seconds()
+    return elapsed < CACHE_TTL
+
+
+def ensure_age_buckets(lazy_df: pl.LazyFrame) -> pl.LazyFrame:
+    """Ensure age bucket columns exist and are derived from ErrorAge."""
+    schema = lazy_df.collect_schema()
+    if "ErrorAge" not in schema:
+        raise HTTPException(status_code=400, detail="Missing required column: ErrorAge")
+
+    age_col = pl.col("ErrorAge")
+    return lazy_df.with_columns([
+        (age_col <= 3).cast(pl.Int64).alias("0-3"),
+        ((age_col > 3) & (age_col <= 7)).cast(pl.Int64).alias("3-7"),
+        ((age_col > 7) & (age_col <= 14)).cast(pl.Int64).alias("7-14"),
+        ((age_col > 14) & (age_col <= 30)).cast(pl.Int64).alias("14-30"),
+        ((age_col > 30) & (age_col <= 60)).cast(pl.Int64).alias("30-60"),
+    ])
+
+
+def ensure_remediation_status(lazy_df: pl.LazyFrame) -> pl.LazyFrame:
+    """Ensure RemediationStatus exists (derived from RemediationPlan if needed)."""
+    schema = lazy_df.collect_schema()
+    if "RemediationStatus" in schema:
+        return lazy_df
+    if "RemediationPlan" not in schema:
+        raise HTTPException(status_code=400, detail="Missing required column: RemediationPlan")
+
+    return lazy_df.with_columns([
+        pl.when(pl.col("RemediationPlan") == "No action required")
+        .then(pl.lit("Remediated"))
+        .otherwise(pl.lit("Unremediated"))
+        .alias("RemediationStatus")
+    ])
+
+
+def load_saved_filters() -> List[Dict[str, Any]]:
+    """Load saved filters from disk."""
+    if not os.path.exists(SAVED_FILTERS_FILE):
+        return []
     try:
-        file_path = request.get("file_path", "").strip()
-        if not file_path:
-            raise HTTPException(status_code=400, detail="file_path is required")
-
-        # Validate file exists and is an Excel file
-        path = _Path(file_path)
-        if not path.exists():
-            raise HTTPException(status_code=400, detail=f"File not found: {file_path}")
-        if path.suffix.lower() not in (".xlsx", ".xls"):
-            raise HTTPException(status_code=400, detail="File must be .xlsx or .xls")
-
-        logger.info(f"[ConfigValidator] Starting validation for: {file_path}")
-
-        python_script_path = "api/config_validator_script.py"
-
-        control_params = {
-            "control_name": "config_validator",
-            "task_name": f"Config Validation - {path.name}",
-            "run_env": "DEV",
-            "expected_run_date": datetime.now().strftime("%Y-%m-%d"),
-            "python_script_path": python_script_path,
-            "script_arguments": [file_path],
-            "environment_variables": {
-                "FILE_PATH": file_path,
-                "RESULTS_DIR": str(RESULTS_DIR),
-            },
-            "control_id": "config_validator",
-        }
-
-        result = control_runner.run_control_task(control_params)
-        result["file_path"] = file_path
-
-        logger.info(f"[ConfigValidator] Task started: {result.get('task_id')}")
-        return result
-
-    except HTTPException:
-        raise
+        with open(SAVED_FILTERS_FILE, "r") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            return []
     except Exception as e:
-        logger.error(f"[ConfigValidator] Error starting validation: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to load saved filters: {e}")
+        return []
 
 
-@router.get("/{task_id}/status")
-async def get_validation_status(task_id: str):
-    """Get status for a specific config validation task."""
+def write_saved_filters(filters: List[Dict[str, Any]]) -> None:
+    """Persist saved filters to disk."""
     try:
-        result = control_runner.get_task_status(task_id)
-        return result
+        os.makedirs(os.path.dirname(SAVED_FILTERS_FILE), exist_ok=True)
+        with open(SAVED_FILTERS_FILE, "w") as f:
+            json.dump(filters, f, indent=2)
     except Exception as e:
-        logger.error(f"[ConfigValidator] Error getting status: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to write saved filters: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save filter")
 
 
-@router.get("/{task_id}/results")
-async def get_validation_results(task_id: str):
+@router.get("/filter-options")
+async def get_filter_options() -> Dict[str, Any]:
     """
-    Get validation results after completion.
-    Reads the results JSON written by the subprocess script.
+    Get unique values for all filter columns
+    Returns cached results if available and valid
     """
+    global _filter_options_cache
+
     try:
-        results_file = RESULTS_DIR / f"{task_id}.json"
-        if not results_file.exists():
-            raise HTTPException(
-                status_code=404,
-                detail=f"Results not found for task {task_id}. Task may still be running."
-            )
+        # Return cached data if valid
+        if is_cache_valid():
+            logger.info("Returning cached filter options")
+            return _filter_options_cache["data"]
 
-        with open(results_file, "r", encoding="utf-8") as f:
-            results = _json.load(f)
+        file_path = get_data_file_path()
+        logger.info(f"Loading filter options from: {file_path}")
 
-        results["task_id"] = task_id
-        results["retrieved_at"] = datetime.now().isoformat()
-        return results
+        if not Path(file_path).exists():
+            raise HTTPException(status_code=404, detail=f"Data file not found: {file_path}")
 
-    except HTTPException:
-        raise
-    except _json.JSONDecodeError as e:
-        logger.error(f"[ConfigValidator] Invalid JSON in results file: {e}")
-        raise HTTPException(status_code=500, detail="Results file is corrupted")
-    except Exception as e:
-        logger.error(f"[ConfigValidator] Error getting results: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        # Use lazy loading to get unique values efficiently
+        lazy_df = pl.scan_parquet(file_path)
+        lazy_df = ensure_remediation_status(lazy_df)
 
+        filter_options = {}
 
-@router.get("/{task_id}/logs")
-async def get_validation_logs(
-    task_id: str,
-    log_type: str = "execution",
-    lines: int = 200,
-    from_line: int = 0
-):
-    """Get logs for a specific config validation task."""
-    try:
-        result = control_runner.get_task_logs(task_id, log_type, lines, from_line)
-        return result
-    except Exception as e:
-        logger.error(f"[ConfigValidator] Error getting logs: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/history")
-async def get_validation_history(limit: int = 20):
-    """Get recent config validation runs."""
-    try:
-        tasks = control_runner.task_persistence.get_all_tasks(limit=10000) or []
-        enriched = []
-
-        for t in tasks:
-            state = control_runner.task_persistence.get_task_state(t.get("task_id"))
-            if not state:
-                continue
-            if state.get("control_name") != "config_validator":
-                continue
-            enriched.append(state)
-
-        # Sort: running first, then by updated_at desc
-        def _sort_key(s):
+        for key, column_name in FILTER_COLUMNS.items():
             try:
-                status = (s.get("status") or "").lower()
-                is_running = status in ["running", "started"]
-                updated_at = s.get("updated_at") or s.get("started_at") or ""
-                return (1 if is_running else 0, updated_at)
-            except Exception:
-                return (0, "")
+                unique_values = (
+                    lazy_df
+                    .select(pl.col(column_name))
+                    .unique()
+                    .collect()
+                    .to_series()
+                    .to_list()
+                )
+                # Sort and filter out None values
+                unique_values = sorted([v for v in unique_values if v is not None])
+                filter_options[key] = unique_values
+                logger.info(f"Column '{column_name}' has {len(unique_values)} unique values")
+            except Exception as e:
+                logger.warning(f"Could not get unique values for column '{column_name}': {e}")
+                filter_options[key] = []
 
-        enriched.sort(key=_sort_key, reverse=True)
-        recent = enriched[:limit]
+        # Get total row count
+        parquet_file = pq.ParquetFile(file_path)
+        total_rows = parquet_file.metadata.num_rows
 
-        # Check for results availability
-        history = []
-        for s in recent:
-            task_id = s.get("task_id")
-            results_file = RESULTS_DIR / f"{task_id}.json"
-            has_results = results_file.exists()
-
-            # Try to read summary from results
-            validation_passed = None
-            total_errors = None
-            if has_results:
-                try:
-                    with open(results_file, "r", encoding="utf-8") as f:
-                        res = _json.load(f)
-                    validation_passed = res.get("validation_passed")
-                    total_errors = res.get("summary", {}).get("total_errors")
-                except Exception:
-                    pass
-
-            script_args = s.get("script_arguments", [])
-            file_path = script_args[0] if script_args else "unknown"
-
-            history.append({
-                "task_id": task_id,
-                "file_path": file_path,
-                "task_name": s.get("task_name", "Config Validation"),
-                "status": s.get("status") or "unknown",
-                "validation_passed": validation_passed,
-                "total_errors": total_errors,
-                "has_results": has_results,
-                "created_at": s.get("created_at"),
-                "updated_at": s.get("updated_at"),
-                "started_at": s.get("started_at"),
-                "completed_at": s.get("completed_at") or s.get("ended_at"),
-                "return_code": s.get("return_code"),
-            })
-
-        return {
-            "history": history,
-            "limit": limit,
-            "retrieved_at": datetime.now().isoformat(),
+        result = {
+            "success": True,
+            "filter_options": filter_options,
+            "total_records": total_rows,
+            "columns": list(FILTER_COLUMNS.keys()),
+            "age_buckets": AGE_BUCKET_COLUMNS,
+            "retrieved_at": datetime.now().isoformat()
         }
 
+        # Update cache
+        _filter_options_cache["data"] = result
+        _filter_options_cache["timestamp"] = datetime.now()
+
+        return result
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"[ConfigValidator] Error getting history: {e}")
+        logger.error(f"Error getting filter options: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 
-#Validator
-
-
-"""
-Config Validator Script
-Runs as a subprocess to validate Excel config files.
-Reads the Excel, validates each sheet, and writes results JSON + validated Excel.
-
-Environment variables:
-    TASK_ID: Unique task identifier
-    FILE_PATH: Path to the Excel config file
-    RESULTS_DIR: Directory to write results JSON
-    TASK_FILE_PATH: Path to task state file (set by control_runner)
-"""
-import os
-import sys
-import json
-import traceback
-from pathlib import Path
-from datetime import datetime
-from copy import copy
-
-try:
-    import openpyxl
-except ImportError:
-    print("ERROR: openpyxl is required. Install with: pip install openpyxl")
-    sys.exit(1)
-
-
-def get_env(name, default=None):
-    value = os.environ.get(name, default)
-    if value is None:
-        print(f"WARNING: Environment variable {name} not set")
-    return value
-
-
-def read_excel_sheets(file_path):
-    """Read all sheets from an Excel file using openpyxl. Returns dict of sheet_name -> list of row dicts."""
-    print(f"Reading Excel file: {file_path}")
-    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
-    sheet_names = wb.sheetnames
-    print(f"Found {len(sheet_names)} sheets: {sheet_names}")
-
-    sheets_data = {}
-    for sheet_name in sheet_names:
-        ws = wb[sheet_name]
-        rows = list(ws.iter_rows(values_only=True))
-        if not rows:
-            sheets_data[sheet_name] = {"columns": [], "data": [], "row_count": 0}
-            continue
-
-        # First row is header
-        headers = [str(h) if h is not None else f"Column_{i}" for i, h in enumerate(rows[0])]
-        data = []
-        for row in rows[1:]:
-            row_dict = {}
-            for i, val in enumerate(row):
-                col_name = headers[i] if i < len(headers) else f"Column_{i}"
-                # Convert to JSON-safe types
-                if val is None:
-                    row_dict[col_name] = None
-                elif isinstance(val, datetime):
-                    row_dict[col_name] = val.isoformat()
-                elif isinstance(val, (int, float, bool)):
-                    row_dict[col_name] = val
-                else:
-                    row_dict[col_name] = str(val)
-            data.append(row_dict)
-
-        sheets_data[sheet_name] = {
-            "columns": headers,
-            "data": data,
-            "row_count": len(data),
-        }
-        print(f"  Sheet '{sheet_name}': {len(headers)} columns, {len(data)} rows")
-
-    wb.close()
-    return sheet_names, sheets_data
-
-
-def validate_config(sheet_names, sheets_data):
+@router.post("/aggregations")
+async def get_aggregations(request: AggregationRequest) -> Dict[str, Any]:
     """
-    Validate the config across all sheets.
-    Returns a list of validation error dicts.
-
-    ========================================================
-    ADD YOUR CUSTOM VALIDATION LOGIC HERE.
-    Each error should be a dict with these keys:
-        - Sheet: name of the sheet containing the error
-        - Row: 1-based row number (relative to data, not header)
-        - Column: column name where the error was found
-        - Error_Type: category (MISSING_VALUE, INVALID_REFERENCE, DUPLICATE, etc.)
-        - Severity: ERROR or WARNING
-        - Error_Message: human-readable description
-        - Expected_Value: what was expected (optional)
-        - Actual_Value: what was found (optional)
-    ========================================================
+    Get aggregated counts with age bucket breakdown
+    Filters are applied before aggregation
+    Returns both unremediated and total counts when include_remediation_split is True
     """
-    errors = []
-    print("Running validation checks...")
+    try:
+        file_path = get_data_file_path()
+        logger.info(f"Getting aggregations from: {file_path}")
 
-    def add_error(sheet, row, col, error_type, severity, message, expected="", actual=""):
-        errors.append({
-            "Sheet": sheet,
-            "Row": row,
-            "Column": col,
-            "Error_Type": error_type,
-            "Severity": severity,
-            "Error_Message": message,
-            "Expected_Value": expected,
-            "Actual_Value": actual,
-        })
+        if not Path(file_path).exists():
+            raise HTTPException(status_code=404, detail=f"Data file not found: {file_path}")
 
-    # --- Define required columns per sheet ---
-    # Map sheet name -> list of columns that must not be empty
-    required_columns = {
-        "InputFiles": ["SourceName", "FilePath", "FileType", "Encoding", "Active"],
-        "Rules": ["RuleID", "RuleName", "SourceField", "TargetField", "MatchType", "Active"],
-        "Enrichment": ["EnrichmentID", "SourceSheet", "LookupField", "LookupSource", "OutputField", "Active"],
-        "FieldOperations": ["OperationID", "InputField", "Operation", "OutputField", "Active"],
-        "OutputRules": ["OutputID", "OutputName", "OutputPath", "Format", "Active"],
-    }
+        # Start with lazy loading
+        lazy_df = pl.scan_parquet(file_path)
+        lazy_df = ensure_age_buckets(lazy_df)
+        lazy_df = ensure_remediation_status(lazy_df)
+        lazy_df = ensure_age_buckets(lazy_df)
 
-    for sheet_name in sheet_names:
-        sheet_info = sheets_data.get(sheet_name, {})
-        data = sheet_info.get("data", [])
-        columns = sheet_info.get("columns", [])
+        # Get total rows before filtering
+        parquet_file = pq.ParquetFile(file_path)
+        total_records = parquet_file.metadata.num_rows
 
-        if not data:
-            continue
+        # Apply filters
+        if request.filters:
+            for filter_key, filter_values in request.filters.items():
+                if filter_values and len(filter_values) > 0:
+                    column_name = FILTER_COLUMNS.get(filter_key)
+                    if column_name:
+                        lazy_df = lazy_df.filter(pl.col(column_name).is_in(filter_values))
+                        logger.info(f"Applied filter: {column_name} in {filter_values}")
 
-        req_cols = required_columns.get(sheet_name, [])
+        # Determine group by columns
+        group_by_columns = []
+        if request.group_by:
+            for col in request.group_by:
+                # Map display names to actual column names
+                actual_col = FILTER_COLUMNS.get(col.lower().replace(" ", "_"), col)
+                group_by_columns.append(actual_col)
+        else:
+            # Default grouping
+            group_by_columns = ["Regulation", "AssetClass"]
 
-        # Rule 1: Check required columns for empty/null values (ERROR severity)
-        for row_idx, row in enumerate(data):
-            for col in req_cols:
-                if col not in columns:
-                    continue
-                val = row.get(col)
-                if val is None or (isinstance(val, str) and val.strip() == ""):
-                    add_error(
-                        sheet_name, row_idx + 2, col,
-                        "MISSING_VALUE", "ERROR",
-                        f"Required field '{col}' is empty",
-                        "Non-empty value",
-                        "(null)" if val is None else "(empty)",
-                    )
+        logger.info(f"Grouping by: {group_by_columns}")
 
-        # Rule 2: Check optional columns for empty/null values (WARNING severity)
-        for row_idx, row in enumerate(data):
-            for col in columns:
-                if col in req_cols:
-                    continue  # Already checked above
-                val = row.get(col)
-                if val is None or (isinstance(val, str) and val.strip() == ""):
-                    add_error(
-                        sheet_name, row_idx + 2, col,
-                        "MISSING_VALUE", "WARNING",
-                        f"Optional field '{col}' is empty",
-                        "Non-empty value",
-                        "(null)" if val is None else "(empty)",
-                    )
-
-    # Rule 3: Cross-sheet reference validation (Enrichment.SourceSheet must be a valid sheet name)
-    enrichment = sheets_data.get("Enrichment", {})
-    enr_data = enrichment.get("data", [])
-    enr_cols = enrichment.get("columns", [])
-    if "SourceSheet" in enr_cols:
-        for row_idx, row in enumerate(enr_data):
-            ref = row.get("SourceSheet")
-            if ref and isinstance(ref, str) and ref.strip() and ref not in sheet_names:
-                add_error(
-                    "Enrichment", row_idx + 2, "SourceSheet",
-                    "INVALID_REFERENCE", "ERROR",
-                    f"SourceSheet '{ref}' does not exist in workbook",
-                    f"One of: {', '.join(sheet_names)}",
-                    ref,
+        if request.include_remediation_split:
+            # Build aggregation with remediation split
+            # Total counts
+            agg_expressions = [
+                pl.count().alias("total_count")
+            ]
+            for bucket in AGE_BUCKET_COLUMNS:
+                agg_expressions.append(
+                    pl.col(bucket).sum().alias(f"total_{bucket}")
                 )
 
-    # Rule 4: Duplicate detection in Rules sheet (same SourceField + TargetField)
-    rules = sheets_data.get("Rules", {})
-    rules_data = rules.get("data", [])
-    rules_cols = rules.get("columns", [])
-    if "SourceField" in rules_cols and "TargetField" in rules_cols:
-        seen = {}
-        for row_idx, row in enumerate(rules_data):
-            src = row.get("SourceField", "")
-            tgt = row.get("TargetField", "")
-            if src and tgt:
-                key = f"{src}|{tgt}"
-                if key in seen:
-                    add_error(
-                        "Rules", row_idx + 2, "SourceField",
-                        "DUPLICATE", "ERROR",
-                        f"Duplicate rule: SourceField='{src}' + TargetField='{tgt}' already defined at row {seen[key]}",
-                        "Unique SourceField+TargetField combination",
-                        f"Duplicate of row {seen[key]}",
-                    )
-                else:
-                    seen[key] = row_idx + 2
+            # Unremediated counts (where RemediationPlan is NOT 'No action required')
+            for bucket in AGE_BUCKET_COLUMNS:
+                agg_expressions.append(
+                    pl.when(pl.col("RemediationStatus") == "Unremediated")
+                    .then(pl.col(bucket))
+                    .otherwise(0)
+                    .sum()
+                    .alias(f"unremediated_{bucket}")
+                )
 
-    print(f"Validation complete. Found {len(errors)} issues.")
-    return errors
+            # Unremediated count
+            agg_expressions.append(
+                pl.when(pl.col("RemediationStatus") == "Unremediated")
+                .then(1)
+                .otherwise(0)
+                .sum()
+                .alias("unremediated_count")
+            )
 
+            # Execute aggregation
+            aggregated_df = (
+                lazy_df
+                .group_by(group_by_columns)
+                .agg(agg_expressions)
+                .sort(group_by_columns)
+                .collect()
+            )
 
-def build_summary(errors, sheet_names):
-    """Build validation summary statistics."""
-    total_errors = sum(1 for e in errors if e["Severity"] == "ERROR")
-    total_warnings = sum(1 for e in errors if e["Severity"] == "WARNING")
+            # Convert to list of dicts
+            aggregations = aggregated_df.to_dicts()
 
-    errors_by_sheet = {}
-    for e in errors:
-        sheet = e["Sheet"]
-        errors_by_sheet[sheet] = errors_by_sheet.get(sheet, 0) + 1
+            # Calculate totals for each row
+            for row in aggregations:
+                row["total_total"] = sum(row.get(f"total_{bucket}", 0) or 0 for bucket in AGE_BUCKET_COLUMNS)
+                row["unremediated_total"] = sum(row.get(f"unremediated_{bucket}", 0) or 0 for bucket in AGE_BUCKET_COLUMNS)
 
-    errors_by_type = {}
-    for e in errors:
-        etype = e["Error_Type"]
-        errors_by_type[etype] = errors_by_type.get(etype, 0) + 1
+            # Calculate summary statistics
+            filtered_count = sum(row["total_count"] for row in aggregations)
+            unremediated_count = sum(row["unremediated_count"] for row in aggregations)
 
-    errors_by_severity = {}
-    for e in errors:
-        sev = e["Severity"]
-        errors_by_severity[sev] = errors_by_severity.get(sev, 0) + 1
-
-    return {
-        "total_errors": total_errors,
-        "total_warnings": total_warnings,
-        "total_issues": len(errors),
-        "errors_by_sheet": errors_by_sheet,
-        "errors_by_type": errors_by_type,
-        "errors_by_severity": errors_by_severity,
-        "sheets_validated": sheet_names,
-        "validation_duration_seconds": 0,  # Updated below
-    }
-
-
-def write_validated_excel(original_path, errors):
-    """
-    Create a copy of the Excel file with an added 'Validation' sheet containing errors.
-    Returns the path to the validated file.
-    """
-    if not errors:
-        return None
-
-    original = Path(original_path)
-    validated_path = original.parent / f"{original.stem}_validated{original.suffix}"
-    print(f"Writing validated Excel to: {validated_path}")
-
-    wb = openpyxl.load_workbook(original_path)
-
-    # Remove existing Validation sheet if present
-    if "Validation" in wb.sheetnames:
-        del wb["Validation"]
-
-    ws = wb.create_sheet("Validation")
-
-    # Write header
-    validation_columns = [
-        "Sheet", "Row", "Column", "Error_Type", "Severity",
-        "Error_Message", "Expected_Value", "Actual_Value"
-    ]
-    for col_idx, col_name in enumerate(validation_columns, 1):
-        cell = ws.cell(row=1, column=col_idx, value=col_name)
-        cell.font = openpyxl.styles.Font(bold=True)
-
-    # Write error rows
-    for row_idx, error in enumerate(errors, 2):
-        for col_idx, col_name in enumerate(validation_columns, 1):
-            val = error.get(col_name, "")
-            ws.cell(row=row_idx, column=col_idx, value=val)
-
-    # Auto-fit column widths (approximate)
-    for col_idx, col_name in enumerate(validation_columns, 1):
-        max_len = len(col_name)
-        for row_idx in range(2, min(len(errors) + 2, 102)):  # Check first 100 rows
-            cell_val = str(ws.cell(row=row_idx, column=col_idx).value or "")
-            max_len = max(max_len, len(cell_val))
-        ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 2, 50)
-
-    wb.save(validated_path)
-    wb.close()
-    print(f"Validated Excel written with {len(errors)} error rows")
-    return str(validated_path)
-
-
-def main():
-    start_time = datetime.now()
-    task_id = get_env("TASK_ID", "unknown")
-    file_path = get_env("FILE_PATH")
-    results_dir = get_env("RESULTS_DIR")
-
-    print("=" * 70)
-    print(f"Config Validator Script")
-    print(f"Task ID: {task_id}")
-    print(f"File: {file_path}")
-    print(f"Results Dir: {results_dir}")
-    print(f"Started: {start_time.isoformat()}")
-    print("=" * 70)
-
-    if not file_path:
-        print("ERROR: FILE_PATH environment variable is required")
-        sys.exit(1)
-
-    if not Path(file_path).exists():
-        print(f"ERROR: File not found: {file_path}")
-        sys.exit(1)
-
-    try:
-        # Step 1: Read Excel
-        print("\n[Step 1/4] Reading Excel file...")
-        sheet_names, sheets_data = read_excel_sheets(file_path)
-
-        # Step 2: Validate
-        print("\n[Step 2/4] Running validation...")
-        errors = validate_config(sheet_names, sheets_data)
-
-        # Step 3: Build summary
-        print("\n[Step 3/4] Building summary...")
-        validation_passed = len([e for e in errors if e["Severity"] == "ERROR"]) == 0
-        summary = build_summary(errors, sheet_names)
-
-        end_time = datetime.now()
-        duration = (end_time - start_time).total_seconds()
-        summary["validation_duration_seconds"] = round(duration, 2)
-
-        # Step 4: Write outputs
-        print("\n[Step 4/4] Writing outputs...")
-
-        # Write validated Excel (only if errors exist)
-        validated_file_path = None
-        if errors:
-            validated_file_path = write_validated_excel(file_path, errors)
-
-        # Build validation sheet data for results JSON
-        validation_sheet = None
-        if errors:
-            validation_columns = [
-                "Sheet", "Row", "Column", "Error_Type", "Severity",
-                "Error_Message", "Expected_Value", "Actual_Value"
-            ]
-            validation_sheet = {
-                "columns": validation_columns,
-                "data": errors,
-                "row_count": len(errors),
-                "error_count": len(errors),
+            summary = {
+                "total_count": filtered_count,
+                "unremediated_count": unremediated_count,
+                "total": {},
+                "unremediated": {}
             }
+            for bucket in AGE_BUCKET_COLUMNS:
+                summary["total"][bucket] = sum(row.get(f"total_{bucket}", 0) or 0 for row in aggregations)
+                summary["unremediated"][bucket] = sum(row.get(f"unremediated_{bucket}", 0) or 0 for row in aggregations)
 
-        # Add error_count per sheet
-        for sheet_name in sheet_names:
-            sheet_errors = sum(1 for e in errors if e["Sheet"] == sheet_name)
-            sheets_data[sheet_name]["error_count"] = sheet_errors
+            summary["total"]["total"] = sum(summary["total"].values())
+            summary["unremediated"]["total"] = sum(summary["unremediated"].values())
 
-        # Build results JSON
-        results = {
-            "status": "completed",
-            "file_path": file_path,
-            "validation_passed": validation_passed,
+        else:
+            # Simple aggregation without remediation split (original behavior)
+            agg_expressions = [
+                pl.count().alias("count")
+            ]
+
+            for bucket in AGE_BUCKET_COLUMNS:
+                agg_expressions.append(
+                    pl.col(bucket).sum().alias(bucket)
+                )
+
+            # Execute aggregation
+            aggregated_df = (
+                lazy_df
+                .group_by(group_by_columns)
+                .agg(agg_expressions)
+                .sort(group_by_columns)
+                .collect()
+            )
+
+            # Convert to list of dicts
+            aggregations = aggregated_df.to_dicts()
+
+            # Calculate totals for each row
+            for row in aggregations:
+                row["total"] = sum(row.get(bucket, 0) or 0 for bucket in AGE_BUCKET_COLUMNS)
+
+            # Calculate summary statistics
+            filtered_count = sum(row["count"] for row in aggregations)
+            summary = {
+                "total": filtered_count,
+            }
+            for bucket in AGE_BUCKET_COLUMNS:
+                summary[bucket] = sum(row.get(bucket, 0) or 0 for row in aggregations)
+
+        result = {
+            "success": True,
+            "total_records": total_records,
+            "filtered_records": filtered_count,
+            "aggregations": aggregations,
             "summary": summary,
-            "sheet_names": sheet_names,
-            "sheets": sheets_data,
-            "completed_at": end_time.isoformat(),
+            "group_by": group_by_columns,
+            "age_buckets": AGE_BUCKET_COLUMNS,
+            "include_remediation_split": request.include_remediation_split,
+            "retrieved_at": datetime.now().isoformat()
         }
 
-        # Add validation sheet to results if errors exist
-        if validation_sheet:
-            results["sheets"]["Validation"] = validation_sheet
-            results["validated_file_path"] = validated_file_path
+        logger.info(f"Aggregation complete: {len(aggregations)} groups, {filtered_count} filtered records")
+        return result
 
-        # Write results JSON
-        if results_dir:
-            results_path = Path(results_dir) / f"{task_id}.json"
-            results_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(results_path, "w", encoding="utf-8") as f:
-                json.dump(results, f, indent=2, default=str)
-            print(f"Results written to: {results_path}")
-
-        # Print summary
-        print("\n" + "=" * 70)
-        print(f"VALIDATION {'PASSED' if validation_passed else 'FAILED'}")
-        print(f"Total Issues: {len(errors)}")
-        print(f"  Errors: {summary['total_errors']}")
-        print(f"  Warnings: {summary['total_warnings']}")
-        if summary["errors_by_sheet"]:
-            print(f"  By Sheet: {summary['errors_by_sheet']}")
-        if summary["errors_by_type"]:
-            print(f"  By Type: {summary['errors_by_type']}")
-        print(f"Duration: {duration:.2f}s")
-        if validated_file_path:
-            print(f"Validated Excel: {validated_file_path}")
-        print("=" * 70)
-
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"\nFATAL ERROR: {e}")
-        traceback.print_exc()
-
-        # Write error results
-        if results_dir:
-            error_results = {
-                "status": "failed",
-                "file_path": file_path,
-                "validation_passed": None,
-                "error": str(e),
-                "traceback": traceback.format_exc(),
-                "completed_at": datetime.now().isoformat(),
-            }
-            results_path = Path(results_dir) / f"{task_id}.json"
-            results_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(results_path, "w", encoding="utf-8") as f:
-                json.dump(error_results, f, indent=2)
-
-        sys.exit(1)
+        logger.error(f"Error getting aggregations: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-if __name__ == "__main__":
-    main()
-  ### PAGE JS
+@router.post("/details")
+async def get_details(request: DetailsRequest) -> Dict[str, Any]:
+    """
+    Get detailed records with pagination for drill-down views
+    """
+    try:
+        file_path = get_data_file_path()
+        logger.info(f"Getting details from: {file_path}")
 
-import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+        if not Path(file_path).exists():
+            raise HTTPException(status_code=404, detail=f"Data file not found: {file_path}")
+
+        # Start with lazy loading
+        lazy_df = pl.scan_parquet(file_path)
+        lazy_df = ensure_age_buckets(lazy_df)
+        lazy_df = ensure_remediation_status(lazy_df)
+
+        # Apply filters
+        if request.filters:
+            for filter_key, filter_values in request.filters.items():
+                if filter_values and len(filter_values) > 0:
+                    column_name = FILTER_COLUMNS.get(filter_key)
+                    if column_name:
+                        lazy_df = lazy_df.filter(pl.col(column_name).is_in(filter_values))
+
+        # Apply bucket filter
+        if request.bucket and request.bucket in AGE_BUCKET_COLUMNS:
+            bucket = request.bucket
+            if bucket == "0-3":
+                lazy_df = lazy_df.filter(pl.col("ErrorAge") <= 3)
+            elif bucket == "3-7":
+                lazy_df = lazy_df.filter((pl.col("ErrorAge") > 3) & (pl.col("ErrorAge") <= 7))
+            elif bucket == "7-14":
+                lazy_df = lazy_df.filter((pl.col("ErrorAge") > 7) & (pl.col("ErrorAge") <= 14))
+            elif bucket == "14-30":
+                lazy_df = lazy_df.filter((pl.col("ErrorAge") > 14) & (pl.col("ErrorAge") <= 30))
+            elif bucket == "30-60":
+                lazy_df = lazy_df.filter((pl.col("ErrorAge") > 30) & (pl.col("ErrorAge") <= 60))
+
+            if request.bucket_scope == "unremediated":
+                lazy_df = lazy_df.filter(pl.col("RemediationStatus") == "Unremediated")
+
+        # Get filtered count (execute a separate query for count)
+        count_df = lazy_df.select(pl.count()).collect()
+        total_filtered = count_df.item()
+
+        # Apply sorting
+        if request.sort_column:
+            descending = request.sort_direction.lower() == "desc"
+            lazy_df = lazy_df.sort(request.sort_column, descending=descending)
+        else:
+            # Default sort by ErrorAge descending
+            lazy_df = lazy_df.sort("ErrorAge", descending=True)
+
+        # Apply pagination
+        start_idx = (request.page - 1) * request.page_size
+        page_df = (
+            lazy_df
+            .slice(start_idx, request.page_size)
+            .collect()
+        )
+
+        # Convert to list of dicts
+        data = page_df.to_dicts()
+
+        # Calculate pagination info
+        total_pages = (total_filtered + request.page_size - 1) // request.page_size if total_filtered > 0 else 1
+
+        result = {
+            "success": True,
+            "data": data,
+            "columns": page_df.columns,
+            "pagination": {
+                "current_page": request.page,
+                "page_size": request.page_size,
+                "total_rows": total_filtered,
+                "total_pages": total_pages,
+                "has_next": request.page < total_pages,
+                "has_previous": request.page > 1
+            },
+            "retrieved_at": datetime.now().isoformat()
+        }
+
+        logger.info(f"Details retrieved: {len(data)} rows (page {request.page}/{total_pages})")
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting details: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/cache/clear")
+async def clear_cache() -> Dict[str, Any]:
+    """Clear the filter options cache"""
+    global _filter_options_cache
+    _filter_options_cache = {"data": None, "timestamp": None}
+    logger.info("Supervisory dashboard cache cleared")
+    return {"success": True, "message": "Cache cleared"}
+
+
+@router.get("/saved-filters")
+async def list_saved_filters() -> Dict[str, Any]:
+    """List all saved filter presets (shared across users)."""
+    saved = load_saved_filters()
+    return {"success": True, "filters": saved}
+
+
+@router.post("/saved-filters")
+async def save_filter(request: SavedFilterRequest) -> Dict[str, Any]:
+    """Save a new filter preset."""
+    saved = load_saved_filters()
+    now = datetime.now().isoformat()
+    new_item = {
+        "id": str(uuid.uuid4()),
+        "name": request.name,
+        "filters": request.filters,
+        "group_by": request.group_by,
+        "created_by": request.created_by or "anonymous",
+        "created_by_name": request.created_by_name or request.created_by or "anonymous",
+        "created_at": now
+    }
+    saved.insert(0, new_item)
+    write_saved_filters(saved)
+    return {"success": True, "filter": new_item}
+
+
+@router.delete("/saved-filters/{filter_id}")
+async def delete_saved_filter(filter_id: str) -> Dict[str, Any]:
+    """Delete a saved filter preset by id."""
+    saved = load_saved_filters()
+    updated = [item for item in saved if item.get("id") != filter_id]
+    if len(updated) == len(saved):
+        raise HTTPException(status_code=404, detail="Saved filter not found")
+    write_saved_filters(updated)
+    return {"success": True, "message": "Deleted"}
+
+
+page.js super-visory
+
+import { useState, useEffect, useMemo, useCallback } from 'react';
+import HSBCLogo from '../../components/HSBCLogo';
+import { ApiService } from '../../services/api';
 import { AgGridReact } from 'ag-grid-react';
 import 'ag-grid-community/styles/ag-grid.css';
 import 'ag-grid-community/styles/ag-theme-alpine.css';
-import ApiService from '../../services/api';
-import HSBCLogo from '../../components/HSBCLogo';
-import ValidationSummary from './ValidationSummary';
-import { FaCheckCircle, FaPlay, FaTimes, FaTimesCircle, FaSpinner, FaHistory, FaExclamationTriangle } from 'react-icons/fa';
+import {
+    BarChart,
+    Bar,
+    XAxis,
+    YAxis,
+    CartesianGrid,
+    Tooltip,
+    Legend,
+    ResponsiveContainer
+} from 'recharts';
+import { FaFilter, FaSync, FaDownload, FaChartBar, FaTable, FaTimes, FaCheck, FaGripVertical, FaExternalLinkAlt } from 'react-icons/fa';
+import { useUser } from '../../contexts/UserContext';
 
-const ConfigValidatorPage = () => {
-    // Input state
-    const [filePath, setFilePath] = useState('');
+// Age bucket colors
+const AGE_BUCKET_COLORS = {
+    '0-3': '#10B981',
+    '3-7': '#F59E0B',
+    '7-14': '#F97316',
+    '14-30': '#EF4444',
+    '30-60': '#7C3AED'
+};
 
-    // Validation state
-    const [validationState, setValidationState] = useState('idle'); // idle | validating | completed | failed | error
-    const [taskId, setTaskId] = useState(null);
-    const [results, setResults] = useState(null);
-    const [error, setError] = useState(null);
+const AGE_BUCKET_LABELS = {
+    '0-3': '0-3d',
+    '3-7': '3-7d',
+    '7-14': '7-14d',
+    '14-30': '14-30d',
+    '30-60': '30-60d'
+};
 
-    // Sheet display state
-    const [activeSheet, setActiveSheet] = useState('');
-    const [sheetNames, setSheetNames] = useState([]);
+// Available columns for grouping
+const AVAILABLE_COLUMNS = [
+    { id: 'regulation', label: 'Regulation', field: 'Regulation' },
+    { id: 'asset_class', label: 'Asset Class', field: 'AssetClass' },
+    { id: 'control_type', label: 'Control Type', field: 'Control Type' },
+    { id: 'data_type', label: 'Data Type', field: 'Data Type' },
+    { id: 'sub_control_type', label: 'Sub-Control Type', field: 'Sub-ControlType' },
+    { id: 'remediation_status', label: 'Remediation Status', field: 'RemediationStatus' },
+    { id: 'explain_issue', label: 'ExplainIssue', field: 'ExplainIssue' },
+    { id: 'explain_issue_notification', label: 'ExplainIssueNotification', field: 'ExplainIssueNotification' },
+    { id: 'explain_issue_detail', label: 'ExplainIssueDetail', field: 'ExplainIssueDetail' }
+];
 
-    // History state
-    const [history, setHistory] = useState([]);
-    const [showHistory, setShowHistory] = useState(false);
+const DETAIL_FILTER_KEYS = {
+    Regulation: 'regulation',
+    AssetClass: 'asset_class',
+    'Control Type': 'control_type',
+    'Data Type': 'data_type',
+    'Sub-ControlType': 'sub_control_type',
+    RemediationStatus: 'remediation_status',
+    ExplainIssue: 'explain_issue',
+    ExplainIssueNotification: 'explain_issue_notification',
+    ExplainIssueDetail: 'explain_issue_detail'
+};
 
-    // Polling ref
-    const pollingRef = useRef(null);
+// Summary Card Component
+const SummaryCard = ({ title, value, color, subtitle, small }) => (
+    <div
+        className={`bg-white rounded-lg shadow-sm border-l-4 ${small ? 'p-2' : 'p-4'}`}
+        style={{ borderLeftColor: color }}
+    >
+        <div className={`text-gray-500 font-medium ${small ? 'text-xs' : 'text-sm'}`}>{title}</div>
+        <div className={`font-bold mt-1 ${small ? 'text-lg' : 'text-2xl'}`} style={{ color }}>
+            {typeof value === 'number' ? value.toLocaleString() : value}
+        </div>
+        {subtitle && <div className="text-xs text-gray-400 mt-1">{subtitle}</div>}
+    </div>
+);
 
-    // Load history on mount
-    useEffect(() => {
-        loadHistory();
-    }, []);
+// Multi-Select Filter Component
+const MultiSelectFilter = ({ label, options, selected, onChange, placeholder }) => {
+    const [isOpen, setIsOpen] = useState(false);
+    const [search, setSearch] = useState('');
 
-    // Cleanup polling on unmount
-    useEffect(() => {
-        return () => {
-            if (pollingRef.current) {
-                clearInterval(pollingRef.current);
-            }
-        };
-    }, []);
+    const filteredOptions = useMemo(() => {
+        if (!search) return options;
+        return options.filter(opt =>
+            opt.toLowerCase().includes(search.toLowerCase())
+        );
+    }, [options, search]);
 
-    const loadHistory = async () => {
-        try {
-            const response = await ApiService.getConfigValidationHistory(20);
-            setHistory(response.history || []);
-        } catch (err) {
-            // History loading is non-critical
+    const toggleOption = (option) => {
+        if (selected.includes(option)) {
+            onChange(selected.filter(s => s !== option));
+        } else {
+            onChange([...selected, option]);
         }
     };
 
-    const handleValidate = async () => {
-        if (!filePath.trim()) {
-            setError('Please enter a file path');
-            return;
-        }
-
-        setError(null);
-        setResults(null);
-        setValidationState('validating');
-        setSheetNames([]);
-        setActiveSheet('');
-
-        try {
-            const response = await ApiService.startConfigValidation(filePath.trim());
-            const newTaskId = response.task_id;
-            setTaskId(newTaskId);
-
-            // Start polling for status
-            pollingRef.current = setInterval(async () => {
-                try {
-                    const status = await ApiService.getConfigValidationStatus(newTaskId);
-                    const taskStatus = (status.status || '').toLowerCase();
-
-                    if (taskStatus === 'completed' || taskStatus === 'success') {
-                        clearInterval(pollingRef.current);
-                        pollingRef.current = null;
-                        await fetchResults(newTaskId);
-                    } else if (taskStatus === 'failed' || taskStatus === 'error') {
-                        clearInterval(pollingRef.current);
-                        pollingRef.current = null;
-                        setValidationState('error');
-                        setError(`Validation process failed. Check logs for task ${newTaskId}`);
-                        // Still try to fetch results (might have partial data)
-                        try {
-                            await fetchResults(newTaskId);
-                        } catch {
-                            // No results available
-                        }
-                    }
-                } catch (err) {
-                    // Polling error - keep trying
-                }
-            }, 2000);
-
-        } catch (err) {
-            setValidationState('error');
-            setError(err.message);
-        }
-    };
-
-    const fetchResults = async (tid) => {
-        try {
-            const data = await ApiService.getConfigValidationResults(tid);
-
-            if (data.status === 'failed' && data.error) {
-                setValidationState('error');
-                setError(data.error);
-                return;
-            }
-
-            setResults(data);
-
-            // Build sheet names list
-            const names = data.sheet_names || [];
-            const allNames = [...names];
-            // Show Validation tab whenever it exists with data (errors OR warnings)
-            if (data.sheets && data.sheets['Validation'] && data.sheets['Validation'].row_count > 0) {
-                allNames.push('Validation');
-            }
-            setSheetNames(allNames);
-
-            // Set first sheet as active
-            if (allNames.length > 0) {
-                setActiveSheet(allNames[0]);
-            }
-
-            // Determine state: failed if any issues exist, completed if clean
-            const hasIssues = data.summary && (data.summary.total_issues > 0 || data.summary.total_errors > 0 || data.summary.total_warnings > 0);
-            setValidationState(hasIssues ? 'failed' : 'completed');
-            loadHistory(); // Refresh history
-        } catch (err) {
-            setValidationState('error');
-            setError(`Failed to fetch results: ${err.message}`);
-        }
-    };
-
-    const handleClear = () => {
-        if (pollingRef.current) {
-            clearInterval(pollingRef.current);
-            pollingRef.current = null;
-        }
-        setFilePath('');
-        setValidationState('idle');
-        setTaskId(null);
-        setResults(null);
-        setError(null);
-        setSheetNames([]);
-        setActiveSheet('');
-    };
-
-    const handleHistoryClick = async (item) => {
-        setFilePath(item.file_path || '');
-        setShowHistory(false);
-
-        if (item.has_results && item.task_id) {
-            setTaskId(item.task_id);
-            setValidationState('validating');
-            await fetchResults(item.task_id);
-        }
-    };
-
-    const handleKeyPress = (e) => {
-        if (e.key === 'Enter' && validationState !== 'validating') {
-            handleValidate();
-        }
-    };
-
-    // AG Grid data for active sheet
-    const activeSheetData = useMemo(() => {
-        if (!results || !results.sheets || !activeSheet) return [];
-        const sheet = results.sheets[activeSheet];
-        return sheet ? (sheet.data || []) : [];
-    }, [results, activeSheet]);
-
-    // AG Grid column definitions for active sheet
-    const columnDefs = useMemo(() => {
-        if (!results || !results.sheets || !activeSheet) return [];
-        const sheet = results.sheets[activeSheet];
-        if (!sheet || !sheet.columns) return [];
-
-        return sheet.columns.map(col => ({
-            headerName: col,
-            field: col,
-            minWidth: 120,
-            flex: 1,
-            resizable: true,
-            sortable: true,
-            filter: true,
-        }));
-    }, [results, activeSheet]);
-
-    const defaultColDef = useMemo(() => ({
-        sortable: true,
-        filter: true,
-        resizable: true,
-        minWidth: 100,
-    }), []);
-
-    // Row styling for Validation sheet
-    const getRowStyle = useCallback((params) => {
-        if (activeSheet !== 'Validation') return null;
-        const severity = params.data?.Severity;
-        if (severity === 'ERROR') {
-            return { backgroundColor: '#FEE2E2' };
-        }
-        if (severity === 'WARNING') {
-            return { backgroundColor: '#FEF3C7' };
-        }
-        if (severity === 'INFO') {
-            return { backgroundColor: '#DBEAFE' };
-        }
-        return null;
-    }, [activeSheet]);
-
-    // Get error count badge for a sheet tab
-    const getSheetErrorCount = (sheetName) => {
-        if (!results || !results.sheets) return 0;
-        const sheet = results.sheets[sheetName];
-        return sheet?.error_count || 0;
-    };
+    const selectAll = () => onChange([...options]);
+    const clearAll = () => onChange([]);
 
     return (
-        <div className="min-h-screen bg-gray-100">
-            {/* Loading Overlay */}
-            {validationState === 'validating' && (
-                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-                    <div className="bg-white rounded-lg p-8 flex flex-col items-center shadow-xl">
-                        <div className="animate-spin rounded-full h-16 w-16 border-4 border-red-500 border-t-transparent mb-4"></div>
-                        <p className="text-gray-700 text-lg font-medium">Validating config...</p>
-                        <p className="text-gray-500 text-sm mt-1">{filePath.split(/[/\\]/).pop()}</p>
-                    </div>
+        <div className="mb-3">
+            <label className="block text-xs font-medium text-gray-700 mb-1">{label}</label>
+            <div className="relative">
+                <div
+                    onClick={() => setIsOpen(!isOpen)}
+                    className="w-full px-2 py-1.5 border border-gray-300 rounded bg-white cursor-pointer flex items-center justify-between text-xs"
+                >
+                    <span className={selected.length === 0 ? 'text-gray-400' : 'text-gray-700'}>
+                        {selected.length === 0 ? placeholder : `${selected.length} selected`}
+                    </span>
+                    <svg className={`w-3 h-3 transition-transform ${isOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                    </svg>
                 </div>
-            )}
 
-            {/* Header */}
-            <div className="border-b border-slate-200 px-8 py-4"
-                style={{
-                    backgroundColor: 'white',
-                    height: '80px',
-                    boxShadow: '0 4px 8px rgba(0,0,0,0.15), 0 8px 16px rgba(0,0,0,0.1), 0 2px 4px rgba(0,0,0,0.1), inset 0 2px 0 rgba(255,255,255,0.8), inset 0 -2px 0 rgba(0,0,0,0.1)'
-                }}>
-                <div className="flex items-center justify-between h-full">
-                    <div className="flex items-center flex-shrink-0">
-                        <HSBCLogo height={64} className="mr-4" />
-                    </div>
-                    <div className="flex-1 flex justify-center">
-                        <h1 className="text-2xl font-bold text-black text-center">
-                            CONFIG VALIDATOR
-                        </h1>
-                    </div>
-                    <div className="flex-shrink-0 flex items-center gap-2">
-                        <button
-                            onClick={() => setShowHistory(!showHistory)}
-                            className="flex items-center gap-2 px-3 py-1.5 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors text-sm font-medium"
-                        >
-                            <FaHistory />
-                            History
-                        </button>
-                        <div className="px-3 py-1 rounded-lg text-sm font-medium bg-gray-100 text-gray-700">
-                            {new Date().toLocaleDateString()}
+                {isOpen && (
+                    <div className="absolute z-50 w-full mt-1 bg-white border border-gray-300 rounded shadow-lg max-h-48 overflow-hidden">
+                        <div className="p-1.5 border-b">
+                            <input
+                                type="text"
+                                placeholder="Search..."
+                                value={search}
+                                onChange={(e) => setSearch(e.target.value)}
+                                className="w-full px-2 py-1 text-xs border border-gray-200 rounded"
+                                onClick={(e) => e.stopPropagation()}
+                            />
+                        </div>
+                        <div className="flex gap-2 px-2 py-1 border-b bg-gray-50">
+                            <button onClick={(e) => { e.stopPropagation(); selectAll(); }} className="text-xs text-blue-600 hover:underline">All</button>
+                            <button onClick={(e) => { e.stopPropagation(); clearAll(); }} className="text-xs text-red-600 hover:underline">Clear</button>
+                        </div>
+                        <div className="max-h-32 overflow-y-auto">
+                            {filteredOptions.map(option => (
+                                <div
+                                    key={option}
+                                    onClick={(e) => { e.stopPropagation(); toggleOption(option); }}
+                                    className="px-2 py-1.5 hover:bg-gray-100 cursor-pointer flex items-center gap-2 text-xs"
+                                >
+                                    <div className={`w-3 h-3 border rounded flex items-center justify-center ${
+                                        selected.includes(option) ? 'bg-blue-500 border-blue-500' : 'border-gray-300'
+                                    }`}>
+                                        {selected.includes(option) && <FaCheck className="text-white" style={{ fontSize: '8px' }} />}
+                                    </div>
+                                    <span>{option}</span>
+                                </div>
+                            ))}
                         </div>
                     </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+// Draggable Column Chip
+const DraggableChip = ({ column, onRemove, isDragging }) => (
+    <div
+        draggable
+        onDragStart={(e) => {
+            e.dataTransfer.setData('columnId', column.id);
+            e.dataTransfer.effectAllowed = 'move';
+        }}
+        className={`inline-flex items-center gap-1 px-2 py-1 bg-blue-100 text-blue-700 rounded text-xs cursor-move transition-opacity ${
+            isDragging ? 'opacity-50' : ''
+        }`}
+    >
+        <FaGripVertical className="text-blue-400" style={{ fontSize: '10px' }} />
+        <span>{column.label}</span>
+        {onRemove && (
+            <FaTimes
+                className="cursor-pointer hover:text-blue-900 ml-1"
+                style={{ fontSize: '10px' }}
+                onClick={(e) => { e.stopPropagation(); onRemove(column.id); }}
+            />
+        )}
+    </div>
+);
+
+// Column Drop Zone
+const ColumnDropZone = ({ selectedColumns, availableColumns, onColumnsChange }) => {
+    const [dragOver, setDragOver] = useState(false);
+
+    const handleDragOver = (e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        setDragOver(true);
+    };
+
+    const handleDragLeave = () => setDragOver(false);
+
+    const handleDrop = (e) => {
+        e.preventDefault();
+        setDragOver(false);
+        const columnId = e.dataTransfer.getData('columnId');
+        if (columnId && !selectedColumns.find(c => c.id === columnId)) {
+            const column = availableColumns.find(c => c.id === columnId);
+            if (column) {
+                onColumnsChange([...selectedColumns, column]);
+            }
+        }
+    };
+
+    const removeColumn = (columnId) => {
+        onColumnsChange(selectedColumns.filter(c => c.id !== columnId));
+    };
+
+    const unusedColumns = availableColumns.filter(c => !selectedColumns.find(s => s.id === c.id));
+
+    return (
+        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-3 mb-4">
+            <div className="flex items-start gap-4">
+                {/* Drop zone for selected columns */}
+                <div className="flex-1">
+                    <div className="text-xs font-medium text-gray-600 mb-2">Group By (drag to reorder)</div>
+                    <div
+                        onDragOver={handleDragOver}
+                        onDragLeave={handleDragLeave}
+                        onDrop={handleDrop}
+                        className={`min-h-[36px] p-2 border-2 border-dashed rounded flex flex-wrap gap-2 transition-colors ${
+                            dragOver ? 'border-blue-400 bg-blue-50' : 'border-gray-300 bg-gray-50'
+                        }`}
+                    >
+                        {selectedColumns.length === 0 ? (
+                            <span className="text-xs text-gray-400">Drop columns here to group data...</span>
+                        ) : (
+                            selectedColumns.map(col => (
+                                <DraggableChip key={col.id} column={col} onRemove={removeColumn} />
+                            ))
+                        )}
+                    </div>
+                </div>
+
+                {/* Available columns */}
+                <div className="w-64">
+                    <div className="text-xs font-medium text-gray-600 mb-2">Available Columns</div>
+                    <div className="flex flex-wrap gap-2">
+                        {unusedColumns.map(col => (
+                            <DraggableChip key={col.id} column={col} />
+                        ))}
+                        {unusedColumns.length === 0 && (
+                            <span className="text-xs text-gray-400">All columns in use</span>
+                        )}
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default function SupervisoryDashboard() {
+    const { currentUser } = useUser();
+    // Filter options from API
+    const [filterOptions, setFilterOptions] = useState({
+        regulation: [],
+        asset_class: [],
+        control_type: [],
+        data_type: [],
+        sub_control_type: [],
+        remediation_status: []
+    });
+
+    const [savedFilters, setSavedFilters] = useState([]);
+    const [selectedSavedFilterId, setSelectedSavedFilterId] = useState('');
+    const [savedFilterName, setSavedFilterName] = useState('');
+    const [isSavingFilter, setIsSavingFilter] = useState(false);
+
+    // Selected filters
+    const [filters, setFilters] = useState({
+        regulation: [],
+        asset_class: [],
+        control_type: [],
+        data_type: [],
+        sub_control_type: [],
+        remediation_status: []
+    });
+
+    // Aggregation data
+    const [aggregations, setAggregations] = useState([]);
+    const [summary, setSummary] = useState({
+        total_count: 0,
+        unremediated_count: 0,
+        total: { '0-3': 0, '3-7': 0, '7-14': 0, '14-30': 0, '30-60': 0, total: 0 },
+        unremediated: { '0-3': 0, '3-7': 0, '7-14': 0, '14-30': 0, '30-60': 0, total: 0 }
+    });
+    const [totalRecords, setTotalRecords] = useState(0);
+    const [filteredRecords, setFilteredRecords] = useState(0);
+
+    // UI state
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [activeView, setActiveView] = useState('table');
+    const [selectedColumns, setSelectedColumns] = useState([
+        AVAILABLE_COLUMNS[0], // Regulation
+        AVAILABLE_COLUMNS[1],  // Asset Class
+        AVAILABLE_COLUMNS[2],  // Control Type
+        AVAILABLE_COLUMNS[6],  // ExplainIssue
+        AVAILABLE_COLUMNS[7],  // ExplainIssueNotification
+        AVAILABLE_COLUMNS[8]  // ExplainIssueDetail
+
+    ]);
+
+    // Derive groupBy from selectedColumns
+    const groupBy = useMemo(() => selectedColumns.map(c => c.field), [selectedColumns]);
+
+    const emptyFilters = useMemo(() => ({
+        regulation: [],
+        asset_class: [],
+        control_type: [],
+        data_type: [],
+        sub_control_type: [],
+        remediation_status: []
+    }), []);
+
+    // Load filter options on mount
+    useEffect(() => {
+        loadFilterOptions();
+        loadSavedFilters();
+    }, []);
+
+    // Load aggregations when filters or groupBy changes
+    useEffect(() => {
+        if (groupBy.length > 0) {
+            loadAggregations();
+        }
+    }, [filters, groupBy]);
+
+    const loadFilterOptions = async () => {
+        try {
+            const response = await ApiService.getSupervisoryFilterOptions();
+            if (response.success) {
+                setFilterOptions(response.filter_options);
+                setTotalRecords(response.total_records);
+            }
+        } catch (err) {
+            setError('Failed to load filter options');
+        }
+    };
+
+    const loadAggregations = async () => {
+        setIsLoading(true);
+        setError(null);
+        try {
+            const response = await ApiService.getSupervisoryAggregations(filters, groupBy);
+            if (response.success) {
+                setAggregations(response.aggregations);
+                setSummary(response.summary);
+                setFilteredRecords(response.filtered_records);
+                setTotalRecords(response.total_records);
+            }
+        } catch (err) {
+            setError(err.message || 'Failed to load aggregations');
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const loadSavedFilters = async () => {
+        try {
+            const response = await ApiService.getSupervisorySavedFilters();
+            if (response.success) {
+                setSavedFilters(response.filters || []);
+            }
+        } catch (err) {
+            console.error('Failed to load saved filters', err);
+        }
+    };
+
+    const handleFilterChange = (filterKey, values) => {
+        setFilters(prev => ({ ...prev, [filterKey]: values }));
+    };
+
+    const clearAllFilters = () => {
+        setFilters(emptyFilters);
+    };
+
+    const applySavedFilter = useCallback((saved) => {
+        if (!saved) return;
+        const nextFilters = { ...emptyFilters, ...(saved.filters || {}) };
+        setFilters(nextFilters);
+
+        if (Array.isArray(saved.group_by) && saved.group_by.length > 0) {
+            const nextSelected = saved.group_by
+                .map(field => AVAILABLE_COLUMNS.find(col => col.field === field))
+                .filter(Boolean);
+            if (nextSelected.length > 0) {
+                setSelectedColumns(nextSelected);
+            }
+        }
+    }, [emptyFilters]);
+
+    const handleSavedFilterSelect = (e) => {
+        const value = e.target.value;
+        setSelectedSavedFilterId(value);
+        const selected = savedFilters.find(f => f.id === value);
+        applySavedFilter(selected);
+    };
+
+    const handleSaveCurrentFilter = async () => {
+        if (!savedFilterName.trim()) return;
+        setIsSavingFilter(true);
+        try {
+            const payload = {
+                name: savedFilterName.trim(),
+                filters: filters,
+                group_by: selectedColumns.map(col => col.field),
+                created_by: currentUser?.id || currentUser?.username || 'anonymous',
+                created_by_name: currentUser?.name || currentUser?.username || 'anonymous'
+            };
+            const response = await ApiService.saveSupervisoryFilter(payload);
+            if (response.success) {
+                setSavedFilters(prev => [response.filter, ...prev]);
+                setSavedFilterName('');
+                setSelectedSavedFilterId(response.filter.id);
+            }
+        } catch (err) {
+            console.error('Failed to save filter', err);
+        } finally {
+            setIsSavingFilter(false);
+        }
+    };
+
+    const hasActiveFilters = useMemo(() => {
+        return Object.values(filters).some(arr => arr.length > 0);
+    }, [filters]);
+
+    // AG Grid column definitions with dual measure sets
+    const openDetailsWindow = useCallback((rowData, clickedField) => {
+        if (!rowData) return;
+        const detailFilters = {};
+        selectedColumns.forEach(col => {
+            const filterKey = DETAIL_FILTER_KEYS[col.field];
+            if (!filterKey) return;
+            const value = rowData[col.field];
+            if (value === undefined || value === null || value === '') return;
+            detailFilters[filterKey] = [String(value)];
+        });
+
+        if (Object.keys(detailFilters).length === 0) return;
+
+        let bucket = null;
+        let bucketScope = null;
+        if (clickedField && typeof clickedField === 'string') {
+            if (clickedField.startsWith('unremediated_')) {
+                bucket = clickedField.replace('unremediated_', '');
+                bucketScope = 'unremediated';
+            } else if (clickedField.startsWith('total_')) {
+                bucket = clickedField.replace('total_', '');
+                bucketScope = 'total';
+            }
+            if (!AGE_BUCKET_COLORS[bucket]) {
+                bucket = null;
+                bucketScope = null;
+            }
+        }
+
+        const params = new URLSearchParams();
+        params.set('filters', JSON.stringify(detailFilters));
+        params.set('title', selectedColumns.map(col => col.label).join(' / '));
+        if (bucket) params.set('bucket', bucket);
+        if (bucketScope) params.set('bucketScope', bucketScope);
+        window.open(`/supervisory-dashboard/details?${params.toString()}`, '_blank', 'noopener');
+    }, [selectedColumns]);
+
+    const detailCellRenderer = useCallback((params) => {
+        const displayValue = params.valueFormatted ?? params.value ?? '';
+        if (!params.data) {
+            return <span>{displayValue}</span>;
+        }
+        return (
+            <div className="supervisory-cell">
+                <span className="supervisory-cell-value">{displayValue}</span>
+                <button
+                    className="supervisory-cell-action"
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        openDetailsWindow(params.data, params.colDef?.field);
+                    }}
+                    title="Open details"
+                    type="button"
+                >
+                    <FaExternalLinkAlt />
+                </button>
+            </div>
+        );
+    }, [openDetailsWindow]);
+
+    const columnDefs = useMemo(() => {
+        // Group by columns
+        const groupCols = selectedColumns.map(col => ({
+            headerName: col.label,
+            field: col.field,
+            sortable: true,
+            filter: true,
+            pinned: 'left',
+            width: 120,
+            cellStyle: { fontWeight: '500' },
+            cellRenderer: detailCellRenderer
+        }));
+
+        // Unremediated measure columns (Status: Pending Action)
+        const unremediatedCols = [
+            {
+                headerName: 'Unremediated (Pending)',
+                children: [
+                    ...Object.keys(AGE_BUCKET_COLORS).map(bucket => ({
+                        headerName: AGE_BUCKET_LABELS[bucket],
+                        field: `unremediated_${bucket}`,
+                        sortable: true,
+                        type: 'numericColumn',
+                        width: 70,
+                        cellStyle: params => {
+                            const value = params.value || 0;
+                            if (value === 0) return { backgroundColor: '#f9fafb', textAlign: 'right' };
+                            const color = AGE_BUCKET_COLORS[bucket];
+                            return {
+                                backgroundColor: `${color}20`,
+                                fontWeight: value > 100 ? 'bold' : 'normal',
+                                textAlign: 'right'
+                            };
+                        },
+                        valueFormatter: params => params.value ? params.value.toLocaleString() : '0',
+                        cellRenderer: detailCellRenderer
+                    })),
+                    {
+                        headerName: 'Total',
+                        field: 'unremediated_total',
+                        sortable: true,
+                        type: 'numericColumn',
+                        width: 80,
+                        cellStyle: { fontWeight: 'bold', backgroundColor: '#fef2f2', textAlign: 'right' },
+                        valueFormatter: params => params.value ? params.value.toLocaleString() : '0',
+                        cellRenderer: detailCellRenderer
+                    }
+                ]
+            }
+        ];
+
+        // Total measure columns
+        const totalCols = [
+            {
+                headerName: 'Total (All)',
+                children: [
+                    ...Object.keys(AGE_BUCKET_COLORS).map(bucket => ({
+                        headerName: AGE_BUCKET_LABELS[bucket],
+                        field: `total_${bucket}`,
+                        sortable: true,
+                        type: 'numericColumn',
+                        width: 70,
+                        cellStyle: params => {
+                            const value = params.value || 0;
+                            return {
+                                backgroundColor: value > 0 ? '#f0f9ff' : '#f9fafb',
+                                textAlign: 'right'
+                            };
+                        },
+                        valueFormatter: params => params.value ? params.value.toLocaleString() : '0',
+                        cellRenderer: detailCellRenderer
+                    })),
+                    {
+                        headerName: 'Total',
+                        field: 'total_total',
+                        sortable: true,
+                        type: 'numericColumn',
+                        width: 80,
+                        cellStyle: { fontWeight: 'bold', backgroundColor: '#eff6ff', textAlign: 'right' },
+                        valueFormatter: params => params.value ? params.value.toLocaleString() : '0',
+                        cellRenderer: detailCellRenderer
+                    }
+                ]
+            }
+        ];
+
+        return [...groupCols, ...unremediatedCols, ...totalCols];
+    }, [selectedColumns, detailCellRenderer]);
+
+    const defaultColDef = useMemo(() => ({
+        resizable: true,
+        sortable: true
+    }), []);
+
+    // Chart data preparation
+    const chartData = useMemo(() => {
+        if (selectedColumns.length === 0) return [];
+        const groupCol = selectedColumns[0].field;
+        const grouped = {};
+
+        aggregations.forEach(row => {
+            const key = row[groupCol];
+            if (!grouped[key]) {
+                grouped[key] = { name: key };
+                Object.keys(AGE_BUCKET_COLORS).forEach(bucket => {
+                    grouped[key][`unremediated_${bucket}`] = 0;
+                    grouped[key][`total_${bucket}`] = 0;
+                });
+            }
+            Object.keys(AGE_BUCKET_COLORS).forEach(bucket => {
+                grouped[key][`unremediated_${bucket}`] += row[`unremediated_${bucket}`] || 0;
+                grouped[key][`total_${bucket}`] += row[`total_${bucket}`] || 0;
+            });
+        });
+
+        return Object.values(grouped)
+            .sort((a, b) => {
+                const totalA = Object.keys(AGE_BUCKET_COLORS).reduce((sum, k) => sum + (a[`unremediated_${k}`] || 0), 0);
+                const totalB = Object.keys(AGE_BUCKET_COLORS).reduce((sum, k) => sum + (b[`unremediated_${k}`] || 0), 0);
+                return totalB - totalA;
+            })
+            .slice(0, 10);
+    }, [aggregations, selectedColumns]);
+
+    // Export to CSV
+    const exportToCSV = useCallback(() => {
+        if (aggregations.length === 0) return;
+
+        const headers = [
+            ...selectedColumns.map(c => c.field),
+            ...Object.keys(AGE_BUCKET_COLORS).map(b => `unremediated_${b}`),
+            'unremediated_total',
+            ...Object.keys(AGE_BUCKET_COLORS).map(b => `total_${b}`),
+            'total_total'
+        ];
+        const csvContent = [
+            headers.join(','),
+            ...aggregations.map(row => headers.map(h => row[h] ?? '').join(','))
+        ].join('\n');
+
+        const blob = new Blob([csvContent], { type: 'text/csv' });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `supervisory_dashboard_${new Date().toISOString().split('T')[0]}.csv`;
+        a.click();
+        window.URL.revokeObjectURL(url);
+    }, [aggregations, selectedColumns]);
+
+    return (
+        <div className="min-h-screen bg-gray-100 flex flex-col">
+            {/* Header */}
+            <div className="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between" style={{ height: '64px' }}>
+                <div className="flex items-center gap-4">
+                    <HSBCLogo height={40} />
+                    <div>
+                        <h1 className="text-lg font-semibold text-gray-900">SUPERVISORY DASHBOARD</h1>
+                        <p className="text-xs text-gray-500">Unremediated Controls by Age Bucket</p>
+                    </div>
+                </div>
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={loadAggregations}
+                        disabled={isLoading}
+                        className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs bg-gray-100 hover:bg-gray-200 rounded transition-colors"
+                    >
+                        <FaSync className={isLoading ? 'animate-spin' : ''} />
+                        Refresh
+                    </button>
+                    <button
+                        onClick={exportToCSV}
+                        disabled={aggregations.length === 0}
+                        className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs bg-red-500 text-white hover:bg-red-600 rounded transition-colors disabled:opacity-50"
+                    >
+                        <FaDownload />
+                        Export
+                    </button>
                 </div>
             </div>
 
             {/* Main Content */}
-            <div className="px-6 py-4">
-                {/* File Path Input */}
-                <div className="bg-white rounded-lg shadow-sm p-4 mb-4">
-                    <div className="flex items-center gap-3">
-                        <label className="text-sm font-medium text-gray-700 whitespace-nowrap">
-                            File Path:
-                        </label>
-                        <input
-                            type="text"
-                            value={filePath}
-                            onChange={(e) => setFilePath(e.target.value)}
-                            onKeyDown={handleKeyPress}
-                            placeholder="Enter path to Excel config file (e.g., /path/to/config.xlsx)"
-                            className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 text-sm"
-                            disabled={validationState === 'validating'}
-                        />
-                        <button
-                            onClick={handleValidate}
-                            disabled={validationState === 'validating' || !filePath.trim()}
-                            className="flex items-center gap-2 px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed text-sm font-medium"
-                        >
-                            {validationState === 'validating' ? (
-                                <FaSpinner className="animate-spin" />
-                            ) : (
-                                <FaPlay />
-                            )}
-                            Validate
-                        </button>
-                        <button
-                            onClick={handleClear}
-                            className="flex items-center gap-2 px-4 py-2 bg-gray-500 text-white rounded-lg hover:bg-gray-600 transition-colors text-sm font-medium"
-                        >
-                            <FaTimes />
-                            Clear
-                        </button>
-                    </div>
-                </div>
-
-                {/* Error Display */}
-                {error && (
-                    <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mb-4">
-                        {error}
-                    </div>
-                )}
-
-                {/* Validation Summary */}
-                {results && results.summary && (
-                    <ValidationSummary
-                        summary={results.summary}
-                        validationPassed={results.validation_passed}
-                        onSheetClick={(sheet) => setActiveSheet(sheet)}
-                    />
-                )}
-
-                {/* Sheet Tabs + Grid */}
-                {sheetNames.length > 0 && (
-                    <div className="bg-white rounded-lg shadow-sm">
-                        {/* Sheet Tabs */}
-                        <div className="flex items-center border-b border-gray-200 px-2 pt-2 overflow-x-auto">
-                            {sheetNames.map((name) => {
-                                const isValidation = name === 'Validation';
-                                const errorCount = getSheetErrorCount(name);
-                                const isActive = activeSheet === name;
-
-                                return (
-                                    <button
-                                        key={name}
-                                        onClick={() => setActiveSheet(name)}
-                                        className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-t-lg transition-colors whitespace-nowrap ${
-                                            isActive
-                                                ? isValidation
-                                                    ? 'bg-red-50 text-red-700 border border-b-0 border-red-200'
-                                                    : 'bg-white text-gray-900 border border-b-0 border-gray-200'
-                                                : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'
-                                        }`}
-                                    >
-                                        {isValidation && (
-                                            <FaExclamationTriangle className="text-red-500" />
-                                        )}
-                                        {name}
-                                        {errorCount > 0 && !isValidation && (
-                                            <span className="px-1.5 py-0.5 text-xs rounded-full bg-red-100 text-red-600 font-bold">
-                                                {errorCount}
-                                            </span>
-                                        )}
-                                        {isValidation && results?.sheets?.Validation && (
-                                            <span className="px-1.5 py-0.5 text-xs rounded-full bg-red-500 text-white font-bold">
-                                                {results.sheets.Validation.row_count}
-                                            </span>
-                                        )}
-                                    </button>
-                                );
-                            })}
+            <div className="flex flex-1 overflow-hidden">
+                {/* Left Sidebar - Filters */}
+                <div className="w-56 bg-white border-r border-gray-200 p-3 overflow-y-auto flex-shrink-0">
+                    <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-center gap-1.5">
+                            <FaFilter className="text-gray-500" style={{ fontSize: '12px' }} />
+                            <span className="font-semibold text-gray-700 text-sm">Filters</span>
                         </div>
+                        {hasActiveFilters && (
+                            <button onClick={clearAllFilters} className="text-xs text-red-600 hover:underline">Clear</button>
+                        )}
+                    </div>
 
-                        {/* Sheet Info Bar */}
-                        <div className="px-4 py-2 border-b border-gray-100 flex items-center justify-between text-sm text-gray-500">
-                            <span>
-                                {activeSheet}
-                                {results?.sheets?.[activeSheet] && (
-                                    <> - {results.sheets[activeSheet].row_count} rows, {results.sheets[activeSheet].columns?.length || 0} columns</>
-                                )}
-                            </span>
-                            {results?.validated_file_path && (
-                                <span className="text-gray-400">
-                                    Validated file: {results.validated_file_path}
-                                </span>
-                            )}
-                        </div>
-
-                        {/* AG Grid */}
-                        <div className="ag-theme-alpine" style={{ height: 'calc(100vh - 400px)', minHeight: '400px', width: '100%' }}>
-                            <AgGridReact
-                                rowData={activeSheetData}
-                                columnDefs={columnDefs}
-                                defaultColDef={defaultColDef}
-                                animateRows={true}
-                                pagination={false}
-                                enableCellTextSelection={true}
-                                ensureDomOrder={true}
-                                getRowStyle={getRowStyle}
+                    <div className="mb-3">
+                        <label className="block text-xs font-medium text-gray-700 mb-1">Saved Filters</label>
+                        <select
+                            className="w-full px-2 py-1.5 border border-gray-300 rounded bg-white text-xs"
+                            value={selectedSavedFilterId}
+                            onChange={handleSavedFilterSelect}
+                        >
+                            <option value="">Select saved filter...</option>
+                            {savedFilters.map(filter => (
+                                <option key={filter.id} value={filter.id}>
+                                    {filter.name} ({filter.created_by_name || filter.created_by || 'user'})
+                                </option>
+                            ))}
+                        </select>
+                        <div className="flex gap-2 mt-2">
+                            <input
+                                type="text"
+                                className="flex-1 px-2 py-1.5 border border-gray-300 rounded text-xs"
+                                placeholder="Save current as..."
+                                value={savedFilterName}
+                                onChange={(e) => setSavedFilterName(e.target.value)}
                             />
-                        </div>
-                    </div>
-                )}
-
-                {/* Initial State */}
-                {validationState === 'idle' && !results && !error && (
-                    <div className="bg-white rounded-lg shadow-sm p-12 text-center">
-                        <FaCheckCircle className="text-6xl text-gray-300 mx-auto mb-4" />
-                        <h3 className="text-lg font-medium text-gray-700 mb-2">Ready to Validate</h3>
-                        <p className="text-gray-500 max-w-md mx-auto">
-                            Enter the path to an Excel configuration file above and click Validate to check for errors across all sheets.
-                        </p>
-                    </div>
-                )}
-
-                {/* History Panel */}
-                {showHistory && history.length > 0 && (
-                    <div className="mt-4 bg-white rounded-lg shadow-sm">
-                        <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
-                            <span className="font-medium text-gray-700 flex items-center gap-2">
-                                <FaHistory className="text-gray-400" />
-                                Recent Validations
-                            </span>
                             <button
-                                onClick={() => setShowHistory(false)}
-                                className="text-gray-400 hover:text-gray-600"
+                                onClick={handleSaveCurrentFilter}
+                                disabled={!savedFilterName.trim() || isSavingFilter}
+                                className="px-2.5 py-1.5 text-xs bg-blue-600 text-white rounded disabled:opacity-50"
                             >
-                                <FaTimes />
+                                Save
                             </button>
                         </div>
-                        <div className="divide-y divide-gray-100 max-h-64 overflow-y-auto">
-                            {history.map((item) => {
-                                const fileName = item.file_path?.split(/[/\\]/).pop() || 'unknown';
-                                const status = (item.status || '').toLowerCase();
-                                const passed = item.validation_passed;
-                                const timeAgo = getTimeAgo(item.completed_at || item.created_at);
+                    </div>
 
-                                return (
-                                    <button
-                                        key={item.task_id}
-                                        onClick={() => handleHistoryClick(item)}
-                                        className="w-full px-4 py-3 text-left hover:bg-gray-50 transition-colors flex items-center justify-between"
-                                    >
-                                        <div className="flex items-center gap-3">
-                                            {passed === true && (
-                                                <FaCheckCircle className="text-green-500 flex-shrink-0" />
-                                            )}
-                                            {passed === false && (
-                                                <FaTimesCircle className="text-red-500 flex-shrink-0" />
-                                            )}
-                                            {passed === null && (
-                                                <FaSpinner className={`text-gray-400 flex-shrink-0 ${status === 'running' ? 'animate-spin' : ''}`} />
-                                            )}
-                                            <div>
-                                                <div className="text-sm font-medium text-gray-800">{fileName}</div>
-                                                <div className="text-xs text-gray-500">{item.file_path}</div>
-                                            </div>
-                                        </div>
-                                        <div className="text-right flex-shrink-0">
-                                            {item.total_errors !== null && item.total_errors !== undefined && (
-                                                <div className="text-xs text-red-500 font-medium">{item.total_errors} errors</div>
-                                            )}
-                                            <div className="text-xs text-gray-400">{timeAgo}</div>
-                                        </div>
-                                    </button>
-                                );
-                            })}
+                    <MultiSelectFilter
+                        label="Regulation"
+                        options={filterOptions.regulation}
+                        selected={filters.regulation}
+                        onChange={(values) => handleFilterChange('regulation', values)}
+                        placeholder="All"
+                    />
+                    <MultiSelectFilter
+                        label="Asset Class"
+                        options={filterOptions.asset_class}
+                        selected={filters.asset_class}
+                        onChange={(values) => handleFilterChange('asset_class', values)}
+                        placeholder="All"
+                    />
+                    <MultiSelectFilter
+                        label="Control Type"
+                        options={filterOptions.control_type}
+                        selected={filters.control_type}
+                        onChange={(values) => handleFilterChange('control_type', values)}
+                        placeholder="All"
+                    />
+                    <MultiSelectFilter
+                        label="Data Type"
+                        options={filterOptions.data_type}
+                        selected={filters.data_type}
+                        onChange={(values) => handleFilterChange('data_type', values)}
+                        placeholder="All"
+                    />
+                    <MultiSelectFilter
+                        label="Sub-Control Type"
+                        options={filterOptions.sub_control_type}
+                        selected={filters.sub_control_type}
+                        onChange={(values) => handleFilterChange('sub_control_type', values)}
+                        placeholder="All"
+                    />
+                    <MultiSelectFilter
+                        label="Remediation Status"
+                        options={filterOptions.remediation_status}
+                        selected={filters.remediation_status}
+                        onChange={(values) => handleFilterChange('remediation_status', values)}
+                        placeholder="All"
+                    />
+
+                    {/* Stats */}
+                    <div className="mt-4 pt-3 border-t border-gray-200 text-xs text-gray-600">
+                        <div className="flex justify-between mb-1">
+                            <span>Total:</span>
+                            <span className="font-medium">{totalRecords.toLocaleString()}</span>
+                        </div>
+                        <div className="flex justify-between">
+                            <span>Filtered:</span>
+                            <span className="font-medium">{filteredRecords.toLocaleString()}</span>
                         </div>
                     </div>
-                )}
-            </div>
-        </div>
-    );
-};
-
-function getTimeAgo(isoString) {
-    if (!isoString) return '';
-    try {
-        const date = new Date(isoString);
-        const now = new Date();
-        const diffMs = now - date;
-        const diffMins = Math.floor(diffMs / 60000);
-        if (diffMins < 1) return 'just now';
-        if (diffMins < 60) return `${diffMins}m ago`;
-        const diffHours = Math.floor(diffMins / 60);
-        if (diffHours < 24) return `${diffHours}h ago`;
-        const diffDays = Math.floor(diffHours / 24);
-        return `${diffDays}d ago`;
-    } catch {
-        return '';
-    }
-}
-
-export default ConfigValidatorPage;
-  ### Val Summ
-
-import { FaCheckCircle, FaTimesCircle, FaExclamationTriangle } from 'react-icons/fa';
-
-const ValidationSummary = ({ summary, validationPassed, onSheetClick }) => {
-    if (!summary) return null;
-
-    const {
-        total_errors = 0,
-        total_warnings = 0,
-        total_issues = 0,
-        errors_by_sheet = {},
-        errors_by_type = {},
-        validation_duration_seconds = 0,
-    } = summary;
-
-    const hasIssues = total_issues > 0 || total_errors > 0 || total_warnings > 0;
-    const hasErrors = total_errors > 0;
-
-    // Three states: clean (green), warnings only (yellow), errors (red)
-    const bgClass = !hasIssues
-        ? 'bg-green-50 border-green-200'
-        : hasErrors
-            ? 'bg-red-50 border-red-200'
-            : 'bg-yellow-50 border-yellow-200';
-
-    const statusIcon = !hasIssues
-        ? <FaCheckCircle className="text-green-500 text-2xl" />
-        : hasErrors
-            ? <FaTimesCircle className="text-red-500 text-2xl" />
-            : <FaExclamationTriangle className="text-yellow-500 text-2xl" />;
-
-    const statusText = !hasIssues
-        ? 'VALIDATION PASSED'
-        : hasErrors
-            ? 'VALIDATION FAILED'
-            : 'VALIDATION PASSED WITH WARNINGS';
-
-    const statusColor = !hasIssues
-        ? 'text-green-700'
-        : hasErrors
-            ? 'text-red-700'
-            : 'text-yellow-700';
-
-    return (
-        <div className={`rounded-lg border p-4 mb-4 ${bgClass}`}>
-            <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-3">
-                    {statusIcon}
-                    <span className={`text-lg font-bold ${statusColor}`}>
-                        {statusText}
-                    </span>
                 </div>
-                <div className="flex items-center gap-4 text-sm">
-                    {total_errors > 0 && (
-                        <span className="flex items-center gap-1 text-red-600 font-medium">
-                            <FaTimesCircle />
-                            {total_errors} {total_errors === 1 ? 'Error' : 'Errors'}
-                        </span>
-                    )}
-                    {total_warnings > 0 && (
-                        <span className="flex items-center gap-1 text-yellow-600 font-medium">
-                            <FaExclamationTriangle />
-                            {total_warnings} {total_warnings === 1 ? 'Warning' : 'Warnings'}
-                        </span>
-                    )}
-                    {validation_duration_seconds > 0 && (
-                        <span className="text-gray-500">
-                            {validation_duration_seconds.toFixed(1)}s
-                        </span>
-                    )}
-                </div>
-            </div>
 
-            {hasIssues && (
-                <div className="flex flex-wrap gap-4 text-sm">
-                    {/* Issues by Sheet */}
-                    {Object.keys(errors_by_sheet).length > 0 && (
-                        <div>
-                            <span className="text-gray-600 font-medium mr-2">By Sheet:</span>
-                            {Object.entries(errors_by_sheet).map(([sheet, count]) => (
-                                <button
-                                    key={sheet}
-                                    onClick={() => onSheetClick && onSheetClick(sheet)}
-                                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded mr-1 hover:opacity-80 transition-colors cursor-pointer ${
-                                        hasErrors ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-700'
-                                    }`}
-                                >
-                                    {sheet}
-                                    <span className="font-bold">({count})</span>
-                                </button>
-                            ))}
+                {/* Main Dashboard Area */}
+                <div className="flex-1 p-4 overflow-y-auto">
+                    {error && (
+                        <div className="mb-3 p-2 bg-red-50 border border-red-200 rounded text-red-700 text-xs">{error}</div>
+                    )}
+
+                    {/* Summary Cards - Two rows */}
+                    <div className="grid grid-cols-2 gap-4 mb-4">
+                        {/* Unremediated Summary (Status != "No action required") */}
+                        <div className="bg-red-50 rounded-lg p-3 border border-red-200">
+                            <div className="text-sm font-semibold text-red-800 mb-2">
+                                Unremediated <span className="text-xs font-normal text-red-600">(Status: Pending Action)</span>
+                            </div>
+                            <div className="grid grid-cols-6 gap-2">
+                                <SummaryCard title="Total" value={summary.unremediated?.total || 0} color="#DC2626" small />
+                                {Object.entries(AGE_BUCKET_COLORS).map(([bucket, color]) => (
+                                    <SummaryCard
+                                        key={`unrem-${bucket}`}
+                                        title={AGE_BUCKET_LABELS[bucket]}
+                                        value={summary.unremediated?.[bucket] || 0}
+                                        color={color}
+                                        small
+                                    />
+                                ))}
+                            </div>
+                        </div>
+
+                        {/* Total Summary (All Records) */}
+                        <div className="bg-blue-50 rounded-lg p-3 border border-blue-200">
+                            <div className="text-sm font-semibold text-blue-800 mb-2">
+                                All Records <span className="text-xs font-normal text-blue-600">(All Remediation Status)</span>
+                            </div>
+                            <div className="grid grid-cols-6 gap-2">
+                                <SummaryCard title="Total" value={summary.total?.total || 0} color="#2563EB" small />
+                                {Object.entries(AGE_BUCKET_COLORS).map(([bucket, color]) => (
+                                    <SummaryCard
+                                        key={`total-${bucket}`}
+                                        title={AGE_BUCKET_LABELS[bucket]}
+                                        value={summary.total?.[bucket] || 0}
+                                        color={color}
+                                        small
+                                    />
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Column Drop Zone */}
+                    <ColumnDropZone
+                        selectedColumns={selectedColumns}
+                        availableColumns={AVAILABLE_COLUMNS}
+                        onColumnsChange={setSelectedColumns}
+                    />
+
+                    {/* View Toggle */}
+                    <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-center gap-1 bg-gray-100 rounded p-0.5">
+                            <button
+                                onClick={() => setActiveView('table')}
+                                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs transition-colors ${
+                                    activeView === 'table' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-600 hover:text-gray-900'
+                                }`}
+                            >
+                                <FaTable />
+                                Table
+                            </button>
+                            <button
+                                onClick={() => setActiveView('chart')}
+                                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs transition-colors ${
+                                    activeView === 'chart' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-600 hover:text-gray-900'
+                                }`}
+                            >
+                                <FaChartBar />
+                                Chart
+                            </button>
+                        </div>
+                        <div className="text-xs text-gray-500">{aggregations.length} groups</div>
+                    </div>
+
+                    {/* Table View */}
+                    {activeView === 'table' && (
+                        <div className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
+                            <div className="ag-theme-alpine" style={{ height: 'calc(100vh - 420px)', width: '100%' }}>
+                                <AgGridReact
+                                    rowData={aggregations}
+                                    columnDefs={columnDefs}
+                                    defaultColDef={defaultColDef}
+                                    animateRows={true}
+                                    rowSelection="single"
+                                    suppressCellFocus={true}
+                                    overlayLoadingTemplate={'<span class="ag-overlay-loading-center">Loading...</span>'}
+                                    overlayNoRowsTemplate={'<span class="ag-overlay-no-rows-center">No data to display</span>'}
+                                    loading={isLoading}
+                                />
+                            </div>
                         </div>
                     )}
 
-                    {/* Issues by Type */}
-                    {Object.keys(errors_by_type).length > 0 && (
-                        <div>
-                            <span className="text-gray-600 font-medium mr-2">By Type:</span>
-                            {Object.entries(errors_by_type).map(([type, count]) => (
-                                <span
-                                    key={type}
-                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-gray-100 text-gray-700 mr-1"
-                                >
-                                    {type}
-                                    <span className="font-bold">({count})</span>
-                                </span>
-                            ))}
+                    {/* Chart View */}
+                    {activeView === 'chart' && (
+                        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4">
+                            <h3 className="text-sm font-medium text-gray-900 mb-3">
+                                Unremediated by {selectedColumns[0]?.label || 'Dimension'}
+                            </h3>
+                            <div style={{ height: 'calc(100vh - 460px)', minHeight: '350px' }}>
+                                <ResponsiveContainer width="100%" height="100%">
+                                    <BarChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
+                                        <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+                                        <XAxis dataKey="name" tick={{ fontSize: 11 }} angle={-45} textAnchor="end" height={80} />
+                                        <YAxis tick={{ fontSize: 11 }} />
+                                        <Tooltip
+                                            contentStyle={{ backgroundColor: 'white', border: '1px solid #e5e7eb', borderRadius: '8px', fontSize: '12px' }}
+                                            formatter={(value, name) => [value.toLocaleString(), name.replace('unremediated_', 'Unrem ').replace('total_', 'Total ')]}
+                                        />
+                                        <Legend formatter={(value) => value.replace('unremediated_', 'Unrem ').replace('total_', 'Total ')} wrapperStyle={{ fontSize: '11px' }} />
+                                        {Object.entries(AGE_BUCKET_COLORS).map(([bucket, color]) => (
+                                            <Bar key={`unremediated_${bucket}`} dataKey={`unremediated_${bucket}`} stackId="unremediated" fill={color} name={`unremediated_${bucket}`} />
+                                        ))}
+                                    </BarChart>
+                                </ResponsiveContainer>
+                            </div>
                         </div>
                     )}
+                </div>
+            </div>
+
+            {/* Loading Overlay */}
+            {isLoading && (
+                <div className="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center z-50">
+                    <div className="bg-white rounded-lg p-4 flex items-center gap-3 shadow-xl">
+                        <div className="w-6 h-6 border-3 border-red-500 border-t-transparent rounded-full animate-spin"></div>
+                        <span className="text-gray-700 text-sm">Loading...</span>
+                    </div>
                 </div>
             )}
         </div>
     );
-};
+}
 
-export default ValidationSummary;
 
-    // ==========================================
-    // Config Validator Methods
-    // ==========================================
+api.
 
-    static async startConfigValidation(filePath) {
+
+    // ==================== Supervisory Dashboard API ====================
+
+    static async getSupervisoryFilterOptions() {
         return this.retryRequest(async () => {
             const response = await this.fetchWithTimeout(
-                `${API_BASE_URL}/api/config-validator/validate`,
+                `${API_BASE_URL}/api/supervisory/filter-options`
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to get filter options: ${response.statusText}`);
+            }
+
+            return await response.json();
+        });
+    }
+
+    static async getSupervisoryAggregations(filters = {}, groupBy = ['Regulation', 'AssetClass']) {
+        return this.retryRequest(async () => {
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/supervisory/aggregations`,
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ file_path: filePath }),
+                    body: JSON.stringify({
+                        filters: filters,
+                        group_by: groupBy
+                    })
                 }
             );
 
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `Failed to start validation: ${response.statusText}`);
+                throw new Error(errorData.detail || `Failed to get aggregations: ${response.statusText}`);
             }
 
             return await response.json();
         });
     }
 
-    static async getConfigValidationStatus(taskId) {
+    static async getSupervisoryDetails(filters = {}, page = 1, pageSize = 50, sortColumn = null, sortDirection = 'desc', bucket = null, bucketScope = null) {
         return this.retryRequest(async () => {
             const response = await this.fetchWithTimeout(
-                `${API_BASE_URL}/api/config-validator/${taskId}/status`
+                `${API_BASE_URL}/api/supervisory/details`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        filters: filters,
+                        page: page,
+                        page_size: pageSize,
+                        sort_column: sortColumn,
+                        sort_direction: sortDirection,
+                        bucket: bucket,
+                        bucket_scope: bucketScope
+                    })
+                }
             );
 
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `Failed to get validation status: ${response.statusText}`);
+                throw new Error(errorData.detail || `Failed to get details: ${response.statusText}`);
             }
 
             return await response.json();
         });
     }
 
-    static async getConfigValidationResults(taskId) {
+    static async getSupervisorySavedFilters() {
         return this.retryRequest(async () => {
             const response = await this.fetchWithTimeout(
-                `${API_BASE_URL}/api/config-validator/${taskId}/results`
+                `${API_BASE_URL}/api/supervisory/saved-filters`
             );
 
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `Failed to get validation results: ${response.statusText}`);
+                throw new Error(errorData.detail || `Failed to get saved filters: ${response.statusText}`);
             }
 
             return await response.json();
         });
     }
 
-    static async getConfigValidationLogs(taskId, logType = 'execution', lines = 200) {
+    static async saveSupervisoryFilter(payload) {
         return this.retryRequest(async () => {
-            const params = new URLSearchParams({
-                log_type: logType,
-                lines: lines.toString(),
-            });
-
             const response = await this.fetchWithTimeout(
-                `${API_BASE_URL}/api/config-validator/${taskId}/logs?${params.toString()}`
+                `${API_BASE_URL}/api/supervisory/saved-filters`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                }
             );
 
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `Failed to get validation logs: ${response.statusText}`);
+                throw new Error(errorData.detail || `Failed to save filter: ${response.statusText}`);
             }
 
             return await response.json();
         });
     }
 
-    static async getConfigValidationHistory(limit = 20) {
+    static async deleteSupervisoryFilter(filterId) {
         return this.retryRequest(async () => {
-            const params = new URLSearchParams({ limit: limit.toString() });
-
             const response = await this.fetchWithTimeout(
-                `${API_BASE_URL}/api/config-validator/history?${params.toString()}`
+                `${API_BASE_URL}/api/supervisory/saved-filters/${filterId}`,
+                {
+                    method: 'DELETE'
+                }
             );
 
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `Failed to get validation history: ${response.statusText}`);
+                throw new Error(errorData.detail || `Failed to delete filter: ${response.statusText}`);
             }
 
             return await response.json();
         });
     }
 
-#### PAGEJS
-import { FaChartLine, FaCheckCircle, FaCog, FaServer, FaDesktop, FaFlask, FaRobot, FaChartBar, FaSearch, FaFileAlt } from 'react-icons/fa';
+Details.page
 
-  const openConfigValidator = () => {
-    window.open('/config-validator', '_blank');
-  };
 
-            {/* Feature 12 - Config Validator */}
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import { ApiService } from '../../services/api';
+import { DataOutputProvider } from '../../contexts/DataOutputContext';
+import { ColumnResizeProvider } from '../../contexts/ColumnResizeContext';
+import DataOutputContent from '../../components/DataOutput/DataOutputContent';
+import ErrorBoundary from '../../components/common/ErrorBoundary';
+
+const DEFAULT_PAGE_SIZE = 50;
+
+const SupervisoryDetailsPage = () => {
+    const [searchParams] = useSearchParams();
+    const [detailsData, setDetailsData] = useState(null);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [currentPage, setCurrentPage] = useState(1);
+    const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+
+    const filters = useMemo(() => {
+        const raw = searchParams.get('filters');
+        if (!raw) return {};
+        try {
+            return JSON.parse(raw);
+        } catch (parseError) {
+            return {};
+        }
+    }, [searchParams]);
+
+    const title = searchParams.get('title') || 'Filtered Details';
+    const bucket = searchParams.get('bucket');
+    const bucketScope = searchParams.get('bucketScope');
+
+    const loadDetails = useCallback(async () => {
+        setIsLoading(true);
+        setError(null);
+
+        try {
+            const response = await ApiService.getSupervisoryDetails(filters, currentPage, pageSize, null, 'desc', bucket, bucketScope);
+            if (response.success) {
+                setDetailsData(response);
+            } else {
+                setError(response.error || 'Failed to load details');
+            }
+        } catch (err) {
+            setError(err.message || 'Failed to load details');
+        } finally {
+            setIsLoading(false);
+        }
+    }, [filters, currentPage, pageSize]);
+
+    useEffect(() => {
+        loadDetails();
+    }, [loadDetails]);
+
+    const initialData = useMemo(() => {
+        if (!detailsData?.success) {
+            return {
+                headers: [],
+                table: [],
+                totalRows: 0,
+                displayedRows: 0,
+                columns: 0,
+                source: 'csv_api'
+            };
+        }
+
+        return {
+            headers: detailsData.columns || [],
+            table: detailsData.data || [],
+            totalRows: detailsData.pagination?.total_rows || 0,
+            displayedRows: detailsData.data?.length || 0,
+            columns: detailsData.columns?.length || 0,
+            source: 'csv_api'
+        };
+    }, [detailsData]);
+
+    const csvData = useMemo(() => {
+        if (!detailsData?.success) return null;
+        return {
+            data: detailsData.data || [],
+            columns: detailsData.columns || [],
+            pagination: detailsData.pagination || {}
+        };
+    }, [detailsData]);
+
+    const handlePageChange = useCallback((page) => {
+        setCurrentPage(page);
+    }, []);
+
+    const handlePageSizeChange = useCallback((size) => {
+        setPageSize(size);
+        setCurrentPage(1);
+    }, []);
+
+    return (
+        <div className="min-h-screen bg-gray-100 flex flex-col">
+            <div className="bg-white border-b border-gray-200 px-6 py-3">
+                <h1 className="text-lg font-semibold text-gray-900">Supervisory Details</h1>
+                <p className="text-xs text-gray-500">{title}</p>
+            </div>
+
+            <div className="flex-1 p-4">
+                {error && (
+                    <div className="mb-3 p-2 bg-red-50 border border-red-200 rounded text-red-700 text-xs">{error}</div>
+                )}
+                {isLoading && (
+                    <div className="mb-3 p-2 bg-gray-50 border border-gray-200 rounded text-gray-600 text-xs">Loading details...</div>
+                )}
+
+                <ErrorBoundary>
+                    <DataOutputProvider
+                        initialData={initialData}
+                        csvData={csvData}
+                        onPageChange={handlePageChange}
+                        onPageSizeChange={handlePageSizeChange}
+                        currentPage={currentPage}
+                        pageSize={pageSize}
+                    >
+                        <ColumnResizeProvider>
+                            <div style={{ height: 'calc(100vh - 140px)' }}>
+                                <DataOutputContent height="calc(100vh - 140px)" />
+                            </div>
+                        </ColumnResizeProvider>
+                    </DataOutputProvider>
+                </ErrorBoundary>
+            </div>
+        </div>
+    );
+};
+
+export default SupervisoryDetailsPage;
+
+
+jsx validator
+
+            <style jsx global>{`
+                .config-grid-theme .ag-menu,
+                .config-grid-theme .ag-popup,
+                .config-grid-theme .ag-filter {
+                    min-width: 320px;
+                }
+                .config-grid-theme .ag-filter,
+                .config-grid-theme .ag-filter-body {
+                    padding: 12px 12px 10px 12px;
+                }
+                .config-grid-theme .ag-filter-apply-panel {
+                    padding-top: 8px;
+                    gap: 8px;
+                }
+                .config-grid-theme .ag-input-field-input,
+                .config-grid-theme .ag-filter-filter,
+                .config-grid-theme .ag-mini-filter,
+                .config-grid-theme .ag-picker-field-wrapper {
+                    border-radius: 8px;
+                    border: 1px solid #e2e8f0;
+                    background: #f8fafc;
+                    padding: 6px 10px;
+                    font-size: 13px;
+                }
+                .config-grid-theme .ag-input-field-input:focus,
+                .config-grid-theme .ag-filter-filter:focus,
+                .config-grid-theme .ag-mini-filter:focus {
+                    outline: none;
+                    border-color: #ef4444;
+                    box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.18);
+                    background: #fff;
+                }
+                .config-grid-theme .ag-filter-select,
+                .config-grid-theme .ag-picker-field-display {
+                    border-radius: 8px;
+                    background: #f8fafc;
+                }
+                .config-grid-theme .ag-filter-apply-panel .ag-standard-button {
+                    border-radius: 8px;
+                    background: #111827;
+                    color: #fff;
+                    border: none;
+                    padding: 6px 12px;
+                }
+                .config-grid-theme .ag-filter-apply-panel .ag-standard-button:hover {
+                    background: #1f2937;
+                }
+                .config-grid-theme .ag-filter-apply-panel .ag-standard-button:disabled {
+                    background: #9ca3af;
+                }
+            `}</style>
+
+
+page
+
+
+            {/* Feature 13 - Supervisory Dashboard */}
             <div
-              onClick={openConfigValidator}
+              onClick={openSupervisoryDashboard}
               className="group rounded-lg border border-slate-200 p-6 transition-all duration-300 ease-in-out bg-white hover:scale-105 hover:shadow-xl hover:shadow-slate-700/10 cursor-pointer transform-gpu"
             >
               <div className="flex items-center gap-4 mb-4">
                 <div className="p-3 rounded-lg bg-white text-red-500 transition-colors">
-                  <FaFileAlt size={32} />
+                  <FaChartBar size={32} />
                 </div>
-                <h3 className="text-lg font-semibold text-black">CONFIG VALIDATOR</h3>
+                <h3 className="text-lg font-semibold text-black">SUPERVISORY DASHBOARD</h3>
               </div>
               <p className="mt-2 text-black">
-                Validate Excel configuration files across all sheets. Identify missing values, invalid references, and data issues with detailed error reporting.
+                Monitor unremediated controls by regulation, asset class, and control type. View age bucket analysis with pivot-table style aggregations.
               </p>
             </div>
 
-# INDEX
+globals
 
-import ConfigValidatorPage from './controls/config-validator/page';
-<Route path="/config-validator" element={<ConfigValidatorPage />} />
+
+/* Supervisory dashboard cell actions */
+.supervisory-cell {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  padding-right: 20px;
+}
+
+.supervisory-cell-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.supervisory-cell-action {
+  opacity: 0;
+  position: absolute;
+  right: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 11px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #0f172a;
+  transition: opacity 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+
+.ag-cell:hover .supervisory-cell-action {
+  opacity: 1;
+}
+
+.supervisory-cell-action:hover {
+  background: #f1f5f9;
+  border-color: #94a3b8;
+}
+
+
+app
+
+import SupervisoryDashboardPage from './controls/supervisory-dashboard/page';
+import SupervisoryDetailsPage from './controls/supervisory-dashboard/details-page';
+
+<Route path="/supervisory-dashboard" element={<SupervisoryDashboardPage />} />
+<Route path="/supervisory-dashboard/details" element={<SupervisoryDetailsPage />} />
+
