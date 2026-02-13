@@ -1,3 +1,638 @@
+"""
+Supervisory Dashboard Router
+Provides aggregated data views for supervisory monitoring with filtering and age bucket analysis
+"""
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Any, List, Optional, Tuple
+import polars as pl
+import pyarrow.parquet as pq
+import logging
+from datetime import datetime
+from pathlib import Path
+import json
+import uuid
+import os
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/supervisory", tags=["supervisory"])
+
+# Configuration
+DATA_FILE = "dummy_controls_data.parquet"
+CACHE_TTL = 300  # 5 minutes
+SAVED_FILTERS_FILE = os.path.join(Path(__file__).parent.parent, "data", "supervisory_saved_filters.json")
+
+# Cache for filter options
+_filter_options_cache = {
+    "data": None,
+    "timestamp": None
+}
+
+# Column mappings (display name -> actual column name in parquet)
+FILTER_COLUMNS = {
+    "regulation": "Regulation",
+    "asset_class": "AssetClass",
+    "control_type": "Control Type",
+    "data_type": "Data Type",
+    "sub_control_type": "Sub-ControlType",
+    "remediation_status": "RemediationStatus",
+    "explain_issue": "ExplainIssue",
+    "explain_issue_notification": "ExplainIssueNotification",
+    "explain_issue_detail": "ExplainIssueDetail"
+}
+
+AGE_BUCKET_COLUMNS = ["0-3", "3-7", "7-14", "14-30", "30-60"]
+DEFAULT_BUCKET_SET = "CFTC"
+AGE_BUCKET_SET_COLUMN_CANDIDATES = {
+    "CFTC": {
+        "0-3": ["0-3", "CFTC_0-3", "0-3_CFTC", "CFTC_0_3", "0_3_CFTC"],
+        "3-7": ["3-7", "CFTC_3-7", "3-7_CFTC", "CFTC_3_7", "3_7_CFTC"],
+        "7-14": ["7-14", "CFTC_7-14", "7-14_CFTC", "CFTC_7_14", "7_14_CFTC"],
+        "14-30": ["14-30", "CFTC_14-30", "14-30_CFTC", "CFTC_14_30", "14_30_CFTC"],
+        "30-60": ["30-60", "CFTC_30-60", "30-60_CFTC", "CFTC_30_60", "30_60_CFTC"],
+    },
+    "EMIR": {
+        "0-3": ["EMIR_0-3", "0-3_EMIR", "EMIR_0_3", "0_3_EMIR"],
+        "3-7": ["EMIR_3-7", "3-7_EMIR", "EMIR_3_7", "3_7_EMIR"],
+        "7-14": ["EMIR_7-14", "7-14_EMIR", "EMIR_7_14", "7_14_EMIR"],
+        "14-30": ["EMIR_14-30", "14-30_EMIR", "EMIR_14_30", "14_30_EMIR"],
+        "30-60": ["EMIR_30-60", "30-60_EMIR", "EMIR_30_60", "30_60_EMIR"],
+    },
+}
+
+# Preselected filters for first dashboard load to keep initial query lightweight.
+# Values are sanitized against available options at runtime.
+DEFAULT_INITIAL_FILTERS = {
+    "regulation": ["CFTC-P45"],
+    "asset_class": ["FX"],
+    "data_type": ["TRADESTATE"],
+}
+
+# Remediation plans that indicate "unremediated" status
+UNREMEDIATED_PLANS = [
+    'Investigate and fix root cause',
+    'Manual override and re-process',
+    'Update configuration',
+    'Escalate to support team',
+    'Patch deployment scheduled'
+]
+
+REMEDIATED_PLANS = ['No action required']
+
+
+class AggregationRequest(BaseModel):
+    filters: Optional[Dict[str, List[str]]] = None
+    group_by: Optional[List[str]] = None
+    bucket_set: str = DEFAULT_BUCKET_SET
+    include_remediation_split: bool = True  # Whether to split by remediation status
+
+
+class DetailsRequest(BaseModel):
+    filters: Optional[Dict[str, List[str]]] = None
+    page: int = 1
+    page_size: int = 50
+    sort_column: Optional[str] = None
+    sort_direction: str = "desc"
+    bucket: Optional[str] = None
+    bucket_scope: Optional[str] = None
+    bucket_set: str = DEFAULT_BUCKET_SET
+    merge_columns: Optional[List[str]] = None  # Columns to group together for merged cell display
+
+
+class SavedFilterRequest(BaseModel):
+    name: str
+    filters: Dict[str, List[str]]
+    group_by: List[str]
+    created_by: Optional[str] = None
+    created_by_name: Optional[str] = None
+
+
+def get_data_file_path() -> str:
+    """Get the path to the data file"""
+    # Check multiple possible locations
+    possible_paths = [
+        Path(DATA_FILE),  # Current directory
+        Path("..") / DATA_FILE,  # Parent directory
+        Path(__file__).parent.parent.parent / DATA_FILE,  # Project root
+    ]
+
+    for path in possible_paths:
+        if path.exists():
+            return str(path.resolve())
+
+    # Default to project root
+    return str(Path(__file__).parent.parent.parent / DATA_FILE)
+
+
+def is_cache_valid() -> bool:
+    """Check if filter options cache is still valid"""
+    if _filter_options_cache["data"] is None or _filter_options_cache["timestamp"] is None:
+        return False
+    elapsed = (datetime.now() - _filter_options_cache["timestamp"]).total_seconds()
+    return elapsed < CACHE_TTL
+
+
+def ensure_age_buckets(lazy_df: pl.LazyFrame) -> pl.LazyFrame:
+    """Ensure age bucket columns exist and are derived from ErrorAge."""
+    schema = lazy_df.collect_schema()
+    if "ErrorAge" not in schema:
+        raise HTTPException(status_code=400, detail="Missing required column: ErrorAge")
+
+    age_col = pl.col("ErrorAge")
+    return lazy_df.with_columns([
+        (age_col <= 3).cast(pl.Int64).alias("0-3"),
+        ((age_col > 3) & (age_col <= 7)).cast(pl.Int64).alias("3-7"),
+        ((age_col > 7) & (age_col <= 14)).cast(pl.Int64).alias("7-14"),
+        ((age_col > 14) & (age_col <= 30)).cast(pl.Int64).alias("14-30"),
+        ((age_col > 30) & (age_col <= 60)).cast(pl.Int64).alias("30-60"),
+    ])
+
+
+def resolve_age_bucket_column_map(schema_names: set, bucket_set: str) -> Optional[Dict[str, str]]:
+    """Find the physical columns for a bucket set. Returns logical->physical map or None."""
+    candidates = AGE_BUCKET_SET_COLUMN_CANDIDATES.get(bucket_set, {})
+    column_map: Dict[str, str] = {}
+    for bucket in AGE_BUCKET_COLUMNS:
+        physical = next((name for name in candidates.get(bucket, []) if name in schema_names), None)
+        if not physical:
+            return None
+        column_map[bucket] = physical
+    return column_map
+
+
+def get_available_bucket_sets(schema_names: set) -> List[str]:
+    """Return bucket sets that can be served from this dataset."""
+    available: List[str] = []
+    for bucket_set in AGE_BUCKET_SET_COLUMN_CANDIDATES.keys():
+        if resolve_age_bucket_column_map(schema_names, bucket_set):
+            available.append(bucket_set)
+
+    # CFTC can be derived from ErrorAge if explicit columns are not present.
+    if "CFTC" not in available and "ErrorAge" in schema_names:
+        available.append("CFTC")
+    return available
+
+
+def apply_age_bucket_set(lazy_df: pl.LazyFrame, bucket_set: str) -> Tuple[pl.LazyFrame, str]:
+    """Normalize requested bucket set into canonical AGE_BUCKET_COLUMNS."""
+    schema_names = set(lazy_df.collect_schema().names())
+    normalized_set = (bucket_set or DEFAULT_BUCKET_SET).upper()
+    available_sets = get_available_bucket_sets(schema_names)
+
+    selected_set = normalized_set if normalized_set in available_sets else DEFAULT_BUCKET_SET
+    if selected_set not in available_sets and available_sets:
+        selected_set = available_sets[0]
+
+    column_map = resolve_age_bucket_column_map(schema_names, selected_set)
+    if column_map:
+        return lazy_df.with_columns([pl.col(column_map[b]).alias(b) for b in AGE_BUCKET_COLUMNS]), selected_set
+
+    if selected_set == "CFTC" and "ErrorAge" in schema_names:
+        return ensure_age_buckets(lazy_df), "CFTC"
+
+    raise HTTPException(status_code=400, detail=f"No age bucket columns available for set: {bucket_set}")
+
+
+def ensure_remediation_status(lazy_df: pl.LazyFrame) -> pl.LazyFrame:
+    """Ensure RemediationStatus exists (derived from RemediationPlan if needed)."""
+    schema = lazy_df.collect_schema()
+    if "RemediationStatus" in schema:
+        return lazy_df
+    if "RemediationPlan" not in schema:
+        raise HTTPException(status_code=400, detail="Missing required column: RemediationPlan")
+
+    return lazy_df.with_columns([
+        pl.when(pl.col("RemediationPlan") == "No action required")
+        .then(pl.lit("Remediated"))
+        .otherwise(pl.lit("Unremediated"))
+        .alias("RemediationStatus")
+    ])
+
+
+def load_saved_filters() -> List[Dict[str, Any]]:
+    """Load saved filters from disk."""
+    if not os.path.exists(SAVED_FILTERS_FILE):
+        return []
+    try:
+        with open(SAVED_FILTERS_FILE, "r") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            return []
+    except Exception as e:
+        logger.error(f"Failed to load saved filters: {e}")
+        return []
+
+
+def write_saved_filters(filters: List[Dict[str, Any]]) -> None:
+    """Persist saved filters to disk."""
+    try:
+        os.makedirs(os.path.dirname(SAVED_FILTERS_FILE), exist_ok=True)
+        with open(SAVED_FILTERS_FILE, "w") as f:
+            json.dump(filters, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to write saved filters: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save filter")
+
+
+def get_default_initial_filters(filter_options: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Return valid startup filters based on configured defaults and available options."""
+    defaults: Dict[str, List[str]] = {}
+    for key, configured_values in DEFAULT_INITIAL_FILTERS.items():
+        available_values = set(filter_options.get(key, []))
+        valid_values = [v for v in configured_values if v in available_values]
+        defaults[key] = valid_values
+    return defaults
+
+
+@router.get("/filter-options")
+async def get_filter_options() -> Dict[str, Any]:
+    """
+    Get unique values for all filter columns
+    Returns cached results if available and valid
+    """
+    global _filter_options_cache
+
+    try:
+        # Return cached data if valid
+        if is_cache_valid():
+            cached = _filter_options_cache["data"] or {}
+            if "bucket_sets" in cached and "default_bucket_set" in cached:
+                logger.info("Returning cached filter options")
+                return cached
+
+        file_path = get_data_file_path()
+        logger.info(f"Loading filter options from: {file_path}")
+
+        if not Path(file_path).exists():
+            raise HTTPException(status_code=404, detail=f"Data file not found: {file_path}")
+
+        # Use lazy loading to get unique values efficiently
+        lazy_df = pl.scan_parquet(file_path)
+        lazy_df = ensure_remediation_status(lazy_df)
+        schema_names = set(lazy_df.collect_schema().names())
+        available_bucket_sets = get_available_bucket_sets(schema_names)
+        default_bucket_set = DEFAULT_BUCKET_SET if DEFAULT_BUCKET_SET in available_bucket_sets else (
+            available_bucket_sets[0] if available_bucket_sets else DEFAULT_BUCKET_SET
+        )
+
+        filter_options = {}
+
+        for key, column_name in FILTER_COLUMNS.items():
+            try:
+                unique_values = (
+                    lazy_df
+                    .select(pl.col(column_name))
+                    .unique()
+                    .collect()
+                    .to_series()
+                    .to_list()
+                )
+                # Sort and filter out None values
+                unique_values = sorted([v for v in unique_values if v is not None])
+                filter_options[key] = unique_values
+                logger.info(f"Column '{column_name}' has {len(unique_values)} unique values")
+            except Exception as e:
+                logger.warning(f"Could not get unique values for column '{column_name}': {e}")
+                filter_options[key] = []
+
+        # Get total row count
+        parquet_file = pq.ParquetFile(file_path)
+        total_rows = parquet_file.metadata.num_rows
+
+        result = {
+            "success": True,
+            "filter_options": filter_options,
+            "default_initial_filters": get_default_initial_filters(filter_options),
+            "bucket_sets": available_bucket_sets,
+            "default_bucket_set": default_bucket_set,
+            "total_records": total_rows,
+            "columns": list(FILTER_COLUMNS.keys()),
+            "age_buckets": AGE_BUCKET_COLUMNS,
+            "retrieved_at": datetime.now().isoformat()
+        }
+
+        # Update cache
+        _filter_options_cache["data"] = result
+        _filter_options_cache["timestamp"] = datetime.now()
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting filter options: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/aggregations")
+async def get_aggregations(request: AggregationRequest) -> Dict[str, Any]:
+    """
+    Get aggregated counts with age bucket breakdown
+    Filters are applied before aggregation
+    Returns both unremediated and total counts when include_remediation_split is True
+    """
+    try:
+        file_path = get_data_file_path()
+        logger.info(f"Getting aggregations from: {file_path}")
+
+        if not Path(file_path).exists():
+            raise HTTPException(status_code=404, detail=f"Data file not found: {file_path}")
+
+        # Start with lazy loading
+        lazy_df = pl.scan_parquet(file_path)
+        lazy_df = ensure_remediation_status(lazy_df)
+        lazy_df, active_bucket_set = apply_age_bucket_set(lazy_df, request.bucket_set)
+
+        # Get total rows before filtering
+        parquet_file = pq.ParquetFile(file_path)
+        total_records = parquet_file.metadata.num_rows
+
+        # Apply filters
+        if request.filters:
+            for filter_key, filter_values in request.filters.items():
+                if filter_values and len(filter_values) > 0:
+                    column_name = FILTER_COLUMNS.get(filter_key)
+                    if column_name:
+                        lazy_df = lazy_df.filter(pl.col(column_name).is_in(filter_values))
+                        logger.info(f"Applied filter: {column_name} in {filter_values}")
+
+        # Determine group by columns
+        group_by_columns = []
+        if request.group_by:
+            for col in request.group_by:
+                # Map display names to actual column names
+                actual_col = FILTER_COLUMNS.get(col.lower().replace(" ", "_"), col)
+                group_by_columns.append(actual_col)
+        else:
+            # Default grouping
+            group_by_columns = ["Regulation", "AssetClass"]
+
+        logger.info(f"Grouping by: {group_by_columns}")
+
+        if request.include_remediation_split:
+            # Build aggregation with remediation split
+            # Total counts
+            agg_expressions = [
+                pl.count().alias("total_count")
+            ]
+            for bucket in AGE_BUCKET_COLUMNS:
+                agg_expressions.append(
+                    pl.col(bucket).sum().alias(f"total_{bucket}")
+                )
+
+            # Unremediated counts (where RemediationPlan is NOT 'No action required')
+            for bucket in AGE_BUCKET_COLUMNS:
+                agg_expressions.append(
+                    pl.when(pl.col("RemediationStatus") == "Unremediated")
+                    .then(pl.col(bucket))
+                    .otherwise(0)
+                    .sum()
+                    .alias(f"unremediated_{bucket}")
+                )
+
+            # Unremediated count
+            agg_expressions.append(
+                pl.when(pl.col("RemediationStatus") == "Unremediated")
+                .then(1)
+                .otherwise(0)
+                .sum()
+                .alias("unremediated_count")
+            )
+
+            # Execute aggregation
+            aggregated_df = (
+                lazy_df
+                .group_by(group_by_columns)
+                .agg(agg_expressions)
+                .sort(group_by_columns)
+                .collect()
+            )
+
+            # Convert to list of dicts
+            aggregations = aggregated_df.to_dicts()
+
+            # Calculate totals for each row
+            for row in aggregations:
+                row["total_total"] = sum(row.get(f"total_{bucket}", 0) or 0 for bucket in AGE_BUCKET_COLUMNS)
+                row["unremediated_total"] = sum(row.get(f"unremediated_{bucket}", 0) or 0 for bucket in AGE_BUCKET_COLUMNS)
+
+            # Calculate summary statistics
+            filtered_count = sum(row["total_count"] for row in aggregations)
+            unremediated_count = sum(row["unremediated_count"] for row in aggregations)
+
+            summary = {
+                "total_count": filtered_count,
+                "unremediated_count": unremediated_count,
+                "total": {},
+                "unremediated": {}
+            }
+            for bucket in AGE_BUCKET_COLUMNS:
+                summary["total"][bucket] = sum(row.get(f"total_{bucket}", 0) or 0 for row in aggregations)
+                summary["unremediated"][bucket] = sum(row.get(f"unremediated_{bucket}", 0) or 0 for row in aggregations)
+
+            summary["total"]["total"] = sum(summary["total"].values())
+            summary["unremediated"]["total"] = sum(summary["unremediated"].values())
+
+        else:
+            # Simple aggregation without remediation split (original behavior)
+            agg_expressions = [
+                pl.count().alias("count")
+            ]
+
+            for bucket in AGE_BUCKET_COLUMNS:
+                agg_expressions.append(
+                    pl.col(bucket).sum().alias(bucket)
+                )
+
+            # Execute aggregation
+            aggregated_df = (
+                lazy_df
+                .group_by(group_by_columns)
+                .agg(agg_expressions)
+                .sort(group_by_columns)
+                .collect()
+            )
+
+            # Convert to list of dicts
+            aggregations = aggregated_df.to_dicts()
+
+            # Calculate totals for each row
+            for row in aggregations:
+                row["total"] = sum(row.get(bucket, 0) or 0 for bucket in AGE_BUCKET_COLUMNS)
+
+            # Calculate summary statistics
+            filtered_count = sum(row["count"] for row in aggregations)
+            summary = {
+                "total": filtered_count,
+            }
+            for bucket in AGE_BUCKET_COLUMNS:
+                summary[bucket] = sum(row.get(bucket, 0) or 0 for row in aggregations)
+
+        result = {
+            "success": True,
+            "total_records": total_records,
+            "filtered_records": filtered_count,
+            "aggregations": aggregations,
+            "summary": summary,
+            "group_by": group_by_columns,
+            "age_buckets": AGE_BUCKET_COLUMNS,
+            "bucket_set": active_bucket_set,
+            "include_remediation_split": request.include_remediation_split,
+            "retrieved_at": datetime.now().isoformat()
+        }
+
+        logger.info(f"Aggregation complete: {len(aggregations)} groups, {filtered_count} filtered records")
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting aggregations: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/details")
+async def get_details(request: DetailsRequest) -> Dict[str, Any]:
+    """
+    Get detailed records with pagination for drill-down views
+    """
+    try:
+        file_path = get_data_file_path()
+        logger.info(f"Getting details from: {file_path}")
+
+        if not Path(file_path).exists():
+            raise HTTPException(status_code=404, detail=f"Data file not found: {file_path}")
+
+        # Start with lazy loading
+        lazy_df = pl.scan_parquet(file_path)
+        lazy_df = ensure_remediation_status(lazy_df)
+        lazy_df, active_bucket_set = apply_age_bucket_set(lazy_df, request.bucket_set)
+
+        # Apply filters
+        if request.filters:
+            for filter_key, filter_values in request.filters.items():
+                if filter_values and len(filter_values) > 0:
+                    column_name = FILTER_COLUMNS.get(filter_key)
+                    if column_name:
+                        lazy_df = lazy_df.filter(pl.col(column_name).is_in(filter_values))
+
+        # Apply bucket filter
+        if request.bucket and request.bucket in AGE_BUCKET_COLUMNS:
+            bucket = request.bucket
+            lazy_df = lazy_df.filter(pl.col(bucket) == 1)
+
+            if request.bucket_scope == "unremediated":
+                lazy_df = lazy_df.filter(pl.col("RemediationStatus") == "Unremediated")
+
+        # Get filtered count (execute a separate query for count)
+        count_df = lazy_df.select(pl.count()).collect()
+        total_filtered = count_df.item()
+
+        # Apply sorting
+        if request.sort_column:
+            descending = request.sort_direction.lower() == "desc"
+            lazy_df = lazy_df.sort(request.sort_column, descending=descending)
+        else:
+            # Default sort by ErrorAge descending
+            lazy_df = lazy_df.sort("ErrorAge", descending=True)
+
+        # Apply pagination
+        start_idx = (request.page - 1) * request.page_size
+        page_df = (
+            lazy_df
+            .slice(start_idx, request.page_size)
+            .collect()
+        )
+
+        # Convert to list of dicts
+        data = page_df.to_dicts()
+
+        # Calculate pagination info
+        total_pages = (total_filtered + request.page_size - 1) // request.page_size if total_filtered > 0 else 1
+
+        result = {
+            "success": True,
+            "data": data,
+            "columns": page_df.columns,
+            "bucket_set": active_bucket_set,
+            "pagination": {
+                "current_page": request.page,
+                "page_size": request.page_size,
+                "total_rows": total_filtered,
+                "total_pages": total_pages,
+                "has_next": request.page < total_pages,
+                "has_previous": request.page > 1
+            },
+            "retrieved_at": datetime.now().isoformat()
+        }
+
+        logger.info(f"Details retrieved: {len(data)} rows (page {request.page}/{total_pages})")
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting details: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/cache/clear")
+async def clear_cache() -> Dict[str, Any]:
+    """Clear the filter options cache"""
+    global _filter_options_cache
+    _filter_options_cache = {"data": None, "timestamp": None}
+    logger.info("Supervisory dashboard cache cleared")
+    return {"success": True, "message": "Cache cleared"}
+
+
+@router.get("/saved-filters")
+async def list_saved_filters() -> Dict[str, Any]:
+    """List all saved filter presets (shared across users)."""
+    saved = load_saved_filters()
+    return {"success": True, "filters": saved}
+
+
+@router.post("/saved-filters")
+async def save_filter(request: SavedFilterRequest) -> Dict[str, Any]:
+    """Save a new filter preset."""
+    saved = load_saved_filters()
+    now = datetime.now().isoformat()
+    new_item = {
+        "id": str(uuid.uuid4()),
+        "name": request.name,
+        "filters": request.filters,
+        "group_by": request.group_by,
+        "created_by": request.created_by or "anonymous",
+        "created_by_name": request.created_by_name or request.created_by or "anonymous",
+        "created_at": now
+    }
+    saved.insert(0, new_item)
+    write_saved_filters(saved)
+    return {"success": True, "filter": new_item}
+
+
+@router.delete("/saved-filters/{filter_id}")
+async def delete_saved_filter(filter_id: str) -> Dict[str, Any]:
+    """Delete a saved filter preset by id."""
+    saved = load_saved_filters()
+    updated = [item for item in saved if item.get("id") != filter_id]
+    if len(updated) == len(saved):
+        raise HTTPException(status_code=404, detail="Saved filter not found")
+    write_saved_filters(updated)
+    return {"success": True, "message": "Deleted"}
+
+
+Page.js
+
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import HSBCLogo from '../../components/HSBCLogo';
 import { ApiService } from '../../services/api';
@@ -33,6 +668,8 @@ const AGE_BUCKET_LABELS = {
     '14-30': '14-30d',
     '30-60': '30-60d'
 };
+
+const BUCKET_SET_OPTIONS = ['CFTC', 'EMIR'];
 
 // Available columns for grouping
 const AVAILABLE_COLUMNS = [
@@ -198,6 +835,16 @@ const ROW_SPAN_CONFIG = [
     { field: 'AssetClass', prerequisites: ['Regulation'] }
 ];
 
+const hasPrereqMismatch = (rows, currentIndex, startIndex, prerequisites) => {
+    for (let i = 0; i < prerequisites.length; i++) {
+        const prereq = prerequisites[i];
+        if (rows[currentIndex]?.[prereq] !== rows[startIndex]?.[prereq]) {
+            return true;
+        }
+    }
+    return false;
+};
+
 const computeRowSpanMeta = (rows, configs) => {
     const meta = rows.map(() => ({}));
 
@@ -213,7 +860,7 @@ const computeRowSpanMeta = (rows, configs) => {
                     break;
                 }
 
-                const prereqMismatch = prerequisites.some(prereq => rows[next]?.[prereq] !== rows[start]?.[prereq]);
+                const prereqMismatch = hasPrereqMismatch(rows, next, start, prerequisites);
                 if (prereqMismatch) {
                     break;
                 }
@@ -249,7 +896,7 @@ const addRowSpanMetadata = (rows) => {
                     break;
                 }
 
-                const prereqMismatch = prerequisites.some(prereq => rows[next]?.[prereq] !== rows[start]?.[prereq]);
+                const prereqMismatch = hasPrereqMismatch(rows, next, start, prerequisites);
                 if (prereqMismatch) {
                     break;
                 }
@@ -355,6 +1002,7 @@ const ColumnDropZone = ({ selectedColumns, availableColumns, onColumnsChange }) 
 export default function SupervisoryDashboard() {
     const { currentUser } = useUser();
     const dashboardLayoutRef = useRef(null);
+    const SIDEBAR_WIDTH_KEY = 'supervisory_dashboard_sidebar_width';
     // Filter options from API
     const [filterOptions, setFilterOptions] = useState({
         regulation: [],
@@ -369,6 +1017,7 @@ export default function SupervisoryDashboard() {
     const [selectedSavedFilterId, setSelectedSavedFilterId] = useState('');
     const [savedFilterName, setSavedFilterName] = useState('');
     const [isSavingFilter, setIsSavingFilter] = useState(false);
+    const [selectedBucketSet, setSelectedBucketSet] = useState('CFTC');
 
     // Selected filters
     const [filters, setFilters] = useState({
@@ -396,7 +1045,11 @@ export default function SupervisoryDashboard() {
     const [isInitialFiltersReady, setIsInitialFiltersReady] = useState(false);
     const [error, setError] = useState(null);
     const [activeView, setActiveView] = useState('table');
-    const [sidebarWidth, setSidebarWidth] = useState(224);
+    const [sidebarWidth, setSidebarWidth] = useState(() => {
+        if (typeof window === 'undefined') return 224;
+        const stored = Number(window.localStorage.getItem(SIDEBAR_WIDTH_KEY));
+        return Number.isFinite(stored) && stored > 0 ? stored : 224;
+    });
     const isResizingSidebarRef = useRef(false);
     const [selectedColumns, setSelectedColumns] = useState([
         AVAILABLE_COLUMNS[0], // Regulation
@@ -420,20 +1073,7 @@ export default function SupervisoryDashboard() {
         remediation_status: []
     }), []);
 
-    // Load filter options on mount
-    useEffect(() => {
-        loadFilterOptions();
-        loadSavedFilters();
-    }, []);
-
-    // Load aggregations when filters or groupBy changes
-    useEffect(() => {
-        if (isInitialFiltersReady && groupBy.length > 0) {
-            loadAggregations();
-        }
-    }, [filters, groupBy, isInitialFiltersReady]);
-
-    const loadFilterOptions = async () => {
+    const loadFilterOptions = useCallback(async () => {
         try {
             const response = await ApiService.getSupervisoryFilterOptions();
             if (response.success) {
@@ -466,13 +1106,13 @@ export default function SupervisoryDashboard() {
         } finally {
             setIsInitialFiltersReady(true);
         }
-    };
+    }, [emptyFilters]);
 
-    const loadAggregations = async () => {
+    const loadAggregations = useCallback(async () => {
         setIsLoading(true);
         setError(null);
         try {
-            const response = await ApiService.getSupervisoryAggregations(filters, groupBy);
+            const response = await ApiService.getSupervisoryAggregations(filters, groupBy, selectedBucketSet);
             if (response.success) {
                 setAggregations(response.aggregations || []);
                 setSummary(response.summary);
@@ -484,9 +1124,9 @@ export default function SupervisoryDashboard() {
         } finally {
             setIsLoading(false);
         }
-    };
+    }, [filters, groupBy, selectedBucketSet]);
 
-    const loadSavedFilters = async () => {
+    const loadSavedFilters = useCallback(async () => {
         try {
             const response = await ApiService.getSupervisorySavedFilters();
             if (response.success) {
@@ -495,7 +1135,20 @@ export default function SupervisoryDashboard() {
         } catch (err) {
             console.error('Failed to load saved filters', err);
         }
-    };
+    }, []);
+
+    // Load filter options on mount
+    useEffect(() => {
+        loadFilterOptions();
+        loadSavedFilters();
+    }, [loadFilterOptions, loadSavedFilters]);
+
+    // Load aggregations when filters or groupBy changes
+    useEffect(() => {
+        if (isInitialFiltersReady && groupBy.length > 0) {
+            loadAggregations();
+        }
+    }, [groupBy.length, isInitialFiltersReady, loadAggregations]);
 
     const handleFilterChange = (filterKey, values) => {
         setFilters(prev => ({ ...prev, [filterKey]: values }));
@@ -590,8 +1243,9 @@ export default function SupervisoryDashboard() {
         params.set('title', selectedColumns.map(col => col.label).join(' / '));
         if (bucket) params.set('bucket', bucket);
         if (bucketScope) params.set('bucketScope', bucketScope);
+        params.set('bucketSet', selectedBucketSet);
         window.open(`/supervisory-dashboard/details?${params.toString()}`, '_blank', 'noopener');
-    }, [selectedColumns]);
+    }, [selectedColumns, selectedBucketSet]);
 
     const detailCellRenderer = useCallback((params) => {
         const field = params.colDef?.field;
@@ -779,6 +1433,11 @@ export default function SupervisoryDashboard() {
         };
     }, []);
 
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(sidebarWidth)));
+    }, [sidebarWidth, SIDEBAR_WIDTH_KEY]);
+
     const handleSidebarResizeStart = useCallback((event) => {
         event.preventDefault();
         isResizingSidebarRef.current = true;
@@ -919,6 +1578,21 @@ export default function SupervisoryDashboard() {
                                 Save
                             </button>
                         </div>
+                    </div>
+
+                    <div className="mb-3">
+                        <label className="block text-xs font-medium text-gray-700 mb-1">Age Bucket Set</label>
+                        <select
+                            className="w-full px-2 py-1.5 border border-gray-300 rounded bg-white text-xs"
+                            value={selectedBucketSet}
+                            onChange={(e) => setSelectedBucketSet(e.target.value)}
+                        >
+                            {BUCKET_SET_OPTIONS.map(bucketSet => (
+                                <option key={bucketSet} value={bucketSet}>
+                                    {bucketSet}
+                                </option>
+                            ))}
+                        </select>
                     </div>
 
                     <MultiSelectFilter
@@ -1126,3 +1800,270 @@ export default function SupervisoryDashboard() {
         </div>
     );
 }
+API
+ // ==================== Supervisory Dashboard API ====================
+
+    static async getSupervisoryFilterOptions() {
+        return this.retryRequest(async () => {
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/supervisory/filter-options`
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to get filter options: ${response.statusText}`);
+            }
+
+            return await response.json();
+        });
+    }
+
+    static async getSupervisoryAggregations(filters = {}, groupBy = ['Regulation', 'AssetClass'], bucketSet = 'CFTC') {
+        return this.retryRequest(async () => {
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/supervisory/aggregations`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        filters: filters,
+                        group_by: groupBy,
+                        bucket_set: bucketSet
+                    })
+                }
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to get aggregations: ${response.statusText}`);
+            }
+
+            return await response.json();
+        });
+    }
+
+    static async getSupervisoryDetails(filters = {}, page = 1, pageSize = 50, sortColumn = null, sortDirection = 'desc', bucket = null, bucketScope = null, bucketSet = 'CFTC') {
+        return this.retryRequest(async () => {
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/supervisory/details`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        filters: filters,
+                        page: page,
+                        page_size: pageSize,
+                        sort_column: sortColumn,
+                        sort_direction: sortDirection,
+                        bucket: bucket,
+                        bucket_scope: bucketScope,
+                        bucket_set: bucketSet
+                    })
+                }
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to get details: ${response.statusText}`);
+            }
+
+            return await response.json();
+        });
+    }
+
+    static async getSupervisorySavedFilters() {
+        return this.retryRequest(async () => {
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/supervisory/saved-filters`
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to get saved filters: ${response.statusText}`);
+            }
+
+            return await response.json();
+        });
+    }
+
+    static async saveSupervisoryFilter(payload) {
+        return this.retryRequest(async () => {
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/supervisory/saved-filters`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                }
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to save filter: ${response.statusText}`);
+            }
+
+            return await response.json();
+        });
+    }
+
+    static async deleteSupervisoryFilter(filterId) {
+        return this.retryRequest(async () => {
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/supervisory/saved-filters/${filterId}`,
+                {
+                    method: 'DELETE'
+                }
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to delete filter: ${response.statusText}`);
+            }
+
+            return await response.json();
+        });
+
+
+DETAILS
+
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import { ApiService } from '../../services/api';
+import { DataOutputProvider } from '../../contexts/DataOutputContext';
+import { ColumnResizeProvider } from '../../contexts/ColumnResizeContext';
+import DataOutputContent from '../../components/DataOutput/DataOutputContent';
+import ErrorBoundary from '../../components/common/ErrorBoundary';
+
+const DEFAULT_PAGE_SIZE = 50;
+
+const SupervisoryDetailsPage = () => {
+    const [searchParams] = useSearchParams();
+    const [detailsData, setDetailsData] = useState(null);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [currentPage, setCurrentPage] = useState(1);
+    const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+
+    const filters = useMemo(() => {
+        const raw = searchParams.get('filters');
+        if (!raw) return {};
+        try {
+            return JSON.parse(raw);
+        } catch (parseError) {
+            return {};
+        }
+    }, [searchParams]);
+
+    const title = searchParams.get('title') || 'Filtered Details';
+    const bucket = searchParams.get('bucket');
+    const bucketScope = searchParams.get('bucketScope');
+    const bucketSet = searchParams.get('bucketSet') || 'CFTC';
+
+    const loadDetails = useCallback(async () => {
+        setIsLoading(true);
+        setError(null);
+
+        try {
+            const response = await ApiService.getSupervisoryDetails(
+                filters,
+                currentPage,
+                pageSize,
+                null,
+                'desc',
+                bucket,
+                bucketScope,
+                bucketSet
+            );
+            if (response.success) {
+                setDetailsData(response);
+            } else {
+                setError(response.error || 'Failed to load details');
+            }
+        } catch (err) {
+            setError(err.message || 'Failed to load details');
+        } finally {
+            setIsLoading(false);
+        }
+    }, [filters, currentPage, pageSize, bucket, bucketScope, bucketSet]);
+
+    useEffect(() => {
+        loadDetails();
+    }, [loadDetails]);
+
+    const initialData = useMemo(() => {
+        if (!detailsData?.success) {
+            return {
+                headers: [],
+                table: [],
+                totalRows: 0,
+                displayedRows: 0,
+                columns: 0,
+                source: 'csv_api'
+            };
+        }
+
+        return {
+            headers: detailsData.columns || [],
+            table: detailsData.data || [],
+            totalRows: detailsData.pagination?.total_rows || 0,
+            displayedRows: detailsData.data?.length || 0,
+            columns: detailsData.columns?.length || 0,
+            source: 'csv_api'
+        };
+    }, [detailsData]);
+
+    const csvData = useMemo(() => {
+        if (!detailsData?.success) return null;
+        return {
+            data: detailsData.data || [],
+            columns: detailsData.columns || [],
+            pagination: detailsData.pagination || {}
+        };
+    }, [detailsData]);
+
+    const handlePageChange = useCallback((page) => {
+        setCurrentPage(page);
+    }, []);
+
+    const handlePageSizeChange = useCallback((size) => {
+        setPageSize(size);
+        setCurrentPage(1);
+    }, []);
+
+    return (
+        <div className="min-h-screen bg-gray-100 flex flex-col">
+            <div className="bg-white border-b border-gray-200 px-6 py-3">
+                <h1 className="text-lg font-semibold text-gray-900">Supervisory Details</h1>
+                <p className="text-xs text-gray-500">{title}</p>
+            </div>
+
+            <div className="flex-1 p-4">
+                {error && (
+                    <div className="mb-3 p-2 bg-red-50 border border-red-200 rounded text-red-700 text-xs">{error}</div>
+                )}
+                {isLoading && (
+                    <div className="mb-3 p-2 bg-gray-50 border border-gray-200 rounded text-gray-600 text-xs">Loading details...</div>
+                )}
+
+                <ErrorBoundary>
+                    <DataOutputProvider
+                        initialData={initialData}
+                        csvData={csvData}
+                        onPageChange={handlePageChange}
+                        onPageSizeChange={handlePageSizeChange}
+                        currentPage={currentPage}
+                        pageSize={pageSize}
+                    >
+                        <ColumnResizeProvider>
+                            <div style={{ height: 'calc(100vh - 140px)' }}>
+                                <DataOutputContent height="calc(100vh - 140px)" />
+                            </div>
+                        </ColumnResizeProvider>
+                    </DataOutputProvider>
+                </ErrorBoundary>
+            </div>
+        </div>
+    );
+};
+
+export default SupervisoryDetailsPage;
