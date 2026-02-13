@@ -1,572 +1,4 @@
-Supervisory
-
-"""
-Supervisory Dashboard Router
-Provides aggregated data views for supervisory monitoring with filtering and age bucket analysis
-"""
-
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from typing import Dict, Any, List, Optional
-import polars as pl
-import pyarrow.parquet as pq
-import logging
-from datetime import datetime
-from pathlib import Path
-import json
-import uuid
-import os
-
-logger = logging.getLogger(__name__)
-
-router = APIRouter(prefix="/api/supervisory", tags=["supervisory"])
-
-# Configuration
-DATA_FILE = "dummy_controls_data.parquet"
-CACHE_TTL = 300  # 5 minutes
-SAVED_FILTERS_FILE = os.path.join(Path(__file__).parent.parent, "data", "supervisory_saved_filters.json")
-CACHE_FILE = os.path.join(Path(__file__).parent.parent, "data", "supervisory_filter_cache.json")
-
-# Column mappings (display name -> actual column name in parquet)
-FILTER_COLUMNS = {
-    "regulation": "Regulation",
-    "asset_class": "AssetClass",
-    "control_type": "Control Type",
-    "data_type": "Data Type",
-    "sub_control_type": "Sub-ControlType",
-    "remediation_status": "RemediationStatus",
-    "explain_issue": "ExplainIssue",
-    "explain_issue_notification": "ExplainIssueNotification",
-    "explain_issue_detail": "ExplainIssueDetail"
-}
-
-AGE_BUCKET_COLUMNS = ["0-3", "3-7", "7-14", "14-30", "30-60"]
-
-# Remediation plans that indicate "unremediated" status
-UNREMEDIATED_PLANS = [
-    'Investigate and fix root cause',
-    'Manual override and re-process',
-    'Update configuration',
-    'Escalate to support team',
-    'Patch deployment scheduled'
-]
-
-REMEDIATED_PLANS = ['No action required']
-
-
-class AggregationRequest(BaseModel):
-    filters: Optional[Dict[str, List[str]]] = None
-    group_by: Optional[List[str]] = None
-    include_remediation_split: bool = True  # Whether to split by remediation status
-
-
-class DetailsRequest(BaseModel):
-    filters: Optional[Dict[str, List[str]]] = None
-    page: int = 1
-    page_size: int = 50
-    sort_column: Optional[str] = None
-    sort_direction: str = "desc"
-    bucket: Optional[str] = None
-    bucket_scope: Optional[str] = None
-
-
-class SavedFilterRequest(BaseModel):
-    name: str
-    filters: Dict[str, List[str]]
-    group_by: List[str]
-    created_by: Optional[str] = None
-    created_by_name: Optional[str] = None
-
-
-def get_data_file_path() -> str:
-    """Get the path to the data file"""
-    # Check multiple possible locations
-    possible_paths = [
-        Path(DATA_FILE),  # Current directory
-        Path("..") / DATA_FILE,  # Parent directory
-        Path(__file__).parent.parent.parent / DATA_FILE,  # Project root
-    ]
-
-    for path in possible_paths:
-        if path.exists():
-            return str(path.resolve())
-
-    # Default to project root
-    return str(Path(__file__).parent.parent.parent / DATA_FILE)
-
-
-def load_cache() -> Optional[Dict[str, Any]]:
-    """Load cached filter options from disk. Returns None if cache is missing or expired."""
-    if not os.path.exists(CACHE_FILE):
-        return None
-    try:
-        with open(CACHE_FILE, "r") as f:
-            cached = json.load(f)
-        timestamp = datetime.fromisoformat(cached.get("cached_at", ""))
-        elapsed = (datetime.now() - timestamp).total_seconds()
-        if elapsed >= CACHE_TTL:
-            return None
-        return cached.get("data")
-    except Exception as e:
-        logger.warning(f"Failed to read filter cache: {e}")
-        return None
-
-
-def write_cache(data: Dict[str, Any]) -> None:
-    """Persist filter options cache to disk."""
-    try:
-        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-        payload = {"cached_at": datetime.now().isoformat(), "data": data}
-        with open(CACHE_FILE, "w") as f:
-            json.dump(payload, f, indent=2)
-    except Exception as e:
-        logger.warning(f"Failed to write filter cache: {e}")
-
-
-def ensure_age_buckets(lazy_df: pl.LazyFrame) -> pl.LazyFrame:
-    """Ensure age bucket columns exist and are derived from ErrorAge."""
-    schema = lazy_df.collect_schema()
-    if "ErrorAge" not in schema:
-        raise HTTPException(status_code=400, detail="Missing required column: ErrorAge")
-
-    age_col = pl.col("ErrorAge")
-    return lazy_df.with_columns([
-        (age_col <= 3).cast(pl.Int64).alias("0-3"),
-        ((age_col > 3) & (age_col <= 7)).cast(pl.Int64).alias("3-7"),
-        ((age_col > 7) & (age_col <= 14)).cast(pl.Int64).alias("7-14"),
-        ((age_col > 14) & (age_col <= 30)).cast(pl.Int64).alias("14-30"),
-        ((age_col > 30) & (age_col <= 60)).cast(pl.Int64).alias("30-60"),
-    ])
-
-
-def ensure_remediation_status(lazy_df: pl.LazyFrame) -> pl.LazyFrame:
-    """Ensure RemediationStatus exists (derived from RemediationPlan if needed)."""
-    schema = lazy_df.collect_schema()
-    if "RemediationStatus" in schema:
-        return lazy_df
-    if "RemediationPlan" not in schema:
-        raise HTTPException(status_code=400, detail="Missing required column: RemediationPlan")
-
-    return lazy_df.with_columns([
-        pl.when(pl.col("RemediationPlan") == "No action required")
-        .then(pl.lit("Remediated"))
-        .otherwise(pl.lit("Unremediated"))
-        .alias("RemediationStatus")
-    ])
-
-
-def load_saved_filters() -> List[Dict[str, Any]]:
-    """Load saved filters from disk."""
-    if not os.path.exists(SAVED_FILTERS_FILE):
-        return []
-    try:
-        with open(SAVED_FILTERS_FILE, "r") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                return data
-            return []
-    except Exception as e:
-        logger.error(f"Failed to load saved filters: {e}")
-        return []
-
-
-def write_saved_filters(filters: List[Dict[str, Any]]) -> None:
-    """Persist saved filters to disk."""
-    try:
-        os.makedirs(os.path.dirname(SAVED_FILTERS_FILE), exist_ok=True)
-        with open(SAVED_FILTERS_FILE, "w") as f:
-            json.dump(filters, f, indent=2)
-    except Exception as e:
-        logger.error(f"Failed to write saved filters: {e}")
-        raise HTTPException(status_code=500, detail="Failed to save filter")
-
-
-@router.get("/filter-options")
-async def get_filter_options() -> Dict[str, Any]:
-    """
-    Get unique values for all filter columns
-    Returns cached results if available and valid
-    """
-    try:
-        # Return cached data if valid
-        cached = load_cache()
-        if cached is not None:
-            logger.info("Returning cached filter options")
-            return cached
-
-        file_path = get_data_file_path()
-        logger.info(f"Loading filter options from: {file_path}")
-
-        if not Path(file_path).exists():
-            raise HTTPException(status_code=404, detail=f"Data file not found: {file_path}")
-
-        # Use lazy loading to get unique values efficiently
-        lazy_df = pl.scan_parquet(file_path)
-        lazy_df = ensure_remediation_status(lazy_df)
-
-        filter_options = {}
-
-        for key, column_name in FILTER_COLUMNS.items():
-            try:
-                unique_values = (
-                    lazy_df
-                    .select(pl.col(column_name))
-                    .unique()
-                    .collect()
-                    .to_series()
-                    .to_list()
-                )
-                # Sort and filter out None values
-                unique_values = sorted([v for v in unique_values if v is not None])
-                filter_options[key] = unique_values
-                logger.info(f"Column '{column_name}' has {len(unique_values)} unique values")
-            except Exception as e:
-                logger.warning(f"Could not get unique values for column '{column_name}': {e}")
-                filter_options[key] = []
-
-        # Get total row count
-        parquet_file = pq.ParquetFile(file_path)
-        total_rows = parquet_file.metadata.num_rows
-
-        result = {
-            "success": True,
-            "filter_options": filter_options,
-            "total_records": total_rows,
-            "columns": list(FILTER_COLUMNS.keys()),
-            "age_buckets": AGE_BUCKET_COLUMNS,
-            "retrieved_at": datetime.now().isoformat()
-        }
-
-        # Update cache
-        write_cache(result)
-
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting filter options: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/aggregations")
-async def get_aggregations(request: AggregationRequest) -> Dict[str, Any]:
-    """
-    Get aggregated counts with age bucket breakdown
-    Filters are applied before aggregation
-    Returns both unremediated and total counts when include_remediation_split is True
-    """
-    try:
-        file_path = get_data_file_path()
-        logger.info(f"Getting aggregations from: {file_path}")
-
-        if not Path(file_path).exists():
-            raise HTTPException(status_code=404, detail=f"Data file not found: {file_path}")
-
-        # Start with lazy loading
-        lazy_df = pl.scan_parquet(file_path)
-        lazy_df = ensure_age_buckets(lazy_df)
-        lazy_df = ensure_remediation_status(lazy_df)
-        lazy_df = ensure_age_buckets(lazy_df)
-
-        # Get total rows before filtering
-        parquet_file = pq.ParquetFile(file_path)
-        total_records = parquet_file.metadata.num_rows
-
-        # Apply filters
-        if request.filters:
-            for filter_key, filter_values in request.filters.items():
-                if filter_values and len(filter_values) > 0:
-                    column_name = FILTER_COLUMNS.get(filter_key)
-                    if column_name:
-                        lazy_df = lazy_df.filter(pl.col(column_name).is_in(filter_values))
-                        logger.info(f"Applied filter: {column_name} in {filter_values}")
-
-        # Determine group by columns
-        group_by_columns = []
-        if request.group_by:
-            for col in request.group_by:
-                # Map display names to actual column names
-                actual_col = FILTER_COLUMNS.get(col.lower().replace(" ", "_"), col)
-                group_by_columns.append(actual_col)
-        else:
-            # Default grouping
-            group_by_columns = ["Regulation", "AssetClass"]
-
-        logger.info(f"Grouping by: {group_by_columns}")
-
-        if request.include_remediation_split:
-            # Build aggregation with remediation split
-            # Total counts
-            agg_expressions = [
-                pl.count().alias("total_count")
-            ]
-            for bucket in AGE_BUCKET_COLUMNS:
-                agg_expressions.append(
-                    pl.col(bucket).sum().alias(f"total_{bucket}")
-                )
-
-            # Unremediated counts (where RemediationPlan is NOT 'No action required')
-            for bucket in AGE_BUCKET_COLUMNS:
-                agg_expressions.append(
-                    pl.when(pl.col("RemediationStatus") == "Unremediated")
-                    .then(pl.col(bucket))
-                    .otherwise(0)
-                    .sum()
-                    .alias(f"unremediated_{bucket}")
-                )
-
-            # Unremediated count
-            agg_expressions.append(
-                pl.when(pl.col("RemediationStatus") == "Unremediated")
-                .then(1)
-                .otherwise(0)
-                .sum()
-                .alias("unremediated_count")
-            )
-
-            # Execute aggregation
-            aggregated_df = (
-                lazy_df
-                .group_by(group_by_columns)
-                .agg(agg_expressions)
-                .sort(group_by_columns)
-                .collect()
-            )
-
-            # Convert to list of dicts
-            aggregations = aggregated_df.to_dicts()
-
-            # Calculate totals for each row
-            for row in aggregations:
-                row["total_total"] = sum(row.get(f"total_{bucket}", 0) or 0 for bucket in AGE_BUCKET_COLUMNS)
-                row["unremediated_total"] = sum(row.get(f"unremediated_{bucket}", 0) or 0 for bucket in AGE_BUCKET_COLUMNS)
-
-            # Calculate summary statistics
-            filtered_count = sum(row["total_count"] for row in aggregations)
-            unremediated_count = sum(row["unremediated_count"] for row in aggregations)
-
-            summary = {
-                "total_count": filtered_count,
-                "unremediated_count": unremediated_count,
-                "total": {},
-                "unremediated": {}
-            }
-            for bucket in AGE_BUCKET_COLUMNS:
-                summary["total"][bucket] = sum(row.get(f"total_{bucket}", 0) or 0 for row in aggregations)
-                summary["unremediated"][bucket] = sum(row.get(f"unremediated_{bucket}", 0) or 0 for row in aggregations)
-
-            summary["total"]["total"] = sum(summary["total"].values())
-            summary["unremediated"]["total"] = sum(summary["unremediated"].values())
-
-        else:
-            # Simple aggregation without remediation split (original behavior)
-            agg_expressions = [
-                pl.count().alias("count")
-            ]
-
-            for bucket in AGE_BUCKET_COLUMNS:
-                agg_expressions.append(
-                    pl.col(bucket).sum().alias(bucket)
-                )
-
-            # Execute aggregation
-            aggregated_df = (
-                lazy_df
-                .group_by(group_by_columns)
-                .agg(agg_expressions)
-                .sort(group_by_columns)
-                .collect()
-            )
-
-            # Convert to list of dicts
-            aggregations = aggregated_df.to_dicts()
-
-            # Calculate totals for each row
-            for row in aggregations:
-                row["total"] = sum(row.get(bucket, 0) or 0 for bucket in AGE_BUCKET_COLUMNS)
-
-            # Calculate summary statistics
-            filtered_count = sum(row["count"] for row in aggregations)
-            summary = {
-                "total": filtered_count,
-            }
-            for bucket in AGE_BUCKET_COLUMNS:
-                summary[bucket] = sum(row.get(bucket, 0) or 0 for row in aggregations)
-
-        result = {
-            "success": True,
-            "total_records": total_records,
-            "filtered_records": filtered_count,
-            "aggregations": aggregations,
-            "summary": summary,
-            "group_by": group_by_columns,
-            "age_buckets": AGE_BUCKET_COLUMNS,
-            "include_remediation_split": request.include_remediation_split,
-            "retrieved_at": datetime.now().isoformat()
-        }
-
-        logger.info(f"Aggregation complete: {len(aggregations)} groups, {filtered_count} filtered records")
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting aggregations: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/details")
-async def get_details(request: DetailsRequest) -> Dict[str, Any]:
-    """
-    Get detailed records with pagination for drill-down views
-    """
-    try:
-        file_path = get_data_file_path()
-        logger.info(f"Getting details from: {file_path}")
-
-        if not Path(file_path).exists():
-            raise HTTPException(status_code=404, detail=f"Data file not found: {file_path}")
-
-        # Start with lazy loading
-        lazy_df = pl.scan_parquet(file_path)
-        lazy_df = ensure_age_buckets(lazy_df)
-        lazy_df = ensure_remediation_status(lazy_df)
-
-        # Apply filters
-        if request.filters:
-            for filter_key, filter_values in request.filters.items():
-                if filter_values and len(filter_values) > 0:
-                    column_name = FILTER_COLUMNS.get(filter_key)
-                    if column_name:
-                        lazy_df = lazy_df.filter(pl.col(column_name).is_in(filter_values))
-
-        # Apply bucket filter
-        if request.bucket and request.bucket in AGE_BUCKET_COLUMNS:
-            bucket = request.bucket
-            if bucket == "0-3":
-                lazy_df = lazy_df.filter(pl.col("ErrorAge") <= 3)
-            elif bucket == "3-7":
-                lazy_df = lazy_df.filter((pl.col("ErrorAge") > 3) & (pl.col("ErrorAge") <= 7))
-            elif bucket == "7-14":
-                lazy_df = lazy_df.filter((pl.col("ErrorAge") > 7) & (pl.col("ErrorAge") <= 14))
-            elif bucket == "14-30":
-                lazy_df = lazy_df.filter((pl.col("ErrorAge") > 14) & (pl.col("ErrorAge") <= 30))
-            elif bucket == "30-60":
-                lazy_df = lazy_df.filter((pl.col("ErrorAge") > 30) & (pl.col("ErrorAge") <= 60))
-
-            if request.bucket_scope == "unremediated":
-                lazy_df = lazy_df.filter(pl.col("RemediationStatus") == "Unremediated")
-
-        # Get filtered count (execute a separate query for count)
-        count_df = lazy_df.select(pl.count()).collect()
-        total_filtered = count_df.item()
-
-        # Apply sorting
-        if request.sort_column:
-            descending = request.sort_direction.lower() == "desc"
-            lazy_df = lazy_df.sort(request.sort_column, descending=descending)
-        else:
-            # Default sort by ErrorAge descending
-            lazy_df = lazy_df.sort("ErrorAge", descending=True)
-
-        # Apply pagination
-        start_idx = (request.page - 1) * request.page_size
-        page_df = (
-            lazy_df
-            .slice(start_idx, request.page_size)
-            .collect()
-        )
-
-        # Convert to list of dicts
-        data = page_df.to_dicts()
-
-        # Calculate pagination info
-        total_pages = (total_filtered + request.page_size - 1) // request.page_size if total_filtered > 0 else 1
-
-        result = {
-            "success": True,
-            "data": data,
-            "columns": page_df.columns,
-            "pagination": {
-                "current_page": request.page,
-                "page_size": request.page_size,
-                "total_rows": total_filtered,
-                "total_pages": total_pages,
-                "has_next": request.page < total_pages,
-                "has_previous": request.page > 1
-            },
-            "retrieved_at": datetime.now().isoformat()
-        }
-
-        logger.info(f"Details retrieved: {len(data)} rows (page {request.page}/{total_pages})")
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting details: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/cache/clear")
-async def clear_cache() -> Dict[str, Any]:
-    """Clear the filter options cache"""
-    try:
-        if os.path.exists(CACHE_FILE):
-            os.remove(CACHE_FILE)
-    except Exception as e:
-        logger.warning(f"Failed to remove cache file: {e}")
-    logger.info("Supervisory dashboard cache cleared")
-    return {"success": True, "message": "Cache cleared"}
-
-
-@router.get("/saved-filters")
-async def list_saved_filters() -> Dict[str, Any]:
-    """List all saved filter presets (shared across users)."""
-    saved = load_saved_filters()
-    return {"success": True, "filters": saved}
-
-
-@router.post("/saved-filters")
-async def save_filter(request: SavedFilterRequest) -> Dict[str, Any]:
-    """Save a new filter preset."""
-    saved = load_saved_filters()
-    now = datetime.now().isoformat()
-    new_item = {
-        "id": str(uuid.uuid4()),
-        "name": request.name,
-        "filters": request.filters,
-        "group_by": request.group_by,
-        "created_by": request.created_by or "anonymous",
-        "created_by_name": request.created_by_name or request.created_by or "anonymous",
-        "created_at": now
-    }
-    saved.insert(0, new_item)
-    write_saved_filters(saved)
-    return {"success": True, "filter": new_item}
-
-
-@router.delete("/saved-filters/{filter_id}")
-async def delete_saved_filter(filter_id: str) -> Dict[str, Any]:
-    """Delete a saved filter preset by id."""
-    saved = load_saved_filters()
-    updated = [item for item in saved if item.get("id") != filter_id]
-    if len(updated) == len(saved):
-        raise HTTPException(status_code=404, detail="Saved filter not found")
-    write_saved_filters(updated)
-    return {"success": True, "message": "Deleted"}
-
-
-page.js super-visory
-
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import HSBCLogo from '../../components/HSBCLogo';
 import { ApiService } from '../../services/api';
 import { AgGridReact } from 'ag-grid-react';
@@ -645,6 +77,7 @@ const SummaryCard = ({ title, value, color, subtitle, small }) => (
 const MultiSelectFilter = ({ label, options, selected, onChange, placeholder }) => {
     const [isOpen, setIsOpen] = useState(false);
     const [search, setSearch] = useState('');
+    const containerRef = useRef(null);
 
     const filteredOptions = useMemo(() => {
         if (!search) return options;
@@ -652,6 +85,23 @@ const MultiSelectFilter = ({ label, options, selected, onChange, placeholder }) 
             opt.toLowerCase().includes(search.toLowerCase())
         );
     }, [options, search]);
+
+    const selectedLabel = useMemo(() => {
+        if (selected.length === 0) return placeholder;
+        if (selected.length <= 2) return selected.join(', ');
+        return `${selected.slice(0, 2).join(', ')} +${selected.length - 2}`;
+    }, [selected, placeholder]);
+
+    useEffect(() => {
+        const handleOutsideClick = (event) => {
+            if (containerRef.current && !containerRef.current.contains(event.target)) {
+                setIsOpen(false);
+            }
+        };
+
+        document.addEventListener('mousedown', handleOutsideClick);
+        return () => document.removeEventListener('mousedown', handleOutsideClick);
+    }, []);
 
     const toggleOption = (option) => {
         if (selected.includes(option)) {
@@ -665,15 +115,15 @@ const MultiSelectFilter = ({ label, options, selected, onChange, placeholder }) 
     const clearAll = () => onChange([]);
 
     return (
-        <div className="mb-3">
+        <div className="mb-3" ref={containerRef}>
             <label className="block text-xs font-medium text-gray-700 mb-1">{label}</label>
             <div className="relative">
                 <div
                     onClick={() => setIsOpen(!isOpen)}
                     className="w-full px-2 py-1.5 border border-gray-300 rounded bg-white cursor-pointer flex items-center justify-between text-xs"
                 >
-                    <span className={selected.length === 0 ? 'text-gray-400' : 'text-gray-700'}>
-                        {selected.length === 0 ? placeholder : `${selected.length} selected`}
+                    <span className={selected.length === 0 ? 'text-gray-400' : 'text-gray-700 truncate pr-2'}>
+                        {selectedLabel}
                     </span>
                     <svg className={`w-3 h-3 transition-transform ${isOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
@@ -742,6 +192,94 @@ const DraggableChip = ({ column, onRemove, isDragging }) => (
         )}
     </div>
 );
+
+const ROW_SPAN_CONFIG = [
+    { field: 'Regulation' },
+    { field: 'AssetClass', prerequisites: ['Regulation'] }
+];
+
+const computeRowSpanMeta = (rows, configs) => {
+    const meta = rows.map(() => ({}));
+
+    configs.forEach(({ field, prerequisites = [] }) => {
+        let start = 0;
+        while (start < rows.length) {
+            const baseValue = rows[start]?.[field];
+            let length = 1;
+
+            for (let next = start + 1; next < rows.length; next++) {
+                const nextRow = rows[next];
+                if (nextRow?.[field] !== baseValue) {
+                    break;
+                }
+
+                const prereqMismatch = prerequisites.some(prereq => rows[next]?.[prereq] !== rows[start]?.[prereq]);
+                if (prereqMismatch) {
+                    break;
+                }
+
+                length++;
+            }
+
+            if (length > 1) {
+                meta[start][field] = length;
+            }
+
+            start += length;
+        }
+    });
+
+    return meta;
+};
+
+const addRowSpanMetadata = (rows) => {
+    const meta = computeRowSpanMeta(rows, ROW_SPAN_CONFIG);
+    const mergeDisplay = rows.map(() => ({}));
+    const mergeState = rows.map(() => ({}));
+
+    ROW_SPAN_CONFIG.forEach(({ field, prerequisites = [] }) => {
+        let start = 0;
+        while (start < rows.length) {
+            const baseValue = rows[start]?.[field];
+            let length = 1;
+
+            for (let next = start + 1; next < rows.length; next++) {
+                const nextRow = rows[next];
+                if (nextRow?.[field] !== baseValue) {
+                    break;
+                }
+
+                const prereqMismatch = prerequisites.some(prereq => rows[next]?.[prereq] !== rows[start]?.[prereq]);
+                if (prereqMismatch) {
+                    break;
+                }
+
+                length++;
+            }
+
+            const centerIndex = start + Math.floor((length - 1) / 2);
+            for (let idx = start; idx < start + length; idx++) {
+                mergeDisplay[idx][field] = idx === centerIndex;
+                mergeState[idx][field] = {
+                    isStart: idx === start,
+                    isEnd: idx === (start + length - 1),
+                    isMiddle: idx === centerIndex,
+                    length
+                };
+            }
+
+            start += length;
+        }
+    });
+
+    return rows.map((row, index) => ({
+        ...row,
+        _rowSpanMeta: meta[index],
+        _mergeDisplay: mergeDisplay[index],
+        _mergeState: mergeState[index]
+    }));
+};
+
 
 // Column Drop Zone
 const ColumnDropZone = ({ selectedColumns, availableColumns, onColumnsChange }) => {
@@ -816,6 +354,7 @@ const ColumnDropZone = ({ selectedColumns, availableColumns, onColumnsChange }) 
 
 export default function SupervisoryDashboard() {
     const { currentUser } = useUser();
+    const dashboardLayoutRef = useRef(null);
     // Filter options from API
     const [filterOptions, setFilterOptions] = useState({
         regulation: [],
@@ -854,8 +393,11 @@ export default function SupervisoryDashboard() {
 
     // UI state
     const [isLoading, setIsLoading] = useState(true);
+    const [isInitialFiltersReady, setIsInitialFiltersReady] = useState(false);
     const [error, setError] = useState(null);
     const [activeView, setActiveView] = useState('table');
+    const [sidebarWidth, setSidebarWidth] = useState(224);
+    const isResizingSidebarRef = useRef(false);
     const [selectedColumns, setSelectedColumns] = useState([
         AVAILABLE_COLUMNS[0], // Regulation
         AVAILABLE_COLUMNS[1],  // Asset Class
@@ -886,10 +428,10 @@ export default function SupervisoryDashboard() {
 
     // Load aggregations when filters or groupBy changes
     useEffect(() => {
-        if (groupBy.length > 0) {
+        if (isInitialFiltersReady && groupBy.length > 0) {
             loadAggregations();
         }
-    }, [filters, groupBy]);
+    }, [filters, groupBy, isInitialFiltersReady]);
 
     const loadFilterOptions = async () => {
         try {
@@ -897,9 +439,32 @@ export default function SupervisoryDashboard() {
             if (response.success) {
                 setFilterOptions(response.filter_options);
                 setTotalRecords(response.total_records);
+
+                const startupFilterKeys = ['regulation', 'asset_class', 'data_type'];
+                const configuredDefaults = response.default_initial_filters || {};
+                const initialFilters = { ...emptyFilters };
+
+                startupFilterKeys.forEach((key) => {
+                    const availableOptions = response.filter_options?.[key] || [];
+                    const validConfiguredDefaults = (configuredDefaults[key] || []).filter(v => availableOptions.includes(v));
+
+                    if (validConfiguredDefaults.length > 0) {
+                        initialFilters[key] = validConfiguredDefaults;
+                        return;
+                    }
+
+                    // Keep first load constrained even if backend defaults are not present.
+                    if (availableOptions.length > 0) {
+                        initialFilters[key] = [availableOptions[0]];
+                    }
+                });
+
+                setFilters(initialFilters);
             }
         } catch (err) {
             setError('Failed to load filter options');
+        } finally {
+            setIsInitialFiltersReady(true);
         }
     };
 
@@ -909,7 +474,7 @@ export default function SupervisoryDashboard() {
         try {
             const response = await ApiService.getSupervisoryAggregations(filters, groupBy);
             if (response.success) {
-                setAggregations(response.aggregations);
+                setAggregations(response.aggregations || []);
                 setSummary(response.summary);
                 setFilteredRecords(response.filtered_records);
                 setTotalRecords(response.total_records);
@@ -1029,27 +594,53 @@ export default function SupervisoryDashboard() {
     }, [selectedColumns]);
 
     const detailCellRenderer = useCallback((params) => {
+        const field = params.colDef?.field;
+        const isMergedField = ROW_SPAN_CONFIG.some(cfg => cfg.field === field);
+        const shouldDisplay = isMergedField
+            ? (params.data?._mergeDisplay?.[field] ?? true)
+            : true;
+        if (!shouldDisplay) {
+            return <span />;
+        }
+
         const displayValue = params.valueFormatted ?? params.value ?? '';
         if (!params.data) {
             return <span>{displayValue}</span>;
         }
+        const canOpenDetails = !isMergedField || (params.data?._mergeState?.[field]?.isMiddle ?? true);
+
         return (
             <div className="supervisory-cell">
                 <span className="supervisory-cell-value">{displayValue}</span>
-                <button
-                    className="supervisory-cell-action"
-                    onClick={(e) => {
-                        e.stopPropagation();
-                        openDetailsWindow(params.data, params.colDef?.field);
-                    }}
-                    title="Open details"
-                    type="button"
-                >
-                    <FaExternalLinkAlt />
-                </button>
+                {canOpenDetails && (
+                    <button
+                        className="supervisory-cell-action"
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            openDetailsWindow(params.data, field);
+                        }}
+                        title="Open details"
+                        type="button"
+                    >
+                        <FaExternalLinkAlt />
+                    </button>
+                )}
             </div>
         );
     }, [openDetailsWindow]);
+
+    const getMergedCellStyle = useCallback((field) => (params) => {
+        const state = params.data?._mergeState?.[field];
+        if (!state || state.length <= 1) {
+            return { fontWeight: '500' };
+        }
+
+        return {
+            fontWeight: '500',
+            borderTop: state.isStart ? undefined : 'none',
+            borderBottom: state.isEnd ? undefined : 'none'
+        };
+    }, []);
 
     const columnDefs = useMemo(() => {
         // Group by columns
@@ -1060,7 +651,9 @@ export default function SupervisoryDashboard() {
             filter: true,
             pinned: 'left',
             width: 120,
-            cellStyle: { fontWeight: '500' },
+            cellStyle: ROW_SPAN_CONFIG.some(cfg => cfg.field === col.field)
+                ? getMergedCellStyle(col.field)
+                : { fontWeight: '500' },
             cellRenderer: detailCellRenderer
         }));
 
@@ -1074,7 +667,8 @@ export default function SupervisoryDashboard() {
                         field: `unremediated_${bucket}`,
                         sortable: true,
                         type: 'numericColumn',
-                        width: 70,
+                        minWidth: 68,
+                        flex: 1,
                         cellStyle: params => {
                             const value = params.value || 0;
                             if (value === 0) return { backgroundColor: '#f9fafb', textAlign: 'right' };
@@ -1093,7 +687,8 @@ export default function SupervisoryDashboard() {
                         field: 'unremediated_total',
                         sortable: true,
                         type: 'numericColumn',
-                        width: 80,
+                        minWidth: 76,
+                        flex: 1,
                         cellStyle: { fontWeight: 'bold', backgroundColor: '#fef2f2', textAlign: 'right' },
                         valueFormatter: params => params.value ? params.value.toLocaleString() : '0',
                         cellRenderer: detailCellRenderer
@@ -1112,7 +707,8 @@ export default function SupervisoryDashboard() {
                         field: `total_${bucket}`,
                         sortable: true,
                         type: 'numericColumn',
-                        width: 70,
+                        minWidth: 68,
+                        flex: 1,
                         cellStyle: params => {
                             const value = params.value || 0;
                             return {
@@ -1128,7 +724,8 @@ export default function SupervisoryDashboard() {
                         field: 'total_total',
                         sortable: true,
                         type: 'numericColumn',
-                        width: 80,
+                        minWidth: 76,
+                        flex: 1,
                         cellStyle: { fontWeight: 'bold', backgroundColor: '#eff6ff', textAlign: 'right' },
                         valueFormatter: params => params.value ? params.value.toLocaleString() : '0',
                         cellRenderer: detailCellRenderer
@@ -1138,12 +735,56 @@ export default function SupervisoryDashboard() {
         ];
 
         return [...groupCols, ...unremediatedCols, ...totalCols];
-    }, [selectedColumns, detailCellRenderer]);
+    }, [selectedColumns, detailCellRenderer, getMergedCellStyle]);
+
+    const rowDataWithSpans = useMemo(() => addRowSpanMetadata(aggregations), [aggregations]);
 
     const defaultColDef = useMemo(() => ({
         resizable: true,
         sortable: true
     }), []);
+
+    const SIDEBAR_MIN_WIDTH = 220;
+    const SIDEBAR_MAX_WIDTH = 520;
+
+    useEffect(() => {
+        const handleMouseMove = (event) => {
+            if (!isResizingSidebarRef.current) return;
+
+            const layoutRect = dashboardLayoutRef.current?.getBoundingClientRect();
+            if (!layoutRect) return;
+
+            const availableWidth = layoutRect.width;
+            const dynamicMax = Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, availableWidth - 420));
+            const nextWidth = Math.max(
+                SIDEBAR_MIN_WIDTH,
+                Math.min(dynamicMax, event.clientX - layoutRect.left)
+            );
+            setSidebarWidth(nextWidth);
+        };
+
+        const handleMouseUp = () => {
+            if (!isResizingSidebarRef.current) return;
+            isResizingSidebarRef.current = false;
+            document.body.style.userSelect = '';
+            document.body.style.cursor = '';
+        };
+
+        window.addEventListener('mousemove', handleMouseMove);
+        window.addEventListener('mouseup', handleMouseUp);
+
+        return () => {
+            window.removeEventListener('mousemove', handleMouseMove);
+            window.removeEventListener('mouseup', handleMouseUp);
+        };
+    }, []);
+
+    const handleSidebarResizeStart = useCallback((event) => {
+        event.preventDefault();
+        isResizingSidebarRef.current = true;
+        document.body.style.userSelect = 'none';
+        document.body.style.cursor = 'col-resize';
+    }, []);
 
     // Chart data preparation
     const chartData = useMemo(() => {
@@ -1232,9 +873,12 @@ export default function SupervisoryDashboard() {
             </div>
 
             {/* Main Content */}
-            <div className="flex flex-1 overflow-hidden">
+            <div className="flex flex-1 overflow-hidden" ref={dashboardLayoutRef}>
                 {/* Left Sidebar - Filters */}
-                <div className="w-56 bg-white border-r border-gray-200 p-3 overflow-y-auto flex-shrink-0">
+                <div
+                    className="bg-white border-r border-gray-200 p-3 overflow-y-auto flex-shrink-0 relative"
+                    style={{ width: `${sidebarWidth}px` }}
+                >
                     <div className="flex items-center justify-between mb-3">
                         <div className="flex items-center gap-1.5">
                             <FaFilter className="text-gray-500" style={{ fontSize: '12px' }} />
@@ -1331,6 +975,14 @@ export default function SupervisoryDashboard() {
                             <span className="font-medium">{filteredRecords.toLocaleString()}</span>
                         </div>
                     </div>
+
+                    <div
+                        className="absolute top-0 right-0 h-full w-1 cursor-col-resize hover:bg-blue-300"
+                        onMouseDown={handleSidebarResizeStart}
+                        role="separator"
+                        aria-orientation="vertical"
+                        aria-label="Resize filters sidebar"
+                    />
                 </div>
 
                 {/* Main Dashboard Area */}
@@ -1417,7 +1069,7 @@ export default function SupervisoryDashboard() {
                         <div className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
                             <div className="ag-theme-alpine" style={{ height: 'calc(100vh - 420px)', width: '100%' }}>
                                 <AgGridReact
-                                    rowData={aggregations}
+                                    rowData={rowDataWithSpans}
                                     columnDefs={columnDefs}
                                     defaultColDef={defaultColDef}
                                     animateRows={true}
@@ -1426,6 +1078,9 @@ export default function SupervisoryDashboard() {
                                     overlayLoadingTemplate={'<span class="ag-overlay-loading-center">Loading...</span>'}
                                     overlayNoRowsTemplate={'<span class="ag-overlay-no-rows-center">No data to display</span>'}
                                     loading={isLoading}
+                                    suppressRowTransform={true}
+                                    suppressRowVirtualisation={true}
+                                    suppressColumnVirtualisation={true}
                                 />
                             </div>
                         </div>
@@ -1471,392 +1126,3 @@ export default function SupervisoryDashboard() {
         </div>
     );
 }
-
-
-api.
-
-
-    // ==================== Supervisory Dashboard API ====================
-
-    static async getSupervisoryFilterOptions() {
-        return this.retryRequest(async () => {
-            const response = await this.fetchWithTimeout(
-                `${API_BASE_URL}/api/supervisory/filter-options`
-            );
-
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `Failed to get filter options: ${response.statusText}`);
-            }
-
-            return await response.json();
-        });
-    }
-
-    static async getSupervisoryAggregations(filters = {}, groupBy = ['Regulation', 'AssetClass']) {
-        return this.retryRequest(async () => {
-            const response = await this.fetchWithTimeout(
-                `${API_BASE_URL}/api/supervisory/aggregations`,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        filters: filters,
-                        group_by: groupBy
-                    })
-                }
-            );
-
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `Failed to get aggregations: ${response.statusText}`);
-            }
-
-            return await response.json();
-        });
-    }
-
-    static async getSupervisoryDetails(filters = {}, page = 1, pageSize = 50, sortColumn = null, sortDirection = 'desc', bucket = null, bucketScope = null) {
-        return this.retryRequest(async () => {
-            const response = await this.fetchWithTimeout(
-                `${API_BASE_URL}/api/supervisory/details`,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        filters: filters,
-                        page: page,
-                        page_size: pageSize,
-                        sort_column: sortColumn,
-                        sort_direction: sortDirection,
-                        bucket: bucket,
-                        bucket_scope: bucketScope
-                    })
-                }
-            );
-
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `Failed to get details: ${response.statusText}`);
-            }
-
-            return await response.json();
-        });
-    }
-
-    static async getSupervisorySavedFilters() {
-        return this.retryRequest(async () => {
-            const response = await this.fetchWithTimeout(
-                `${API_BASE_URL}/api/supervisory/saved-filters`
-            );
-
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `Failed to get saved filters: ${response.statusText}`);
-            }
-
-            return await response.json();
-        });
-    }
-
-    static async saveSupervisoryFilter(payload) {
-        return this.retryRequest(async () => {
-            const response = await this.fetchWithTimeout(
-                `${API_BASE_URL}/api/supervisory/saved-filters`,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                }
-            );
-
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `Failed to save filter: ${response.statusText}`);
-            }
-
-            return await response.json();
-        });
-    }
-
-    static async deleteSupervisoryFilter(filterId) {
-        return this.retryRequest(async () => {
-            const response = await this.fetchWithTimeout(
-                `${API_BASE_URL}/api/supervisory/saved-filters/${filterId}`,
-                {
-                    method: 'DELETE'
-                }
-            );
-
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `Failed to delete filter: ${response.statusText}`);
-            }
-
-            return await response.json();
-        });
-    }
-
-Details.page
-
-
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
-import { ApiService } from '../../services/api';
-import { DataOutputProvider } from '../../contexts/DataOutputContext';
-import { ColumnResizeProvider } from '../../contexts/ColumnResizeContext';
-import DataOutputContent from '../../components/DataOutput/DataOutputContent';
-import ErrorBoundary from '../../components/common/ErrorBoundary';
-
-const DEFAULT_PAGE_SIZE = 50;
-
-const SupervisoryDetailsPage = () => {
-    const [searchParams] = useSearchParams();
-    const [detailsData, setDetailsData] = useState(null);
-    const [isLoading, setIsLoading] = useState(true);
-    const [error, setError] = useState(null);
-    const [currentPage, setCurrentPage] = useState(1);
-    const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
-
-    const filters = useMemo(() => {
-        const raw = searchParams.get('filters');
-        if (!raw) return {};
-        try {
-            return JSON.parse(raw);
-        } catch (parseError) {
-            return {};
-        }
-    }, [searchParams]);
-
-    const title = searchParams.get('title') || 'Filtered Details';
-    const bucket = searchParams.get('bucket');
-    const bucketScope = searchParams.get('bucketScope');
-
-    const loadDetails = useCallback(async () => {
-        setIsLoading(true);
-        setError(null);
-
-        try {
-            const response = await ApiService.getSupervisoryDetails(filters, currentPage, pageSize, null, 'desc', bucket, bucketScope);
-            if (response.success) {
-                setDetailsData(response);
-            } else {
-                setError(response.error || 'Failed to load details');
-            }
-        } catch (err) {
-            setError(err.message || 'Failed to load details');
-        } finally {
-            setIsLoading(false);
-        }
-    }, [filters, currentPage, pageSize]);
-
-    useEffect(() => {
-        loadDetails();
-    }, [loadDetails]);
-
-    const initialData = useMemo(() => {
-        if (!detailsData?.success) {
-            return {
-                headers: [],
-                table: [],
-                totalRows: 0,
-                displayedRows: 0,
-                columns: 0,
-                source: 'csv_api'
-            };
-        }
-
-        return {
-            headers: detailsData.columns || [],
-            table: detailsData.data || [],
-            totalRows: detailsData.pagination?.total_rows || 0,
-            displayedRows: detailsData.data?.length || 0,
-            columns: detailsData.columns?.length || 0,
-            source: 'csv_api'
-        };
-    }, [detailsData]);
-
-    const csvData = useMemo(() => {
-        if (!detailsData?.success) return null;
-        return {
-            data: detailsData.data || [],
-            columns: detailsData.columns || [],
-            pagination: detailsData.pagination || {}
-        };
-    }, [detailsData]);
-
-    const handlePageChange = useCallback((page) => {
-        setCurrentPage(page);
-    }, []);
-
-    const handlePageSizeChange = useCallback((size) => {
-        setPageSize(size);
-        setCurrentPage(1);
-    }, []);
-
-    return (
-        <div className="min-h-screen bg-gray-100 flex flex-col">
-            <div className="bg-white border-b border-gray-200 px-6 py-3">
-                <h1 className="text-lg font-semibold text-gray-900">Supervisory Details</h1>
-                <p className="text-xs text-gray-500">{title}</p>
-            </div>
-
-            <div className="flex-1 p-4">
-                {error && (
-                    <div className="mb-3 p-2 bg-red-50 border border-red-200 rounded text-red-700 text-xs">{error}</div>
-                )}
-                {isLoading && (
-                    <div className="mb-3 p-2 bg-gray-50 border border-gray-200 rounded text-gray-600 text-xs">Loading details...</div>
-                )}
-
-                <ErrorBoundary>
-                    <DataOutputProvider
-                        initialData={initialData}
-                        csvData={csvData}
-                        onPageChange={handlePageChange}
-                        onPageSizeChange={handlePageSizeChange}
-                        currentPage={currentPage}
-                        pageSize={pageSize}
-                    >
-                        <ColumnResizeProvider>
-                            <div style={{ height: 'calc(100vh - 140px)' }}>
-                                <DataOutputContent height="calc(100vh - 140px)" />
-                            </div>
-                        </ColumnResizeProvider>
-                    </DataOutputProvider>
-                </ErrorBoundary>
-            </div>
-        </div>
-    );
-};
-
-export default SupervisoryDetailsPage;
-
-
-jsx validator
-
-            <style jsx global>{`
-                .config-grid-theme .ag-menu,
-                .config-grid-theme .ag-popup,
-                .config-grid-theme .ag-filter {
-                    min-width: 320px;
-                }
-                .config-grid-theme .ag-filter,
-                .config-grid-theme .ag-filter-body {
-                    padding: 12px 12px 10px 12px;
-                }
-                .config-grid-theme .ag-filter-apply-panel {
-                    padding-top: 8px;
-                    gap: 8px;
-                }
-                .config-grid-theme .ag-input-field-input,
-                .config-grid-theme .ag-filter-filter,
-                .config-grid-theme .ag-mini-filter,
-                .config-grid-theme .ag-picker-field-wrapper {
-                    border-radius: 8px;
-                    border: 1px solid #e2e8f0;
-                    background: #f8fafc;
-                    padding: 6px 10px;
-                    font-size: 13px;
-                }
-                .config-grid-theme .ag-input-field-input:focus,
-                .config-grid-theme .ag-filter-filter:focus,
-                .config-grid-theme .ag-mini-filter:focus {
-                    outline: none;
-                    border-color: #ef4444;
-                    box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.18);
-                    background: #fff;
-                }
-                .config-grid-theme .ag-filter-select,
-                .config-grid-theme .ag-picker-field-display {
-                    border-radius: 8px;
-                    background: #f8fafc;
-                }
-                .config-grid-theme .ag-filter-apply-panel .ag-standard-button {
-                    border-radius: 8px;
-                    background: #111827;
-                    color: #fff;
-                    border: none;
-                    padding: 6px 12px;
-                }
-                .config-grid-theme .ag-filter-apply-panel .ag-standard-button:hover {
-                    background: #1f2937;
-                }
-                .config-grid-theme .ag-filter-apply-panel .ag-standard-button:disabled {
-                    background: #9ca3af;
-                }
-            `}</style>
-
-
-page
-
-
-            {/* Feature 13 - Supervisory Dashboard */}
-            <div
-              onClick={openSupervisoryDashboard}
-              className="group rounded-lg border border-slate-200 p-6 transition-all duration-300 ease-in-out bg-white hover:scale-105 hover:shadow-xl hover:shadow-slate-700/10 cursor-pointer transform-gpu"
-            >
-              <div className="flex items-center gap-4 mb-4">
-                <div className="p-3 rounded-lg bg-white text-red-500 transition-colors">
-                  <FaChartBar size={32} />
-                </div>
-                <h3 className="text-lg font-semibold text-black">SUPERVISORY DASHBOARD</h3>
-              </div>
-              <p className="mt-2 text-black">
-                Monitor unremediated controls by regulation, asset class, and control type. View age bucket analysis with pivot-table style aggregations.
-              </p>
-            </div>
-
-globals
-
-
-/* Supervisory dashboard cell actions */
-.supervisory-cell {
-  position: relative;
-  width: 100%;
-  height: 100%;
-  display: flex;
-  align-items: center;
-  padding-right: 20px;
-}
-
-.supervisory-cell-value {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  width: 100%;
-}
-
-.supervisory-cell-action {
-  opacity: 0;
-  position: absolute;
-  right: 2px;
-  top: 50%;
-  transform: translateY(-50%);
-  font-size: 11px;
-  padding: 2px 4px;
-  border-radius: 4px;
-  border: 1px solid #cbd5e1;
-  background: #ffffff;
-  color: #0f172a;
-  transition: opacity 0.15s ease, background 0.15s ease, border-color 0.15s ease;
-}
-
-.ag-cell:hover .supervisory-cell-action {
-  opacity: 1;
-}
-
-.supervisory-cell-action:hover {
-  background: #f1f5f9;
-  border-color: #94a3b8;
-}
-
-
-app
-
-import SupervisoryDashboardPage from './controls/supervisory-dashboard/page';
-import SupervisoryDetailsPage from './controls/supervisory-dashboard/details-page';
-
-<Route path="/supervisory-dashboard" element={<SupervisoryDashboardPage />} />
-<Route path="/supervisory-dashboard/details" element={<SupervisoryDetailsPage />} />
-
