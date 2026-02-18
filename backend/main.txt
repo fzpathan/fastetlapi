@@ -1,3 +1,1416 @@
+Parquet Service
+"""
+Parquet Service - High-performance data access using Polars and PyArrow
+Uses lazy loading (scan_parquet) to read only required data into memory
+Much faster and more memory-efficient than CSV + Pandas
+"""
+
+import os
+import polars as pl
+import pyarrow.parquet as pq
+import logging
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+# Data directory configuration
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+class ParquetService:
+    """Service for reading Parquet files with pagination and metadata using Polars"""
+    
+    def __init__(self):
+        self.data_dir = DATA_DIR
+        self.cache = {}  # Minimal cache for metadata only
+        self.cache_ttl = 300  # 5 minutes cache TTL
+    
+    def validate_file_path(self, file_path: str) -> bool:
+        """Validate that a file path exists and is accessible"""
+        try:
+            if not file_path:
+                logger.warning("No file path provided")
+                return False
+            
+            # Normalize path separators for cross-platform compatibility
+            normalized_path = file_path.replace('\\', '/')
+            
+            # Convert .csv to .parquet if needed
+            if normalized_path.endswith('.csv'):
+                normalized_path = normalized_path.replace('.csv', '.parquet')
+            
+            logger.info(f"Validating file path: {normalized_path}")
+                
+            if not os.path.exists(normalized_path):
+                logger.warning(f"File not found: {normalized_path}")
+                # List files in the directory to help debug
+                dir_path = os.path.dirname(normalized_path)
+                if os.path.exists(dir_path):
+                    files_in_dir = os.listdir(dir_path)
+                    logger.info(f"Files in directory {dir_path}: {files_in_dir}")
+                return False
+                
+            logger.info(f"File validated: {normalized_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Error validating file path {file_path}: {e}")
+            return False
+    
+    def normalize_path(self, file_path: str) -> str:
+        """Normalize path and convert CSV to Parquet extension"""
+        normalized = file_path.replace('\\', '/')
+        if normalized.endswith('.csv'):
+            normalized = normalized.replace('.csv', '.parquet')
+        return normalized
+    
+    def get_file_metadata(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """Get detailed metadata for a specific Parquet file using PyArrow"""
+        try:
+            normalized_path = self.normalize_path(file_path)
+            
+            if not self.validate_file_path(normalized_path):
+                return None
+                
+            # Check cache first
+            cache_key = f"metadata:{normalized_path}"
+            if cache_key in self.cache:
+                cached_data, timestamp = self.cache[cache_key]
+                if (datetime.now() - timestamp).seconds < self.cache_ttl:
+                    return cached_data
+            
+            # Read Parquet metadata using PyArrow (very fast, no data loading)
+            file_stat = os.stat(normalized_path)
+            parquet_file = pq.ParquetFile(normalized_path)
+            
+            # Get schema information
+            schema = parquet_file.schema_arrow
+            columns = schema.names
+            
+            # Get row count from metadata
+            total_rows = parquet_file.metadata.num_rows
+            
+            metadata = {
+                "filename": os.path.basename(normalized_path),
+                "file_path": normalized_path,
+                "source": "parquet",
+                "size_bytes": file_stat.st_size,
+                "size_mb": round(file_stat.st_size / (1024 * 1024), 2),
+                "modified_at": datetime.fromtimestamp(file_stat.st_mtime).isoformat(),
+                "created_at": datetime.fromtimestamp(file_stat.st_ctime).isoformat(),
+                "columns": columns,
+                "column_count": len(columns),
+                "total_rows": total_rows,
+                "num_row_groups": parquet_file.metadata.num_row_groups,
+                "compression": parquet_file.metadata.row_group(0).column(0).compression if parquet_file.metadata.num_row_groups > 0 else "NONE"
+            }
+            
+            # Cache the result
+            self.cache[cache_key] = (metadata, datetime.now())
+            
+            logger.info(f"File metadata for {normalized_path}: {metadata['column_count']} columns, {metadata['total_rows']} rows, {metadata['size_mb']} MB")
+            return metadata
+            
+        except Exception as e:
+            logger.error(f"Error getting file metadata for {file_path}: {e}")
+            return None
+    
+    def read_parquet_paginated(
+        self, 
+        file_path: str, 
+        page: int = 1, 
+        page_size: int = 100,
+        sort_column: Optional[str] = None,
+        sort_direction: str = "asc",
+        filters: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Read Parquet file with pagination using Polars lazy loading
+        This reads ONLY the required data into memory - very efficient!
+        """
+        try:
+            normalized_path = self.normalize_path(file_path)
+            logger.info(f"read_parquet_paginated called with file_path: {normalized_path}")
+            
+            if not self.validate_file_path(normalized_path):
+                return {
+                    "error": f"File not found: {normalized_path}",
+                    "data": [],
+                    "columns": [],
+                    "pagination": {
+                        "current_page": page,
+                        "page_size": page_size,
+                        "total_rows": 0,
+                        "total_pages": 0,
+                        "has_next": False,
+                        "has_previous": False
+                    }
+                }
+            
+            # Start with lazy loading - NO DATA READ YET!
+            logger.info(f"Using Polars lazy loading (scan_parquet) for: {normalized_path}")
+            lazy_df = pl.scan_parquet(normalized_path)
+            
+            # Get total row count efficiently (from metadata)
+            parquet_file = pq.ParquetFile(normalized_path)
+            total_rows = parquet_file.metadata.num_rows
+            columns = parquet_file.schema_arrow.names
+            
+            logger.info(f"Total rows in Parquet: {total_rows}")
+            
+            # Apply filters if specified (still lazy!)
+            if filters:
+                for column, filter_value in filters.items():
+                    if column in columns and filter_value:
+                        if isinstance(filter_value, str):
+                            lazy_df = lazy_df.filter(pl.col(column).str.contains(filter_value))
+                        else:
+                            lazy_df = lazy_df.filter(pl.col(column) == filter_value)
+                logger.info(f"Applied filters (lazy)")
+            
+            # Apply sorting if specified (still lazy!)
+            if sort_column and sort_column in columns:
+                descending = sort_direction.lower() == "desc"
+                lazy_df = lazy_df.sort(sort_column, descending=descending)
+                logger.info(f"Sorted by {sort_column} ({sort_direction}) - lazy")
+            
+            # Recompute total rows after filters so pagination remains accurate
+            if filters:
+                total_rows = lazy_df.select(pl.count()).collect(streaming=True).item()
+
+            # Calculate pagination
+            total_pages = (total_rows + page_size - 1) // page_size if total_rows > 0 else 1
+            start_idx = (page - 1) * page_size
+            
+            # NOW we execute and fetch ONLY the required page!
+            # This is where Polars shines - it only reads what's needed
+            logger.info(f"Fetching page {page} ({page_size} rows) - executing lazy query now...")
+            
+            page_data = (
+                lazy_df
+                .slice(start_idx, page_size)  # Only fetch this slice
+                .collect(streaming=True)  # Execute query and load ONLY this data
+            )
+            
+            logger.info(f"Polars loaded {len(page_data)} rows into memory (page {page}/{total_pages})")
+            
+            # Convert to JSON-safe format
+            data = page_data.to_dicts()
+            
+            result = {
+                "data": data,
+                "columns": columns,
+                "pagination": {
+                    "current_page": page,
+                    "page_size": page_size,
+                    "total_rows": total_rows,
+                    "total_pages": total_pages,
+                    "has_next": page < total_pages,
+                    "has_previous": page > 1
+                }
+            }
+            
+            logger.info(f"Successfully returned {len(data)} rows from {normalized_path} (page {page}/{total_pages})")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error reading Parquet file {file_path}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {
+                "error": f"Error reading file: {str(e)}",
+                "data": [],
+                "columns": [],
+                "pagination": {
+                    "current_page": page,
+                    "page_size": page_size,
+                    "total_rows": 0,
+                    "total_pages": 0,
+                    "has_next": False,
+                    "has_previous": False
+                }
+            }
+    
+    def get_column_unique_values(
+        self, 
+        file_path: str, 
+        column_name: str,
+        limit: int = 5000,
+        search_term: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Get unique values for a column with optional limit and search
+        Uses Polars for efficient streaming with early exit
+        
+        Args:
+            file_path: Path to parquet file
+            column_name: Column to get unique values from
+            limit: Maximum number of unique values to return (default: 5000)
+            search_term: Optional search term to filter values
+        
+        Returns:
+            Dict with unique values, count, and metadata
+        """
+        try:
+            normalized_path = self.normalize_path(file_path)
+            
+            if not self.validate_file_path(normalized_path):
+                return {
+                    "error": f"File not found: {normalized_path}",
+                    "values": [],
+                    "count": 0,
+                    "limited": False
+                }
+            
+            # Check cache first
+            cache_key = f"unique_values:{normalized_path}:{column_name}:{limit}:{search_term}"
+            if cache_key in self.cache:
+                cached_data, timestamp = self.cache[cache_key]
+                if (datetime.now() - timestamp).seconds < self.cache_ttl:
+                    logger.info(f"Returning cached unique values for {column_name}")
+                    return cached_data
+            
+            logger.info(f"Getting unique values for column '{column_name}' (limit: {limit})")
+            start_time = datetime.now()
+            
+            # Use lazy loading to read data efficiently
+            lazy_df = pl.scan_parquet(normalized_path)
+            
+            # Select only the column we need (reduces memory usage)
+            lazy_df = lazy_df.select(pl.col(column_name))
+            
+            # Apply search filter if provided (still lazy)
+            if search_term:
+                lazy_df = lazy_df.filter(
+                    pl.col(column_name).cast(pl.Utf8).str.contains(search_term, literal=False)
+                )
+            
+            # Get unique values - collect to get count
+            unique_df = lazy_df.unique().collect()
+            
+            total_unique = len(unique_df)
+            limited = total_unique > limit
+            
+            # Take only the first 'limit' values
+            if limited:
+                unique_df = unique_df.head(limit)
+                logger.warning(f"Column {column_name} has {total_unique} unique values, limited to {limit}")
+            
+            # Convert to list and handle nulls
+            values = []
+            for value in unique_df[column_name].to_list():
+                if value is None or (isinstance(value, str) and value.strip() == ''):
+                    values.append('(Blanks)')
+                else:
+                    values.append(str(value))
+            
+            # Sort values for better UX
+            values.sort()
+            
+            elapsed_time = (datetime.now() - start_time).total_seconds()
+            
+            result = {
+                "values": values,
+                "count": len(values),
+                "total_unique": total_unique,
+                "limited": limited,
+                "column_name": column_name,
+                "search_term": search_term,
+                "processing_time_ms": round(elapsed_time * 1000, 2)
+            }
+            
+            # Cache the result
+            self.cache[cache_key] = (result, datetime.now())
+            
+            logger.info(f"Retrieved {len(values)} unique values for {column_name} in {elapsed_time:.2f}s")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting unique values for {column_name}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {
+                "error": f"Error getting unique values: {str(e)}",
+                "values": [],
+                "count": 0,
+                "limited": False
+            }
+    
+    def get_column_statistics(self, file_path: str, column_name: str) -> Optional[Dict[str, Any]]:
+        """Get statistics for a specific column using Polars lazy loading"""
+        try:
+            normalized_path = self.normalize_path(file_path)
+            
+            if not self.validate_file_path(normalized_path):
+                return None
+                
+            # Check cache first
+            cache_key = f"stats:{normalized_path}:{column_name}"
+            if cache_key in self.cache:
+                cached_data, timestamp = self.cache[cache_key]
+                if (datetime.now() - timestamp).seconds < self.cache_ttl:
+                    return cached_data
+            
+            # Use lazy loading for efficient stats calculation
+            logger.info(f"Calculating statistics for column '{column_name}' using lazy loading...")
+            
+            lazy_df = pl.scan_parquet(normalized_path)
+            
+            # Calculate stats lazily and collect only the results
+            stats_df = (
+                lazy_df
+                .select([
+                    pl.col(column_name).count().alias('total_count'),
+                    pl.col(column_name).null_count().alias('null_count'),
+                    pl.col(column_name).n_unique().alias('unique_count'),
+                ])
+                .collect()
+            )
+            
+            # Get most common values (top 5)
+            most_common_df = (
+                lazy_df
+                .select(column_name)
+                .group_by(column_name)
+                .agg(pl.count().alias('count'))
+                .sort('count', descending=True)
+                .head(5)
+                .collect()
+            )
+            
+            stats = {
+                "column_name": column_name,
+                "total_count": stats_df['total_count'][0],
+                "null_count": stats_df['null_count'][0],
+                "non_null_count": stats_df['total_count'][0] - stats_df['null_count'][0],
+                "unique_count": stats_df['unique_count'][0],
+                "most_common": {
+                    str(row[column_name]): row['count'] 
+                    for row in most_common_df.to_dicts()
+                }
+            }
+            
+            # Cache the result
+            self.cache[cache_key] = (stats, datetime.now())
+            
+            logger.info(f"Column statistics for {column_name}: {stats['unique_count']} unique values")
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting column statistics for {column_name} in {file_path}: {e}")
+            return None
+    
+    def search_in_file(self, file_path: str, query: str, column: Optional[str] = None, limit: int = 5000) -> Dict[str, Any]:
+        """Search for a query in the Parquet file using lazy loading"""
+        try:
+            normalized_path = self.normalize_path(file_path)
+            
+            if not self.validate_file_path(normalized_path):
+                return {
+                    "error": f"File not found: {normalized_path}",
+                    "results": [],
+                    "total_matches": 0
+                }
+            
+            # Use lazy loading for search
+            logger.info(f"Searching for '{query}' using lazy loading...")
+            lazy_df = pl.scan_parquet(normalized_path)
+            
+            # Perform search
+            if column:
+                # Search in specific column
+                results_df = (
+                    lazy_df
+                    .filter(pl.col(column).cast(pl.Utf8).str.contains(query, literal=False))
+                    .limit(limit)  # Apply 5000 limit for performance
+                    .collect()
+                )
+            else:
+                # Search in all string columns
+                # Get schema to identify string columns
+                parquet_file = pq.ParquetFile(normalized_path)
+                schema = parquet_file.schema_arrow
+                
+                # Build OR condition for all string/text columns
+                filter_conditions = []
+                for field in schema:
+                    col_name = field.name
+                    try:
+                        filter_conditions.append(
+                            pl.col(col_name).cast(pl.Utf8).str.contains(query, literal=False)
+                        )
+                    except:
+                        # Skip columns that can't be cast to string
+                        pass
+                
+                if filter_conditions:
+                    combined_filter = filter_conditions[0]
+                    for condition in filter_conditions[1:]:
+                        combined_filter = combined_filter | condition
+                    
+                    results_df = (
+                        lazy_df
+                        .filter(combined_filter)
+                        .limit(limit)  # Apply 5000 limit for performance
+                        .collect()
+                    )
+                else:
+                    results_df = pl.DataFrame()
+            
+            # Convert to JSON-safe format
+            results = results_df.to_dicts()
+            
+            # Check if results were limited
+            limited = len(results) >= limit
+            if limited:
+                logger.warning(f"Search results limited to {limit} rows for performance")
+            
+            logger.info(f"Search '{query}' in {normalized_path}: {len(results)} matches{' (limited)' if limited else ''}")
+            return {
+                "results": results,
+                "total_matches": len(results),
+                "query": query,
+                "column": column,
+                "limit_applied": limit,
+                "results_limited": limited
+            }
+            
+        except Exception as e:
+            logger.error(f"Error searching in file {file_path}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {
+                "error": f"Error searching file: {str(e)}",
+                "results": [],
+                "total_matches": 0
+            }
+    
+    def clear_cache(self):
+        """Clear the cache"""
+        self.cache.clear()
+        logger.info("Parquet service cache cleared")
+
+# Global instance
+parquet_service = ParquetService()
+
+ConfigSearch
+"""
+Config Search Router
+Provides search functionality across configuration parquet files (COMP, QA)
+"""
+from fastapi import APIRouter, HTTPException
+from typing import Optional, List
+from datetime import datetime
+import logging
+from pathlib import Path
+import sys
+import json
+import subprocess
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from .utils import make_json_safe
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/config-search", tags=["config-search"])
+PARQUET_SUBPROCESS_TIMEOUT_SECONDS = 300
+
+# Base directory for search data
+SEARCH_DATA_DIR = Path(__file__).parent.parent / "data" / "search_data"
+
+# Available sheets (parquet files without extension)
+AVAILABLE_SHEETS = ["InputFiles", "rules", "Enrichment", "FieldOperations", "OutputRule"]
+
+
+def _run_parquet_subprocess(mode: str, request: dict):
+    script_path = Path(__file__).with_name("parquet_sub.py")
+    payload = {"mode": mode, "request": request}
+    proc = subprocess.run(
+        [sys.executable, str(script_path)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        timeout=PARQUET_SUBPROCESS_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if proc.returncode != 0:
+        logger.error(f"Parquet subprocess failed ({mode}): stdout={proc.stdout} stderr={proc.stderr}")
+        raise HTTPException(status_code=500, detail=f"Parquet subprocess failed ({mode})")
+
+    try:
+        response = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        logger.error(f"Invalid JSON from parquet subprocess ({mode}): {proc.stdout}")
+        raise HTTPException(status_code=500, detail=f"Invalid parquet subprocess response ({mode})")
+
+    if not response.get("success", False):
+        logger.error(f"Parquet subprocess error payload ({mode}): {response}")
+        raise HTTPException(status_code=500, detail=response.get("error", f"Parquet subprocess error ({mode})"))
+
+    return response.get("result")
+
+
+def get_available_types() -> List[str]:
+    """Get list of available types (directories in search_data)"""
+    types = []
+    if SEARCH_DATA_DIR.exists():
+        for item in SEARCH_DATA_DIR.iterdir():
+            if item.is_dir() and item.name not in ["API", "__pycache__"]:
+                # Check if directory has any parquet files
+                parquet_files = list(item.glob("*.parquet"))
+                if parquet_files:
+                    types.append(item.name)
+    return sorted(types)
+
+
+def get_file_path(type_name: str, sheet_name: str) -> Path:
+    """Build file path for a type and sheet combination"""
+    return SEARCH_DATA_DIR / type_name / f"{sheet_name}.parquet"
+
+
+@router.get("/types")
+async def get_types():
+    """Get available config types (COMP, QA, etc.)"""
+    try:
+        types = get_available_types()
+        return {
+            "success": True,
+            "types": types,
+            "retrieved_at": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error getting types: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sheets")
+async def get_sheets(type_name: Optional[str] = None):
+    """Get available sheets for a type (or all available sheets)"""
+    try:
+        if type_name:
+            # Get sheets available for this specific type
+            type_dir = SEARCH_DATA_DIR / type_name
+            if not type_dir.exists():
+                return {
+                    "success": False,
+                    "error": f"Type '{type_name}' not found",
+                    "sheets": []
+                }
+
+            sheets = []
+            for sheet in AVAILABLE_SHEETS:
+                file_path = type_dir / f"{sheet}.parquet"
+                if file_path.exists():
+                    sheets.append(sheet)
+        else:
+            # Return all known sheets
+            sheets = AVAILABLE_SHEETS.copy()
+
+        return {
+            "success": True,
+            "sheets": sheets,
+            "type": type_name,
+            "retrieved_at": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error getting sheets: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/columns")
+def get_columns(type_name: str, sheet: str):
+    """Get column names for a specific type and sheet"""
+    try:
+        file_path = get_file_path(type_name, sheet)
+
+        if not file_path.exists():
+            return {
+                "success": False,
+                "error": f"File not found: {type_name}/{sheet}.parquet",
+                "columns": []
+            }
+
+        metadata = _run_parquet_subprocess("metadata", {"file_path": str(file_path)})
+
+        if metadata:
+            return {
+                "success": True,
+                "columns": metadata.get("columns", []),
+                "type": type_name,
+                "sheet": sheet,
+                "total_rows": metadata.get("total_rows", 0),
+                "retrieved_at": datetime.now().isoformat()
+            }
+        else:
+            return {
+                "success": False,
+                "error": "Could not read file metadata",
+                "columns": []
+            }
+    except Exception as e:
+        logger.error(f"Error getting columns: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("")
+def search_config(
+    type_name: str,
+    sheet: str,
+    query: str,
+    column: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    limit: int = 5000
+):
+    """
+    Search configuration data in parquet files
+
+    Args:
+        type_name: Config type (COMP, QA)
+        sheet: Sheet name (InputFiles, rules, etc.)
+        query: Search query (supports regex)
+        column: Optional column to search in (None = search all columns)
+        page: Page number for pagination
+        page_size: Number of results per page
+        limit: Maximum total results to return
+    """
+    try:
+        if not query or len(query.strip()) == 0:
+            raise HTTPException(status_code=400, detail="Search query cannot be empty")
+
+        file_path = get_file_path(type_name, sheet)
+
+        if not file_path.exists():
+            return {
+                "success": False,
+                "error": f"File not found: {type_name}/{sheet}.parquet",
+                "results": [],
+                "columns": [],
+                "total_matches": 0
+            }
+
+        # Use parquet service to search
+        search_result = _run_parquet_subprocess(
+            "search",
+            {
+                "file_path": str(file_path),
+                "query": query.strip(),
+                "column": column,
+                "limit": limit,
+            },
+        )
+
+        # Get columns for the response
+        metadata = _run_parquet_subprocess("metadata", {"file_path": str(file_path)})
+        columns = metadata.get("columns", []) if metadata else []
+
+        # Apply pagination to results
+        results = search_result.get("results", [])
+        total_matches = len(results)
+
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_results = results[start_idx:end_idx]
+
+        total_pages = (total_matches + page_size - 1) // page_size if total_matches > 0 else 0
+
+        response = {
+            "success": True,
+            "results": paginated_results,
+            "columns": columns,
+            "total_matches": total_matches,
+            "query": query.strip(),
+            "type": type_name,
+            "sheet": sheet,
+            "searched_column": column,
+            "pagination": {
+                "current_page": page,
+                "page_size": page_size,
+                "total_rows": total_matches,
+                "total_pages": total_pages,
+                "has_next": page < total_pages,
+                "has_previous": page > 1
+            },
+            "results_limited": search_result.get("results_limited", False),
+            "limit_applied": search_result.get("limit_applied", limit),
+            "retrieved_at": datetime.now().isoformat()
+        }
+
+        return make_json_safe(response)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error searching config: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/all-data")
+def get_all_data(
+    type_name: str,
+    sheet: str,
+    page: int = 1,
+    page_size: int = 50,
+    sort_column: Optional[str] = None,
+    sort_direction: str = "asc"
+):
+    """
+    Get all data from a config file with pagination (no search filter)
+    Useful for browsing all records
+    """
+    try:
+        file_path = get_file_path(type_name, sheet)
+
+        if not file_path.exists():
+            return {
+                "success": False,
+                "error": f"File not found: {type_name}/{sheet}.parquet",
+                "data": [],
+                "columns": []
+            }
+
+        # Use parquet service to read paginated data
+        data = _run_parquet_subprocess(
+            "read_paginated",
+            {
+                "file_path": str(file_path),
+                "page": page,
+                "page_size": page_size,
+                "sort_column": sort_column,
+                "sort_direction": sort_direction,
+            },
+        )
+
+        response = {
+            "success": True,
+            "data": data.get("data", []),
+            "columns": data.get("columns", []),
+            "pagination": data.get("pagination", {}),
+            "type": type_name,
+            "sheet": sheet,
+            "retrieved_at": datetime.now().isoformat()
+        }
+
+        if "error" in data:
+            response["error"] = data["error"]
+            response["success"] = False
+
+        return make_json_safe(response)
+
+    except Exception as e:
+        logger.error(f"Error getting all data: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+data.py
+
+"""
+Data/Parquet Router
+Handles Parquet file operations and legacy CSV endpoints
+"""
+from fastapi import APIRouter, HTTPException
+from typing import Optional
+from datetime import datetime
+import logging
+import sys
+from pathlib import Path
+import json
+import subprocess
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from parquet_service import parquet_service
+from .utils import make_json_safe
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="", tags=["data"])
+PARQUET_SUBPROCESS_TIMEOUT_SECONDS = 300
+
+
+def _run_parquet_subprocess(mode: str, request: dict):
+    script_path = Path(__file__).with_name("parquet_sub.py")
+    payload = {"mode": mode, "request": request}
+    proc = subprocess.run(
+        [sys.executable, str(script_path)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        timeout=PARQUET_SUBPROCESS_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if proc.returncode != 0:
+        logger.error(f"Parquet subprocess failed ({mode}): stdout={proc.stdout} stderr={proc.stderr}")
+        raise HTTPException(status_code=500, detail=f"Parquet subprocess failed ({mode})")
+
+    try:
+        response = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        logger.error(f"Invalid JSON from parquet subprocess ({mode}): {proc.stdout}")
+        raise HTTPException(status_code=500, detail=f"Invalid parquet subprocess response ({mode})")
+
+    if not response.get("success", False):
+        logger.error(f"Parquet subprocess error payload ({mode}): {response}")
+        raise HTTPException(status_code=500, detail=response.get("error", f"Parquet subprocess error ({mode})"))
+
+    return response.get("result")
+
+
+@router.get("/data/metadata")
+def get_file_metadata(file_path: str):
+    """Get detailed metadata for a specific Parquet file using direct file path"""
+    try:
+        metadata = _run_parquet_subprocess("metadata", {"file_path": file_path})
+        if metadata:
+            result = {
+                "success": True,
+                "metadata": metadata,
+                "retrieved_at": datetime.now().isoformat()
+            }
+        else:
+            result = {
+                "success": False,
+                "error": f"File not found or inaccessible: {file_path}",
+                "retrieved_at": datetime.now().isoformat()
+            }
+        return make_json_safe(result)
+    except Exception as e:
+        logger.error(f"Error getting file metadata: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/data/records")
+def get_data_records(
+    file_path: str,
+    page: int = 1,
+    page_size: int = 100,
+    sort_column: Optional[str] = None,
+    sort_direction: str = "asc"
+):
+    """Get Parquet data with pagination using Polars lazy loading - ONLY reads required page!"""
+    try:
+        logger.info(f"Fetching data with Polars (file: {file_path}, page: {page}, size: {page_size})")
+        
+        data = _run_parquet_subprocess(
+            "read_paginated",
+            {
+                "file_path": file_path,
+                "page": page,
+                "page_size": page_size,
+                "sort_column": sort_column,
+                "sort_direction": sort_direction,
+            },
+        )
+        
+        result = {
+            "success": True,
+            "data": data.get("data", []),
+            "columns": data.get("columns", []),
+            "pagination": data.get("pagination", {}),
+            "retrieved_at": datetime.now().isoformat(),
+            "engine": "polars"
+        }
+        
+        if "error" in data:
+            result["error"] = data["error"]
+            result["success"] = False
+        
+        return make_json_safe(result)
+    except Exception as e:
+        logger.error(f"Error getting data: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/data/column-stats")
+def get_column_statistics(file_path: str, column_name: str):
+    """Get statistics for a specific column in a Parquet file using Polars"""
+    try:
+        stats = _run_parquet_subprocess(
+            "column_stats",
+            {"file_path": file_path, "column_name": column_name},
+        )
+        if stats:
+            result = {
+                "success": True,
+                "stats": stats,
+                "retrieved_at": datetime.now().isoformat(),
+                "engine": "polars"
+            }
+        else:
+            result = {
+                "success": False,
+                "error": f"Column {column_name} not found in {file_path}",
+                "retrieved_at": datetime.now().isoformat()
+            }
+        return make_json_safe(result)
+    except Exception as e:
+        logger.error(f"Error getting column statistics: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/data/column-values")
+def get_column_unique_values(
+    file_path: str,
+    column_name: str,
+    limit: int = 5000,
+    search_term: Optional[str] = None
+):
+    """
+    Get unique values for a specific column with optional limit and search
+    Optimized for large datasets - streams only requested values
+    """
+    try:
+        logger.info(f"Get unique values request: {column_name} from {file_path} (limit: {limit})")
+        
+        result = _run_parquet_subprocess(
+            "column_values",
+            {
+                "file_path": file_path,
+                "column_name": column_name,
+                "limit": limit,
+                "search_term": search_term,
+            },
+        )
+        
+        if "error" in result:
+            result["success"] = False
+        else:
+            result["success"] = True
+        
+        result["retrieved_at"] = datetime.now().isoformat()
+        result["engine"] = "polars"
+        
+        return make_json_safe(result)
+        
+    except Exception as e:
+        logger.error(f"Error in get_column_unique_values endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/data/search")
+def search_data(file_path: str, query: str, column: Optional[str] = None, limit: int = 5000):
+    """Search for a term in Parquet file using Polars lazy loading"""
+    try:
+        if not query or len(query.strip()) == 0:
+            raise HTTPException(status_code=400, detail="Search query cannot be empty")
+        
+        result = _run_parquet_subprocess(
+            "search",
+            {
+                "file_path": file_path,
+                "query": query.strip(),
+                "column": column,
+                "limit": limit,
+            },
+        )
+        
+        result["engine"] = "polars"
+        return make_json_safe(result)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error searching data: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/data/cache/clear")
+def clear_data_cache():
+    """Clear the Parquet service cache"""
+    try:
+        parquet_service.clear_cache()
+        return {
+            "success": True,
+            "message": "Parquet service cache cleared successfully",
+            "cleared_at": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error clearing cache: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Legacy CSV endpoints for backward compatibility (redirect to Parquet)
+@router.get("/csv/metadata")
+def get_csv_file_metadata_legacy(file_path: str):
+    """Legacy CSV endpoint - redirects to Parquet service"""
+    return get_file_metadata(file_path)
+
+
+@router.get("/csv/data")
+def get_csv_data_legacy(
+    file_path: str,
+    page: int = 1,
+    page_size: int = 100,
+    sort_column: Optional[str] = None,
+    sort_direction: str = "asc"
+):
+    """Legacy CSV endpoint - redirects to Parquet service"""
+    return get_data_records(file_path, page, page_size, sort_column, sort_direction)
+
+
+@router.get("/csv/column-stats")
+def get_csv_column_statistics_legacy(file_path: str, column_name: str):
+    """Legacy CSV endpoint - redirects to Parquet service"""
+    return get_column_statistics(file_path, column_name)
+
+
+@router.get("/csv/search")
+def search_csv_data_legacy(file_path: str, query: str, column: Optional[str] = None, limit: int = 5000):
+    """Legacy CSV endpoint - redirects to Parquet service"""
+    return search_data(file_path, query, column, limit)
+
+
+@router.post("/csv/cache/clear")
+def clear_csv_cache_legacy():
+    """Legacy CSV endpoint - redirects to Parquet service"""
+    return clear_data_cache()
+
+"""
+System Monitoring Router
+Handles CPU, memory, and system monitoring data
+"""
+from collections import deque
+from fastapi import APIRouter, HTTPException, Query
+from typing import Optional
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import re
+import logging
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/monitoring", tags=["monitoring"])
+
+RANGE_WINDOWS = {
+    "1h": timedelta(hours=1),
+    "6h": timedelta(hours=6),
+    "12h": timedelta(hours=12),
+    "24h": timedelta(hours=24),
+}
+
+CPU_RE = re.compile(r"CPU:\s+([\d.]+)%")
+FREQ_RE = re.compile(r"Freq:\s+([\d.]+)MHz")
+LOAD_RE = re.compile(r"Load:\s+([\d.]+)/([\d.]+)/([\d.]+)")
+MEM_PERCENT_RE = re.compile(r"MEM:\s+([\d.]+)%")
+MEM_USED_RE = re.compile(r"Used:\s+([\d.]+[A-Z]+)")
+MEM_AVAIL_RE = re.compile(r"Avail:\s+([\d.]+[A-Z]+)")
+MEM_TOTAL_RE = re.compile(r"Total:\s+([\d.]+[A-Z]+)")
+SWAP_RE = re.compile(r"SWAP:\s+([\d.]+)%")
+CORE_RE = re.compile(r"Per-Core:\s+\[(.*?)\]")
+
+
+def parse_memory_value(mem_str: Optional[str]) -> float:
+    """Parse memory string like '8.50GB' to bytes."""
+    if not mem_str:
+        return 0
+    units = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+    match = re.match(r"([\d.]+)([A-Z]+)", mem_str.strip())
+    if match:
+        value, unit = match.groups()
+        return float(value) * units.get(unit, 1)
+    return 0
+
+
+def parse_timestamp(timestamp_str: str) -> Optional[datetime]:
+    """
+    Parse timestamp in multiple formats and return timezone-aware UTC datetime.
+    """
+    try:
+        if "T" in timestamp_str:
+            parsed_dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        else:
+            parsed_dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+
+        if parsed_dt.tzinfo is None:
+            parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+        return parsed_dt.astimezone(timezone.utc)
+    except Exception as e:
+        logger.warning(f"Failed to parse timestamp '{timestamp_str}': {e}")
+        return None
+
+
+def resolve_log_path(log_file: Optional[str]) -> Path:
+    if log_file:
+        return Path(log_file)
+
+    default_log = Path("cpu_usage.log")
+    if default_log.exists():
+        return default_log
+    return Path("api/cpu_usage.log")
+
+
+def parse_monitoring_line(line: str) -> Optional[dict]:
+    stripped = line.strip()
+    if line.startswith("=") or not stripped or "Monitoring Started" in line:
+        return None
+
+    parts = stripped.split(" | ")
+    if len(parts) < 3:
+        return None
+
+    timestamp_dt = parse_timestamp(parts[0].strip())
+    if not timestamp_dt:
+        return None
+
+    cpu_match = CPU_RE.search(line)
+    freq_match = FREQ_RE.search(line)
+    load_match = LOAD_RE.search(line)
+    mem_percent_match = MEM_PERCENT_RE.search(line)
+    mem_used_match = MEM_USED_RE.search(line)
+    mem_avail_match = MEM_AVAIL_RE.search(line)
+    mem_total_match = MEM_TOTAL_RE.search(line)
+    swap_match = SWAP_RE.search(line)
+    core_match = CORE_RE.search(line)
+
+    core_usage = []
+    if core_match:
+        core_str = core_match.group(1).strip()
+        if core_str:
+            try:
+                core_usage = [float(x.strip().rstrip("%")) for x in core_str.split(",") if x.strip()]
+            except Exception:
+                core_usage = []
+
+    return {
+        "_timestamp_dt": timestamp_dt,
+        "record": {
+            "timestamp": timestamp_dt.isoformat(),
+            "cpu_percent": float(cpu_match.group(1)) if cpu_match else 0,
+            "frequency": float(freq_match.group(1)) if freq_match else 0,
+            "load_1min": float(load_match.group(1)) if load_match else 0,
+            "load_5min": float(load_match.group(2)) if load_match else 0,
+            "load_15min": float(load_match.group(3)) if load_match else 0,
+            "mem_percent": float(mem_percent_match.group(1)) if mem_percent_match else 0,
+            "mem_used": parse_memory_value(mem_used_match.group(1) if mem_used_match else None),
+            "mem_available": parse_memory_value(mem_avail_match.group(1) if mem_avail_match else None),
+            "mem_total": parse_memory_value(mem_total_match.group(1) if mem_total_match else None),
+            "swap_percent": float(swap_match.group(1)) if swap_match else 0,
+            "core_usage": core_usage,
+        },
+    }
+
+
+def downsample_records(data: list, max_points: int) -> list:
+    """Reduce payload size while preserving chronology."""
+    if len(data) <= max_points:
+        return data
+    step = max(1, len(data) // max_points)
+    sampled = data[::step]
+    return sampled[-max_points:]
+
+
+@router.get("/servers")
+def get_available_servers():
+    """
+    Get list of available monitoring log files (servers)
+    Looks for files matching pattern: *cpu_usage.log or *_monitoring.log
+    """
+    try:
+        # Look for monitoring log files in current directory and api directory
+        search_paths = [Path("."), Path("api")]
+        log_files = []
+        
+        for search_path in search_paths:
+            if not search_path.exists():
+                continue
+            
+            # Find all CPU monitoring log files
+            for pattern in ["*cpu_usage.log", "*_monitoring.log", "cpu_usage*.log"]:
+                for log_file in search_path.glob(pattern):
+                    if log_file.is_file():
+                        # Extract server name from filename
+                        filename = log_file.stem
+                        
+                        # Parse server name
+                        if filename == "cpu_usage":
+                            server_name = "Local Server"
+                        elif "_cpu_usage" in filename:
+                            server_name = filename.replace("_cpu_usage", "").replace("_", " ").title()
+                        elif "_monitoring" in filename:
+                            server_name = filename.replace("_monitoring", "").replace("_", " ").title()
+                        else:
+                            server_name = filename.replace("_", " ").title()
+                        
+                        log_files.append({
+                            "server_name": server_name,
+                            "log_file": str(log_file),
+                            "filename": log_file.name,
+                            "size_mb": round(log_file.stat().st_size / (1024 * 1024), 2),
+                            "modified_at": datetime.fromtimestamp(log_file.stat().st_mtime).isoformat()
+                        })
+        
+        # Remove duplicates and sort by name
+        unique_files = {f["log_file"]: f for f in log_files}
+        sorted_files = sorted(unique_files.values(), key=lambda x: x["server_name"])
+        
+        logger.info(f"Found {len(sorted_files)} monitoring log files")
+        
+        return {
+            "success": True,
+            "servers": sorted_files,
+            "total": len(sorted_files)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error listing monitoring servers: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("")
+def get_system_monitoring(
+    range: str = "1h",
+    log_file: Optional[str] = None,
+    max_points: int = Query(default=1200, ge=100, le=10000),
+):
+    """
+    Get system monitoring data (CPU, Memory, etc.)
+    Reads from specified log file and returns parsed data
+    
+    Query Parameters:
+        range: Time range (1h, 6h, 12h, 24h, all)
+        log_file: Path to log file (optional, defaults to cpu_usage.log)
+    """
+    try:
+        log_path = resolve_log_path(log_file)
+        
+        if not log_path.exists():
+            return {
+                "success": False,
+                "error": f"Monitoring log file not found: {log_path}. Please ensure the monitoring script is running.",
+                "data": [],
+                "range": range
+            }
+
+        requested_range = (range or "1h").lower()
+        if requested_range not in RANGE_WINDOWS and requested_range != "all":
+            logger.warning(f"Unknown range '{range}', defaulting to 1h")
+            requested_range = "1h"
+
+        cutoff = None
+        if requested_range in RANGE_WINDOWS:
+            cutoff = datetime.now(timezone.utc) - RANGE_WINDOWS[requested_range]
+
+        record_buffer = deque(maxlen=max_points) if requested_range == "all" else []
+        total_parsed = 0
+
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                parsed = parse_monitoring_line(line)
+                if not parsed:
+                    continue
+
+                total_parsed += 1
+                if cutoff and parsed["_timestamp_dt"] < cutoff:
+                    continue
+
+                record = parsed["record"]
+                if requested_range == "all":
+                    record_buffer.append(record)
+                else:
+                    record_buffer.append(record)
+
+        data = list(record_buffer)
+        if requested_range != "all":
+            data = downsample_records(data, max_points)
+        
+        logger.info(
+            f"Monitoring data fetched: returned={len(data)}, parsed={total_parsed}, "
+            f"range={requested_range}, max_points={max_points}, log={log_path.name}"
+        )
+        return {
+            "success": True,
+            "data": data,
+            "range": requested_range,
+            "log_file": str(log_path),
+            "log_filename": log_path.name,
+            "total_records": len(data),
+            "total_parsed": total_parsed,
+            "max_points": max_points,
+            "retrieved_at": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching monitoring data: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+parquet sub
+"""
+Subprocess worker for parquet service operations.
+Reads JSON payload from stdin and writes JSON response to stdout.
+"""
+
+from __future__ import annotations
+
+import json
+import traceback
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from parquet_service import parquet_service  # noqa: E402
+
+
+def run_operation(payload: dict) -> dict:
+    mode = payload.get("mode")
+    request = payload.get("request", {})
+
+    if mode == "metadata":
+        return parquet_service.get_file_metadata(request["file_path"])
+    if mode == "read_paginated":
+        return parquet_service.read_parquet_paginated(
+            file_path=request["file_path"],
+            page=request.get("page", 1),
+            page_size=request.get("page_size", 100),
+            sort_column=request.get("sort_column"),
+            sort_direction=request.get("sort_direction", "asc"),
+            filters=request.get("filters"),
+        )
+    if mode == "column_stats":
+        return parquet_service.get_column_statistics(
+            request["file_path"],
+            request["column_name"],
+        )
+    if mode == "column_values":
+        return parquet_service.get_column_unique_values(
+            file_path=request["file_path"],
+            column_name=request["column_name"],
+            limit=request.get("limit", 5000),
+            search_term=request.get("search_term"),
+        )
+    if mode == "search":
+        return parquet_service.search_in_file(
+            file_path=request["file_path"],
+            query=request["query"],
+            column=request.get("column"),
+            limit=request.get("limit", 5000),
+        )
+
+    raise ValueError(f"Unsupported mode: {mode}")
+
+
+def main() -> int:
+    try:
+        payload = json.loads(input())
+        result = run_operation(payload)
+        print(json.dumps({"success": True, "result": result}, default=str))
+        return 0
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "success": False,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+supervisory_sub
 """
 Subprocess worker for supervisory aggregations.
 Reads JSON from stdin and writes JSON to stdout.
@@ -32,6 +1445,11 @@ AGE_BUCKETS_BY_SET = {
 }
 DEFAULT_BUCKET_SET = "CFTC"
 AGE_BUCKET_COLUMNS = AGE_BUCKETS_BY_SET["CFTC"]
+DEFAULT_INITIAL_FILTERS = {
+    "regulation": ["CFTC-P45"],
+    "asset_class": ["FX"],
+    "data_type": ["TRADESTATE"],
+}
 
 AGE_BUCKET_SET_COLUMN_CANDIDATES = {
     "CFTC": {
@@ -146,6 +1564,59 @@ def apply_age_bucket_set(lazy_df: pl.LazyFrame, bucket_set: str) -> Tuple[pl.Laz
     raise ValueError(f"No age bucket columns available for set: {bucket_set} (Available: {available_sets})")
 
 
+def get_default_initial_filters(filter_options: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    defaults: Dict[str, List[str]] = {}
+    for key, configured_values in DEFAULT_INITIAL_FILTERS.items():
+        available_values = set(filter_options.get(key, []))
+        defaults[key] = [v for v in configured_values if v in available_values]
+    return defaults
+
+
+def build_filter_options_result(file_path: str) -> Dict[str, Any]:
+    lazy_df = pl.scan_parquet(file_path)
+    lazy_df = ensure_remediation_status(lazy_df)
+    schema_names = set(lazy_df.collect_schema().names())
+    available_bucket_sets = get_available_bucket_sets(schema_names)
+    default_bucket_set = DEFAULT_BUCKET_SET if DEFAULT_BUCKET_SET in available_bucket_sets else (
+        available_bucket_sets[0] if available_bucket_sets else DEFAULT_BUCKET_SET
+    )
+
+    filter_options: Dict[str, List[str]] = {}
+    for key, column_name in FILTER_COLUMNS.items():
+        try:
+            unique_values = (
+                lazy_df
+                .select(pl.col(column_name))
+                .unique()
+                .collect(streaming=True)
+                .to_series()
+                .to_list()
+            )
+            unique_values = sorted([v for v in unique_values if v is not None])
+            filter_options[key] = unique_values
+        except Exception:
+            filter_options[key] = []
+
+    parquet_file = pq.ParquetFile(file_path)
+    total_rows = parquet_file.metadata.num_rows
+
+    return {
+        "success": True,
+        "filter_options": filter_options,
+        "default_initial_filters": get_default_initial_filters(filter_options),
+        "bucket_sets": available_bucket_sets,
+        "default_bucket_set": default_bucket_set,
+        "total_records": total_rows,
+        "columns": list(FILTER_COLUMNS.keys()),
+        "age_buckets": AGE_BUCKETS_BY_SET.get(default_bucket_set, AGE_BUCKET_COLUMNS),
+        "age_buckets_by_set": AGE_BUCKETS_BY_SET,
+        "retrieved_at": datetime.now().isoformat(),
+        "_debug_info": {
+            "execution_mode": "subprocess",
+        },
+    }
+
+
 def build_aggregation_result(file_path: str, request: Dict[str, Any]) -> Dict[str, Any]:
     lazy_df = pl.scan_parquet(file_path)
     lazy_df = ensure_remediation_status(lazy_df)
@@ -255,12 +1726,100 @@ def build_aggregation_result(file_path: str, request: Dict[str, Any]) -> Dict[st
     }
 
 
+def build_details_result(file_path: str, request: Dict[str, Any]) -> Dict[str, Any]:
+    lazy_df = pl.scan_parquet(file_path)
+    lazy_df = ensure_remediation_status(lazy_df)
+    lazy_df, active_bucket_set, active_age_buckets = apply_age_bucket_set(
+        lazy_df, request.get("bucket_set", DEFAULT_BUCKET_SET)
+    )
+
+    applied_filters: List[str] = []
+    filters = request.get("filters") or {}
+    for filter_key, filter_values in filters.items():
+        if filter_values:
+            column_name = FILTER_COLUMNS.get(filter_key)
+            if column_name:
+                lazy_df = lazy_df.filter(pl.col(column_name).is_in(filter_values))
+                applied_filters.append(f"{column_name} in {filter_values}")
+
+    bucket = request.get("bucket")
+    if bucket and bucket in active_age_buckets:
+        lazy_df = lazy_df.filter(pl.col(bucket).cast(pl.Int64) == 1)
+        applied_filters.append(f"age_bucket={bucket}")
+
+    if request.get("bucket_scope") == "unremediated":
+        lazy_df = lazy_df.filter(pl.col("RemediationStatus") == "Unremediated")
+        applied_filters.append("scope=unremediated")
+
+    search_term = (request.get("search_term") or "").strip()
+    search_column = request.get("search_column")
+    if search_term and search_column:
+        physical_col = FILTER_COLUMNS.get(search_column, search_column)
+        lazy_df = lazy_df.filter(
+            pl.col(physical_col).cast(pl.Utf8).str.to_lowercase().str.contains(search_term.lower(), literal=True)
+        )
+        applied_filters.append(f"search: {search_column} contains '{search_term}'")
+
+    count_df = lazy_df.select(pl.count()).collect(streaming=True)
+    total_filtered = count_df.item()
+
+    sort_column = request.get("sort_column")
+    sort_direction = (request.get("sort_direction") or "desc").lower()
+    descending = sort_direction == "desc"
+
+    if sort_column:
+        lazy_df = lazy_df.sort(sort_column, descending=descending)
+    else:
+        try:
+            lazy_df = lazy_df.sort("ErrorAge", descending=True)
+        except Exception:
+            pass
+
+    page = max(1, int(request.get("page", 1)))
+    page_size = max(1, int(request.get("page_size", 50)))
+    start_idx = (page - 1) * page_size
+
+    page_df = lazy_df.slice(start_idx, page_size).collect(streaming=True)
+    data = page_df.to_dicts()
+
+    total_pages = (total_filtered + page_size - 1) // page_size if total_filtered > 0 else 1
+    return {
+        "success": True,
+        "data": data,
+        "columns": page_df.columns,
+        "bucket_set": active_bucket_set,
+        "applied_filters": applied_filters,
+        "bucket": bucket,
+        "bucket_scope": request.get("bucket_scope"),
+        "pagination": {
+            "current_page": page,
+            "page_size": page_size,
+            "total_rows": total_filtered,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_previous": page > 1,
+        },
+        "retrieved_at": datetime.now().isoformat(),
+        "_debug_info": {
+            "execution_mode": "subprocess",
+        },
+    }
+
+
 def main() -> int:
     try:
         payload = json.loads(input())
         file_path = payload["file_path"]
-        request = payload["request"]
-        result = build_aggregation_result(file_path, request)
+        mode = payload.get("mode", "aggregations")
+        request = payload.get("request", {})
+
+        if mode == "filter_options":
+            result = build_filter_options_result(file_path)
+        elif mode == "details":
+            result = build_details_result(file_path, request)
+        else:
+            result = build_aggregation_result(file_path, request)
+
         print(json.dumps(result, default=str))
         return 0
     except Exception as exc:
@@ -275,9 +1834,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
- sup
-
-"""
+super """
 Supervisory Dashboard Router
 Provides aggregated data views for supervisory monitoring with filtering and age bucket analysis
 """
@@ -581,12 +2138,45 @@ def get_default_initial_filters(filter_options: Dict[str, List[str]]) -> Dict[st
     return defaults
 
 
-def _safe_collect(lazy_df: pl.LazyFrame) -> pl.DataFrame:
-    return lazy_df.collect()
-
-
 def _load_lazy_frame(file_path: str) -> pl.LazyFrame:
     return pl.scan_parquet(file_path)
+
+
+def _run_supervisory_subprocess(file_path: str, mode: str, request_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    script_path = Path(__file__).with_name("supervisory_sub.py")
+    payload: Dict[str, Any] = {
+        "file_path": file_path,
+        "mode": mode,
+    }
+    if request_payload is not None:
+        payload["request"] = request_payload
+
+    proc = subprocess.run(
+        [sys.executable, str(script_path)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        timeout=AGGREGATION_SUBPROCESS_TIMEOUT_SECONDS,
+        check=False,
+    )
+
+    if proc.returncode != 0:
+        logger.error(
+            f"Supervisory subprocess failed (mode={mode}):\nstdout={proc.stdout}\nstderr={proc.stderr}"
+        )
+        raise HTTPException(status_code=500, detail=f"Supervisory subprocess failed ({mode})")
+
+    try:
+        result = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        logger.error(f"Invalid JSON from supervisory subprocess (mode={mode}): {proc.stdout}")
+        raise HTTPException(status_code=500, detail=f"Invalid subprocess response ({mode})")
+
+    if not result.get("success", False):
+        logger.error(f"Supervisory subprocess returned error payload (mode={mode}): {result}")
+        raise HTTPException(status_code=500, detail=result.get("error", f"Supervisory subprocess error ({mode})"))
+
+    return result
 
 
 def precompute_filter_options() -> None:
@@ -602,45 +2192,7 @@ def precompute_filter_options() -> None:
             logger.warning(f"Precompute skipped – data file not found: {file_path}")
             return
 
-        lazy_df = _load_lazy_frame(file_path)
-        lazy_df = ensure_remediation_status(lazy_df)
-        schema_names = set(lazy_df.collect_schema().names())
-        available_bucket_sets = get_available_bucket_sets(schema_names)
-        default_bucket_set = DEFAULT_BUCKET_SET if DEFAULT_BUCKET_SET in available_bucket_sets else (
-            available_bucket_sets[0] if available_bucket_sets else DEFAULT_BUCKET_SET
-        )
-
-        filter_options = {}
-        for key, column_name in FILTER_COLUMNS.items():
-            try:
-                unique_values = (
-                    lazy_df
-                    .select(pl.col(column_name))
-                    .unique()
-                    .pipe(_safe_collect)
-                    .to_series()
-                    .to_list()
-                )
-                unique_values = sorted([v for v in unique_values if v is not None])
-                filter_options[key] = unique_values
-            except Exception:
-                filter_options[key] = []
-
-        parquet_file = pq.ParquetFile(file_path)
-        total_rows = parquet_file.metadata.num_rows
-
-        result = {
-            "success": True,
-            "filter_options": filter_options,
-            "default_initial_filters": get_default_initial_filters(filter_options),
-            "bucket_sets": available_bucket_sets,
-            "default_bucket_set": default_bucket_set,
-            "total_records": total_rows,
-            "columns": list(FILTER_COLUMNS.keys()),
-            "age_buckets": AGE_BUCKETS_BY_SET.get(default_bucket_set, AGE_BUCKET_COLUMNS),
-            "age_buckets_by_set": AGE_BUCKETS_BY_SET,
-            "retrieved_at": datetime.now().isoformat()
-        }
+        result = _run_supervisory_subprocess(file_path, mode="filter_options")
 
         _filter_options_cache["data"] = result
         _filter_options_cache["timestamp"] = datetime.now()
@@ -677,51 +2229,7 @@ def get_filter_options() -> Dict[str, Any]:
         if not Path(file_path).exists():
             raise HTTPException(status_code=404, detail=f"Data file not found: {file_path}")
 
-        # Use lazy loading to get unique values efficiently
-        lazy_df = _load_lazy_frame(file_path)
-        lazy_df = ensure_remediation_status(lazy_df)
-        schema_names = set(lazy_df.collect_schema().names())
-        available_bucket_sets = get_available_bucket_sets(schema_names)
-        default_bucket_set = DEFAULT_BUCKET_SET if DEFAULT_BUCKET_SET in available_bucket_sets else (
-            available_bucket_sets[0] if available_bucket_sets else DEFAULT_BUCKET_SET
-        )
-
-        filter_options = {}
-
-        for key, column_name in FILTER_COLUMNS.items():
-            try:
-                unique_values = (
-                    lazy_df
-                    .select(pl.col(column_name))
-                    .unique()
-                    .pipe(_safe_collect)
-                    .to_series()
-                    .to_list()
-                )
-                # Sort and filter out None values
-                unique_values = sorted([v for v in unique_values if v is not None])
-                filter_options[key] = unique_values
-                logger.info(f"Column '{column_name}' has {len(unique_values)} unique values")
-            except Exception as e:
-                logger.warning(f"Could not get unique values for column '{column_name}': {e}")
-                filter_options[key] = []
-
-        # Get total row count
-        parquet_file = pq.ParquetFile(file_path)
-        total_rows = parquet_file.metadata.num_rows
-
-        result = {
-            "success": True,
-            "filter_options": filter_options,
-            "default_initial_filters": get_default_initial_filters(filter_options),
-            "bucket_sets": available_bucket_sets,
-            "default_bucket_set": default_bucket_set,
-            "total_records": total_rows,
-            "columns": list(FILTER_COLUMNS.keys()),
-            "age_buckets": AGE_BUCKETS_BY_SET.get(default_bucket_set, AGE_BUCKET_COLUMNS),
-            "age_buckets_by_set": AGE_BUCKETS_BY_SET,
-            "retrieved_at": datetime.now().isoformat()
-        }
+        result = _run_supervisory_subprocess(file_path, mode="filter_options")
 
         # Update cache
         _filter_options_cache["data"] = result
@@ -752,31 +2260,11 @@ def get_aggregations(request: AggregationRequest) -> Dict[str, Any]:
         if not Path(file_path).exists():
             raise HTTPException(status_code=404, detail=f"Data file not found: {file_path}")
 
-        payload = {
-            "file_path": file_path,
-            "request": request.model_dump(),
-        }
-        script_path = Path(__file__).with_name("supervisory_sub.py")
-
-        proc = subprocess.run(
-            [sys.executable, str(script_path)],
-            input=json.dumps(payload),
-            text=True,
-            capture_output=True,
-            timeout=AGGREGATION_SUBPROCESS_TIMEOUT_SECONDS,
-            check=False,
+        return _run_supervisory_subprocess(
+            file_path=file_path,
+            mode="aggregations",
+            request_payload=request.model_dump(),
         )
-
-        if proc.returncode != 0:
-            logger.error(f"Aggregation subprocess failed:\nstdout={proc.stdout}\nstderr={proc.stderr}")
-            raise HTTPException(status_code=500, detail="Aggregation subprocess failed")
-
-        result = json.loads(proc.stdout)
-        if not result.get("success", False):
-            logger.error(f"Aggregation subprocess returned error payload: {result}")
-            raise HTTPException(status_code=500, detail=result.get("error", "Aggregation subprocess error"))
-
-        return result
 
     except HTTPException:
         raise
@@ -802,104 +2290,11 @@ def get_details(request: DetailsRequest) -> Dict[str, Any]:
         if not Path(file_path).exists():
             raise HTTPException(status_code=404, detail=f"Data file not found: {file_path}")
 
-        # Start with lazy loading
-        lazy_df = _load_lazy_frame(file_path)
-        lazy_df = ensure_remediation_status(lazy_df)
-        lazy_df, active_bucket_set, active_age_buckets = apply_age_bucket_set(lazy_df, request.bucket_set)
-
-        logger.info(f"Details request - bucket: {request.bucket}, bucket_scope: {request.bucket_scope}, bucket_set: {request.bucket_set}")
-        logger.info(f"Details request - filters: {request.filters}")
-        if request.search_term and request.search_column:
-             logger.info(f"Details request - search: '{request.search_term}' in '{request.search_column}'")
-
-        applied_filters = []
-
-        # Apply filters
-        if request.filters:
-            for filter_key, filter_values in request.filters.items():
-                if filter_values and len(filter_values) > 0:
-                    column_name = FILTER_COLUMNS.get(filter_key)
-                    if column_name:
-                        lazy_df = lazy_df.filter(pl.col(column_name).is_in(filter_values))
-                        applied_filters.append(f"{column_name} in {filter_values}")
-                        logger.info(f"Applied filter: {column_name} in {filter_values}")
-
-        # Apply age bucket filter
-        if request.bucket and request.bucket in active_age_buckets:
-            lazy_df = lazy_df.filter(pl.col(request.bucket).cast(pl.Int64) == 1)
-            applied_filters.append(f"age_bucket={request.bucket}")
-            logger.info(f"Applied age bucket filter: {request.bucket} == 1")
-        elif request.bucket:
-            logger.warning(f"Bucket '{request.bucket}' not in active buckets {active_age_buckets}, skipping bucket filter")
-
-        # Apply remediation scope filter (independent of bucket)
-        if request.bucket_scope == "unremediated":
-            lazy_df = lazy_df.filter(pl.col("RemediationStatus") == "Unremediated")
-            applied_filters.append("scope=unremediated")
-            logger.info("Applied remediation scope filter: Unremediated only")
-
-        # Apply column-specific search
-        if request.search_term and request.search_column:
-            search_term = request.search_term.strip()
-            # Map display name to physical column if needed (though usually search_column is physical)
-            # Check if search_column exists in mapping, else use as-is
-            physical_col = FILTER_COLUMNS.get(request.search_column, request.search_column)
-
-            # Use string containment search (case-insensitive)
-            # Note: We cast to string first to be safe
-            lazy_df = lazy_df.filter(
-                pl.col(physical_col).cast(pl.Utf8).str.to_lowercase().str.contains(search_term.lower())
-            )
-            applied_filters.append(f"search: {request.search_column} contains '{search_term}'")
-            logger.info(f"Applied search filter: {physical_col} contains '{search_term}'")
-
-        # Get filtered count (execute a separate query for count)
-        count_df = _safe_collect(lazy_df.select(pl.count()))
-        total_filtered = count_df.item()
-
-        # Apply sorting
-        if request.sort_column:
-            descending = request.sort_direction.lower() == "desc"
-            lazy_df = lazy_df.sort(request.sort_column, descending=descending)
-        else:
-            # Default sort by ErrorAge descending
-            lazy_df = lazy_df.sort("ErrorAge", descending=True)
-
-        # Apply pagination
-        start_idx = (request.page - 1) * request.page_size
-        page_df = (
-            lazy_df
-            .slice(start_idx, request.page_size)
-            .pipe(_safe_collect)
+        return _run_supervisory_subprocess(
+            file_path=file_path,
+            mode="details",
+            request_payload=request.model_dump(),
         )
-
-        # Convert to list of dicts
-        data = page_df.to_dicts()
-
-        # Calculate pagination info
-        total_pages = (total_filtered + request.page_size - 1) // request.page_size if total_filtered > 0 else 1
-
-        result = {
-            "success": True,
-            "data": data,
-            "columns": page_df.columns,
-            "bucket_set": active_bucket_set,
-            "applied_filters": applied_filters,
-            "bucket": request.bucket,
-            "bucket_scope": request.bucket_scope,
-            "pagination": {
-                "current_page": request.page,
-                "page_size": request.page_size,
-                "total_rows": total_filtered,
-                "total_pages": total_pages,
-                "has_next": request.page < total_pages,
-                "has_previous": request.page > 1
-            },
-            "retrieved_at": datetime.now().isoformat()
-        }
-
-        logger.info(f"Details retrieved: {len(data)} rows (page {request.page}/{total_pages})")
-        return result
 
     except HTTPException:
         raise
@@ -990,3 +2385,2608 @@ def delete_saved_filter(filter_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="Saved filter not found")
     write_saved_filters(updated)
     return {"success": True, "message": "Deleted"}
+ workflow
+"""
+Workflow Storage Router
+Handles saving, loading, listing, and deleting workflow configurations.
+Also handles workflow execution with per-user session management.
+"""
+from fastapi import APIRouter, HTTPException, Header, BackgroundTasks
+from fastapi.responses import FileResponse
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+from datetime import datetime
+from pydantic import BaseModel
+import json
+import logging
+import uuid
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/workflows", tags=["workflows"])
+
+# Import workflow engine components
+try:
+    from workflow_engine import WorkflowExecutor, WorkflowSessionManager
+    WORKFLOW_ENGINE_AVAILABLE = True
+except ImportError:
+    WORKFLOW_ENGINE_AVAILABLE = False
+    logger.warning("Workflow engine not available. Execution endpoints will be disabled.")
+
+
+# Pydantic models for request/response
+class WorkflowExecuteRequest(BaseModel):
+    """Request model for workflow execution"""
+    workflow_id: Optional[str] = None
+    workflow_name: Optional[str] = None
+    nodes: List[Dict[str, Any]]
+    edges: List[Dict[str, Any]]
+
+
+class NodeDataRequest(BaseModel):
+    """Request model for node data pagination"""
+    page: int = 1
+    page_size: int = 100
+    sort_column: Optional[str] = None
+    sort_descending: bool = False
+
+# Storage directory for workflows
+WORKFLOW_STORAGE_DIR = Path(__file__).parent.parent / "workflow_storage"
+WORKFLOW_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_workflow_file(workflow_id: str) -> Path:
+    """Get the file path for a workflow"""
+    return WORKFLOW_STORAGE_DIR / f"{workflow_id}.json"
+
+
+def sanitize_workflow_id(workflow_id: str) -> str:
+    """Sanitize workflow ID to prevent path traversal"""
+    # Only allow alphanumeric, underscore, hyphen
+    import re
+    sanitized = re.sub(r'[^a-zA-Z0-9_-]', '_', workflow_id)
+    return sanitized[:100]  # Limit length
+
+
+@router.post("/save")
+async def save_workflow(request: Dict[str, Any]):
+    """
+    Save a workflow configuration
+    
+    Request body:
+    {
+        "workflow_id": "optional-custom-id",  // If not provided, auto-generated
+        "name": "My Workflow",
+        "description": "Optional description",
+        "instance_id": "workflow-instance-id",
+        "nodes": [...],
+        "edges": [...],
+        "metadata": {...}  // Optional additional metadata
+    }
+    """
+    try:
+        logger.info("Saving workflow...")
+        
+        # Get or generate workflow ID
+        workflow_id = request.get("workflow_id")
+        if not workflow_id:
+            workflow_id = str(uuid.uuid4())
+        else:
+            workflow_id = sanitize_workflow_id(workflow_id)
+        
+        # Prepare workflow data
+        workflow_data = {
+            "workflow_id": workflow_id,
+            "name": request.get("name", f"Workflow {workflow_id[:8]}"),
+            "description": request.get("description", ""),
+            "instance_id": request.get("instance_id", ""),
+            "nodes": request.get("nodes", []),
+            "edges": request.get("edges", []),
+            "metadata": request.get("metadata", {}),
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+            "version": 1
+        }
+        
+        # Check if workflow exists (for versioning)
+        workflow_file = get_workflow_file(workflow_id)
+        if workflow_file.exists():
+            try:
+                with open(workflow_file, 'r', encoding='utf-8') as f:
+                    existing = json.load(f)
+                    workflow_data["created_at"] = existing.get("created_at", workflow_data["created_at"])
+                    workflow_data["version"] = existing.get("version", 0) + 1
+            except Exception:
+                pass
+        
+        # Save workflow
+        with open(workflow_file, 'w', encoding='utf-8') as f:
+            json.dump(workflow_data, f, indent=2, default=str)
+        
+        logger.info(f"Workflow saved: {workflow_id} (version {workflow_data['version']})")
+        
+        return {
+            "status": "success",
+            "workflow_id": workflow_id,
+            "name": workflow_data["name"],
+            "version": workflow_data["version"],
+            "saved_at": workflow_data["updated_at"],
+            "message": f"Workflow '{workflow_data['name']}' saved successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error saving workflow: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/load/{workflow_id}")
+async def load_workflow(workflow_id: str):
+    """
+    Load a workflow configuration by ID
+    """
+    try:
+        workflow_id = sanitize_workflow_id(workflow_id)
+        workflow_file = get_workflow_file(workflow_id)
+        
+        if not workflow_file.exists():
+            raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
+        
+        with open(workflow_file, 'r', encoding='utf-8') as f:
+            workflow_data = json.load(f)
+        
+        logger.info(f"Loaded workflow: {workflow_id}")
+        
+        return {
+            "status": "success",
+            "workflow": workflow_data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error loading workflow: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/list")
+async def list_workflows(instance_id: Optional[str] = None, limit: int = 50):
+    """
+    List all saved workflows
+    Optionally filter by instance_id
+    """
+    try:
+        workflows = []
+        
+        for workflow_file in WORKFLOW_STORAGE_DIR.glob("*.json"):
+            try:
+                with open(workflow_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    
+                    # Filter by instance_id if provided
+                    if instance_id and data.get("instance_id") != instance_id:
+                        continue
+                    
+                    workflows.append({
+                        "workflow_id": data.get("workflow_id"),
+                        "name": data.get("name"),
+                        "description": data.get("description", ""),
+                        "instance_id": data.get("instance_id", ""),
+                        "node_count": len(data.get("nodes", [])),
+                        "edge_count": len(data.get("edges", [])),
+                        "version": data.get("version", 1),
+                        "created_at": data.get("created_at"),
+                        "updated_at": data.get("updated_at")
+                    })
+            except Exception as e:
+                logger.warning(f"Error reading workflow file {workflow_file}: {e}")
+                continue
+        
+        # Sort by updated_at (most recent first)
+        workflows.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+        
+        # Apply limit
+        workflows = workflows[:limit]
+        
+        logger.info(f"Listed {len(workflows)} workflows")
+        
+        return {
+            "status": "success",
+            "workflows": workflows,
+            "total": len(workflows),
+            "instance_id": instance_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Error listing workflows: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/delete/{workflow_id}")
+async def delete_workflow(workflow_id: str):
+    """
+    Delete a workflow by ID
+    """
+    try:
+        workflow_id = sanitize_workflow_id(workflow_id)
+        workflow_file = get_workflow_file(workflow_id)
+        
+        if not workflow_file.exists():
+            raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
+        
+        # Get workflow name before deleting
+        workflow_name = workflow_id
+        try:
+            with open(workflow_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                workflow_name = data.get("name", workflow_id)
+        except Exception:
+            pass
+        
+        # Delete the file
+        workflow_file.unlink()
+        
+        logger.info(f"Deleted workflow: {workflow_id}")
+        
+        return {
+            "status": "success",
+            "workflow_id": workflow_id,
+            "message": f"Workflow '{workflow_name}' deleted successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting workflow: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/duplicate/{workflow_id}")
+async def duplicate_workflow(workflow_id: str, new_name: Optional[str] = None):
+    """
+    Duplicate a workflow with a new ID
+    """
+    try:
+        workflow_id = sanitize_workflow_id(workflow_id)
+        workflow_file = get_workflow_file(workflow_id)
+        
+        if not workflow_file.exists():
+            raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
+        
+        # Load original workflow
+        with open(workflow_file, 'r', encoding='utf-8') as f:
+            workflow_data = json.load(f)
+        
+        # Generate new ID
+        new_workflow_id = str(uuid.uuid4())
+        
+        # Update workflow data
+        original_name = workflow_data.get("name", "Workflow")
+        workflow_data["workflow_id"] = new_workflow_id
+        workflow_data["name"] = new_name or f"{original_name} (Copy)"
+        workflow_data["created_at"] = datetime.now().isoformat()
+        workflow_data["updated_at"] = datetime.now().isoformat()
+        workflow_data["version"] = 1
+        
+        # Save new workflow
+        new_workflow_file = get_workflow_file(new_workflow_id)
+        with open(new_workflow_file, 'w', encoding='utf-8') as f:
+            json.dump(workflow_data, f, indent=2, default=str)
+        
+        logger.info(f"Duplicated workflow: {workflow_id} -> {new_workflow_id}")
+        
+        return {
+            "status": "success",
+            "original_id": workflow_id,
+            "new_workflow_id": new_workflow_id,
+            "name": workflow_data["name"],
+            "message": f"Workflow duplicated as '{workflow_data['name']}'"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error duplicating workflow: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/export/{workflow_id}")
+async def export_workflow(workflow_id: str):
+    """
+    Export a workflow as JSON (for download)
+    """
+    try:
+        workflow_id = sanitize_workflow_id(workflow_id)
+        workflow_file = get_workflow_file(workflow_id)
+        
+        if not workflow_file.exists():
+            raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
+        
+        with open(workflow_file, 'r', encoding='utf-8') as f:
+            workflow_data = json.load(f)
+        
+        # Add export metadata
+        workflow_data["exported_at"] = datetime.now().isoformat()
+        workflow_data["export_version"] = "1.0"
+        
+        logger.info(f"Exported workflow: {workflow_id}")
+        
+        return workflow_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error exporting workflow: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/import")
+async def import_workflow(request: Dict[str, Any]):
+    """
+    Import a workflow from JSON
+    """
+    try:
+        # Validate required fields
+        if "nodes" not in request:
+            raise HTTPException(status_code=400, detail="Missing 'nodes' in workflow data")
+        
+        # Generate new ID for imported workflow
+        new_workflow_id = str(uuid.uuid4())
+        
+        workflow_data = {
+            "workflow_id": new_workflow_id,
+            "name": request.get("name", f"Imported Workflow {new_workflow_id[:8]}"),
+            "description": request.get("description", "Imported workflow"),
+            "instance_id": request.get("instance_id", ""),
+            "nodes": request.get("nodes", []),
+            "edges": request.get("edges", []),
+            "metadata": request.get("metadata", {}),
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+            "version": 1,
+            "imported_from": request.get("workflow_id", "unknown"),
+            "imported_at": datetime.now().isoformat()
+        }
+        
+        # Save workflow
+        workflow_file = get_workflow_file(new_workflow_id)
+        with open(workflow_file, 'w', encoding='utf-8') as f:
+            json.dump(workflow_data, f, indent=2, default=str)
+        
+        logger.info(f"Imported workflow as: {new_workflow_id}")
+
+        return {
+            "status": "success",
+            "workflow_id": new_workflow_id,
+            "name": workflow_data["name"],
+            "message": f"Workflow imported as '{workflow_data['name']}'"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error importing workflow: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# WORKFLOW EXECUTION ENDPOINTS
+# ============================================================================
+
+@router.post("/execute")
+async def execute_workflow(
+    request: WorkflowExecuteRequest,
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    Execute a workflow and return session with results.
+
+    Headers:
+        x-user-id: User identifier for session isolation
+
+    Request body:
+        workflow_id: Optional workflow identifier
+        workflow_name: Optional workflow name
+        nodes: List of node definitions
+        edges: List of edge definitions
+
+    Returns:
+        Session ID and execution results
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Workflow execution engine not available"
+        )
+
+    try:
+        logger.info(f"Executing workflow for user: {user_id}")
+        logger.info(f"Workflow request - nodes: {len(request.nodes)}, edges: {len(request.edges)}")
+        logger.info(f"Node types: {[n.get('data', {}).get('type') for n in request.nodes]}")
+
+        executor = WorkflowExecutor()
+
+        result = await executor.execute_workflow(
+            user_id=user_id,
+            workflow_id=request.workflow_id,
+            workflow_name=request.workflow_name,
+            nodes=request.nodes,
+            edges=request.edges
+        )
+
+        logger.info(f"Workflow execution completed - session_id: {result.get('session_id')}, status: {result.get('status')}")
+        logger.info(f"Results: {list(result.get('results', {}).keys())}")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Workflow execution failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/session/{session_id}")
+async def get_session_info(
+    session_id: str,
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    Get session information and execution summary.
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        session_manager = WorkflowSessionManager()
+        session = session_manager.get_session(user_id, session_id)
+
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # Load execution summary if available
+        session_path = session_manager.get_session_path(user_id, session_id)
+        summary_path = session_path / "execution_summary.json"
+
+        execution_summary = None
+        if summary_path.exists():
+            with open(summary_path, 'r') as f:
+                execution_summary = json.load(f)
+
+        return {
+            "status": "success",
+            "session": session,
+            "execution_summary": execution_summary
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/session/{session_id}/data/{node_id}")
+async def get_node_data(
+    session_id: str,
+    node_id: str,
+    page: int = 1,
+    page_size: int = 100,
+    sort_column: Optional[str] = None,
+    sort_descending: bool = False,
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    Get paginated data from a node's output.
+
+    Query params:
+        page: Page number (1-indexed)
+        page_size: Rows per page (max 1000)
+        sort_column: Column to sort by
+        sort_descending: Sort direction
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        # Validate page_size
+        page_size = min(page_size, 1000)
+
+        executor = WorkflowExecutor()
+
+        result = await executor.get_node_data(
+            user_id=user_id,
+            session_id=session_id,
+            node_id=node_id,
+            page=page,
+            page_size=page_size,
+            sort_column=sort_column,
+            sort_descending=sort_descending
+        )
+
+        return {
+            "status": "success",
+            **result
+        }
+
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error getting node data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/session/{session_id}/download/{node_id}")
+async def download_node_data(
+    session_id: str,
+    node_id: str,
+    format: str = "parquet",
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    Download node output as a file.
+
+    Query params:
+        format: Output format (parquet, csv)
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        executor = WorkflowExecutor()
+
+        file_path = await executor.download_node_data(
+            user_id=user_id,
+            session_id=session_id,
+            node_id=node_id,
+            format=format
+        )
+
+        # Determine media type
+        media_type = "application/octet-stream"
+        if format == "csv":
+            media_type = "text/csv"
+        elif format == "parquet":
+            media_type = "application/vnd.apache.parquet"
+
+        filename = f"{node_id}.{format}"
+
+        return FileResponse(
+            path=file_path,
+            media_type=media_type,
+            filename=filename
+        )
+
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error downloading node data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/session/{session_id}")
+async def cleanup_session(
+    session_id: str,
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    Delete a session and its temp data.
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        session_manager = WorkflowSessionManager()
+
+        success = session_manager.cleanup_session(user_id, session_id)
+
+        if not success:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        return {
+            "status": "success",
+            "message": f"Session {session_id} cleaned up"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cleaning up session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sessions")
+async def list_user_sessions(
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    List all sessions for the current user.
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        session_manager = WorkflowSessionManager()
+
+        sessions = session_manager.list_user_sessions(user_id)
+
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "sessions": sessions,
+            "total": len(sessions)
+        }
+
+    except Exception as e:
+        logger.error(f"Error listing sessions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/storage-stats")
+async def get_storage_stats():
+    """
+    Get workflow storage statistics.
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        session_manager = WorkflowSessionManager()
+
+        stats = session_manager.get_storage_stats()
+
+        # Add workflow count
+        workflow_count = len(list(WORKFLOW_STORAGE_DIR.glob("*.json")))
+        stats["workflow_definitions"] = workflow_count
+
+        return {
+            "status": "success",
+            **stats
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting storage stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/cleanup-expired")
+async def cleanup_expired_sessions():
+    """
+    Manually trigger cleanup of expired sessions.
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        session_manager = WorkflowSessionManager()
+
+        stats = session_manager.cleanup_expired_sessions()
+
+        return {
+            "status": "success",
+            "message": "Cleanup completed",
+            **stats
+        }
+
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# NODE LOGS ENDPOINTS
+# ============================================================================
+
+@router.get("/session/{session_id}/nodes/{node_id}/logs")
+async def get_node_logs(
+    session_id: str,
+    node_id: str,
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    Get execution logs for a specific node.
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        session_manager = WorkflowSessionManager()
+        
+        # Check if session exists
+        session = session_manager.get_session(user_id, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        logs = session_manager.get_node_logs(user_id, session_id, node_id)
+        
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "node_id": node_id,
+            "logs": logs,
+            "has_logs": bool(logs)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting node logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/session/{session_id}/logs")
+async def list_session_logs(
+    session_id: str,
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    List all nodes with available logs in a session.
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        session_manager = WorkflowSessionManager()
+        
+        session = session_manager.get_session(user_id, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        node_logs = session_manager.list_node_logs(user_id, session_id)
+        
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "nodes_with_logs": node_logs,
+            "total": len(node_logs)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing session logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# SINGLE NODE EXECUTION
+# ============================================================================
+
+class SingleNodeExecuteRequest(BaseModel):
+    """Request model for single node execution"""
+    session_id: str
+    node_id: str
+    node_config: Dict[str, Any]
+    use_cached_inputs: bool = True
+
+
+@router.post("/execute-node")
+async def execute_single_node(
+    request: SingleNodeExecuteRequest,
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    Execute a single node using cached upstream data.
+    
+    This runs only the specified node, using outputs from previous
+    workflow executions stored in the session.
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        session_manager = WorkflowSessionManager()
+        
+        # Verify session exists
+        session = session_manager.get_session(user_id, request.session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        executor = WorkflowExecutor()
+        
+        # Execute single node
+        result = await executor.execute_single_node(
+            user_id=user_id,
+            session_id=request.session_id,
+            node_id=request.node_id,
+            node_config=request.node_config,
+            use_cached_inputs=request.use_cached_inputs
+        )
+        
+        return {
+            "status": "success",
+            "session_id": request.session_id,
+            "node_id": request.node_id,
+            **result
+        }
+
+    except HTTPException:
+        raise
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error executing single node: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# VALIDATION ENDPOINTS
+# ============================================================================
+
+@router.get("/session/{session_id}/nodes/{node_id}/validations")
+async def get_node_validations(
+    session_id: str,
+    node_id: str,
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    Get validation results for a specific node.
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        session_manager = WorkflowSessionManager()
+        
+        session = session_manager.get_session(user_id, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        validations = session_manager.get_validation_results(user_id, session_id, node_id)
+        
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "node_id": node_id,
+            "validations": validations
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting node validations: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/session/{session_id}/validations")
+async def get_all_validations(
+    session_id: str,
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    Get all validation results for a session.
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        session_manager = WorkflowSessionManager()
+        
+        session = session_manager.get_session(user_id, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        validations = session_manager.get_all_validation_results(user_id, session_id)
+        
+        # Count passed/failed
+        passed = sum(1 for v in validations.values() if v.get("passed", False))
+        failed = len(validations) - passed
+        
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "validations": validations,
+            "summary": {
+                "total": len(validations),
+                "passed": passed,
+                "failed": failed
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting session validations: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# ENHANCED DATA FILTERING
+# ============================================================================
+
+class FilterCondition(BaseModel):
+    """Single filter condition"""
+    column: str
+    operator: str  # contains, equals, starts_with, ends_with, gt, gte, lt, lte, eq, ne, between
+    value: Any
+    value2: Optional[Any] = None  # For 'between' operator
+
+
+class FilteredDataRequest(BaseModel):
+    """Request model for filtered data retrieval"""
+    page: int = 1
+    page_size: int = 100
+    columns: Optional[List[str]] = None  # Columns to return (None = all)
+    filters: Optional[List[FilterCondition]] = None
+    sort_column: Optional[str] = None
+    sort_descending: bool = False
+
+
+@router.post("/session/{session_id}/data/{node_id}/filtered")
+def get_filtered_node_data(
+    session_id: str,
+    node_id: str,
+    request: FilteredDataRequest,
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    Get filtered and column-selected data from a node's output.
+    
+    Features:
+    - Column selection: Return only specified columns
+    - Filtering: Apply conditions on data
+    - Pagination: Page through large datasets
+    - Sorting: Sort by any column
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        import polars as pl
+        
+        session_manager = WorkflowSessionManager()
+        
+        # Get node output path
+        output_path = session_manager.get_node_output_path(user_id, session_id, node_id)
+        
+        if not output_path.exists():
+            raise HTTPException(status_code=404, detail=f"No output found for node '{node_id}'")
+        
+        # Build lazy query instead of eager full-table load
+        lf = pl.scan_parquet(output_path)
+        all_columns = lf.collect_schema().names()
+        original_row_count = lf.select(pl.count()).collect(streaming=True).item()
+
+        # Apply filters
+        if request.filters:
+            for f in request.filters:
+                if f.column not in all_columns:
+                    continue
+
+                col = pl.col(f.column)
+
+                if f.operator == "contains":
+                    lf = lf.filter(col.cast(pl.Utf8).str.contains(str(f.value), literal=True))
+                elif f.operator == "equals":
+                    lf = lf.filter(col == f.value)
+                elif f.operator == "starts_with":
+                    lf = lf.filter(col.cast(pl.Utf8).str.starts_with(str(f.value)))
+                elif f.operator == "ends_with":
+                    lf = lf.filter(col.cast(pl.Utf8).str.ends_with(str(f.value)))
+                elif f.operator == "not_contains":
+                    lf = lf.filter(~col.cast(pl.Utf8).str.contains(str(f.value), literal=True))
+                elif f.operator == "gt":
+                    lf = lf.filter(col > float(f.value))
+                elif f.operator == "gte":
+                    lf = lf.filter(col >= float(f.value))
+                elif f.operator == "lt":
+                    lf = lf.filter(col < float(f.value))
+                elif f.operator == "lte":
+                    lf = lf.filter(col <= float(f.value))
+                elif f.operator == "eq":
+                    lf = lf.filter(col == float(f.value))
+                elif f.operator == "ne":
+                    lf = lf.filter(col != float(f.value))
+                elif f.operator == "between" and f.value2 is not None:
+                    lf = lf.filter((col >= float(f.value)) & (col <= float(f.value2)))
+
+        filtered_row_count = lf.select(pl.count()).collect(streaming=True).item()
+
+        # Select columns
+        visible_columns = all_columns
+        if request.columns:
+            visible_columns = [c for c in request.columns if c in all_columns]
+            if visible_columns:
+                lf = lf.select(visible_columns)
+
+        # Apply sorting
+        if request.sort_column and request.sort_column in visible_columns:
+            lf = lf.sort(request.sort_column, descending=request.sort_descending)
+
+        # Paginate
+        page_size = min(request.page_size, 1000)
+        offset = (request.page - 1) * page_size
+        total_pages = (filtered_row_count + page_size - 1) // page_size if filtered_row_count > 0 else 0
+
+        df_page = lf.slice(offset, page_size).collect(streaming=True)
+
+        # Convert to records
+        data = df_page.to_dicts()
+        
+        return {
+            "status": "success",
+            "node_id": node_id,
+            "data": data,
+            "columns": visible_columns,
+            "all_columns": all_columns,
+            "pagination": {
+                "page": request.page,
+                "page_size": page_size,
+                "total_rows": filtered_row_count,
+                "original_rows": original_row_count,
+                "total_pages": total_pages,
+                "has_next": request.page < total_pages,
+                "has_prev": request.page > 1
+            },
+            "filters_applied": len(request.filters) if request.filters else 0
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting filtered node data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/session/{session_id}/nodes/{node_id}/logs")
+async def get_node_logs(
+    session_id: str,
+    node_id: str,
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    Get execution logs for a specific node.
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        session_manager = WorkflowSessionManager()
+        
+        logs = session_manager.get_node_logs(user_id, session_id, node_id)
+        
+        if not logs:
+            # Check if metadata exists to confirm node ran
+            output_path = session_manager.get_node_output_path(user_id, session_id, node_id)
+            if not output_path.exists():
+                raise HTTPException(status_code=404, detail=f"No logs found for node '{node_id}'")
+        
+        return {
+            "status": "success",
+            "node_id": node_id,
+            "logs": logs
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting node logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/session/{session_id}/nodes/{node_id}/validations")
+async def save_node_validations(
+    session_id: str,
+    node_id: str,
+    validations: List[Dict[str, Any]],
+    user_id: str = Header(default="anonymous", alias="x-user-id")
+):
+    """
+    Save validation rules for a node.
+    """
+    if not WORKFLOW_ENGINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Workflow engine not available")
+
+    try:
+        from workflow_engine.validators import NodeValidator
+        
+        # Save to session metadata/storage
+        # Note: In a real app, this might go to DB. 
+        # Here we just acknowledge receipt or store in a simple way if needed.
+        # Currently the frontend stores validation state in the node data.
+        # This endpoint is for persisting it if needed or running validations.
+        
+        # For now, we'll just return success as the frontend sends validations 
+        # during execution payload too.
+        
+        return {
+            "status": "success",
+            "message": "Validations saved"
+        }
+
+    except Exception as e:
+        logger.error(f"Error saving validations: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+page monitotring 
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import {
+    LineChart,
+    Line,
+    AreaChart,
+    Area,
+    BarChart,
+    Bar,
+    XAxis,
+    YAxis,
+    CartesianGrid,
+    Tooltip,
+    Legend,
+    ResponsiveContainer,
+    Cell
+} from 'recharts';
+import { ApiService } from '../../services/api';
+import { FaSync, FaClock, FaServer } from 'react-icons/fa';
+import HSBCLogo from '../../components/HSBCLogo';
+
+/**
+ * System Monitoring Dashboard
+ * Real-time CPU & Memory utilization analysis
+ * Streamlit-inspired clean design
+ */
+const SystemMonitoring = () => {
+    const DEFAULT_TIME_RANGE = '6h';
+    const MAX_POINTS = 1200;
+    const MAX_CHART_POINTS = 600;
+
+    const [monitoringData, setMonitoringData] = useState([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [autoRefresh, setAutoRefresh] = useState(false);
+    const [lastUpdated, setLastUpdated] = useState(null);
+    const [servers, setServers] = useState([]);
+    const [selectedServer, setSelectedServer] = useState(null);
+
+    // Streamlit-like theme colors
+    const theme = {
+        background: '#FAFAFA',
+        card: '#FFFFFF',
+        border: '#E0E0E0',
+        text: {
+            primary: '#262730',
+            secondary: '#808495'
+        },
+        colors: {
+            blue: '#0068C9',
+            green: '#09AB3B',
+            orange: '#FF8700',
+            red: '#FF2B2B',
+            purple: '#7D3AC1'
+        }
+    };
+
+    // Fetch available servers
+    const fetchServers = useCallback(async () => {
+        try {
+            const response = await ApiService.getMonitoringServers();
+            if (response.success && response.servers) {
+                setServers(response.servers);
+                // Auto-select first server if available and none selected
+                if (response.servers.length > 0) {
+                    setSelectedServer(prev => prev || response.servers[0].log_file);
+                }
+            }
+        } catch (err) {
+            console.error('Failed to fetch servers:', err);
+        }
+    }, []); // No dependencies - runs once on mount
+
+    // Fetch monitoring data
+    const fetchMonitoringData = useCallback(async () => {
+        try {
+            setIsLoading(true);
+            setError(null);
+
+            const response = await ApiService.getSystemMonitoring(
+                DEFAULT_TIME_RANGE,
+                selectedServer,
+                MAX_POINTS
+            );
+
+            setMonitoringData(response.data || []);
+            setLastUpdated(new Date());
+        } catch (err) {
+            console.error('❌ Failed to fetch monitoring data:', err);
+            setError(err.message || 'Failed to load monitoring data');
+        } finally {
+            setIsLoading(false);
+        }
+    }, [selectedServer]);
+
+    // Fetch servers on mount
+    useEffect(() => {
+        fetchServers();
+    }, [fetchServers]);
+
+    // Initial load - wait for server selection
+    useEffect(() => {
+        if (selectedServer) {
+            fetchMonitoringData();
+        }
+    }, [fetchMonitoringData, selectedServer]);
+
+    // Auto-refresh effect
+    useEffect(() => {
+        if (!autoRefresh) return;
+
+        const interval = setInterval(() => {
+            fetchMonitoringData();
+        }, 30000); // Refresh every 30 seconds
+
+        return () => clearInterval(interval);
+    }, [autoRefresh, fetchMonitoringData]);
+
+    const filteredData = useMemo(() => {
+        return monitoringData || [];
+    }, [monitoringData]);
+
+    // Transform data for Recharts
+    const chartData = useMemo(() => {
+        if (!filteredData.length) {
+            return [];
+        }
+
+        const step = Math.max(1, Math.ceil(filteredData.length / MAX_CHART_POINTS));
+        const sampledData = step > 1 ? filteredData.filter((_, idx) => idx % step === 0) : filteredData;
+
+        return sampledData.map((item) => ({
+            time: new Date(item.timestamp).toLocaleTimeString(),
+            timestamp: item.timestamp,
+            cpu: item.cpu_percent,
+            memory: item.mem_percent,
+            memoryUsed: item.mem_used / (1024 ** 3), // Convert to GB
+            memoryAvailable: item.mem_available / (1024 ** 3), // Convert to GB
+            frequency: item.frequency,
+            load1min: item.load_1min,
+            load5min: item.load_5min,
+            load15min: item.load_15min,
+            swap: item.swap_percent,
+            // For per-core data
+            coreData: item.core_usage || []
+        }));
+    }, [filteredData, MAX_CHART_POINTS]);
+
+    // Professional color palette
+    const chartColors = {
+        primary: '#2563eb',      // Blue
+        secondary: '#dc2626',    // Red  
+        success: '#16a34a',      // Green
+        warning: '#f59e0b',      // Amber
+        info: '#3b82f6',         // Light Blue
+        purple: '#9333ea',       // Purple
+        pink: '#ec4899',         // Pink
+        gray: '#6b7280'          // Gray
+    };
+
+    // Enhanced tooltip with better styling
+    const CustomTooltip = ({ active, payload, label }) => {
+        if (active && payload && payload.length) {
+            return (
+                <div style={{
+                    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+                    border: '1px solid #e5e7eb',
+                    borderRadius: '12px',
+                    padding: '16px',
+                    boxShadow: '0 10px 25px rgba(0, 0, 0, 0.15)',
+                    backdropFilter: 'blur(8px)',
+                    fontSize: '14px',
+                    minWidth: '200px'
+                }}>
+                    <div style={{
+                        marginBottom: '12px',
+                        fontWeight: '600',
+                        color: '#1f2937',
+                        fontSize: '15px',
+                        borderBottom: '1px solid #f3f4f6',
+                        paddingBottom: '8px'
+                    }}>
+                        📊 {label}
+                    </div>
+                    {payload.map((entry, index) => (
+                        <div key={index} style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            margin: '6px 0',
+                            padding: '4px 0'
+                        }}>
+                            <div style={{ display: 'flex', alignItems: 'center' }}>
+                                <div style={{
+                                    width: '12px',
+                                    height: '12px',
+                                    backgroundColor: entry.color,
+                                    borderRadius: '2px',
+                                    marginRight: '8px'
+                                }} />
+                                <span style={{ color: '#374151', fontWeight: '500' }}>
+                                    {entry.name || entry.dataKey}
+                                </span>
+                            </div>
+                            <span style={{
+                                fontWeight: '600',
+                                color: entry.color,
+                                backgroundColor: 'rgba(0,0,0,0.05)',
+                                padding: '2px 8px',
+                                borderRadius: '6px',
+                                fontSize: '13px'
+                            }}>
+                                {entry.value}{entry.dataKey.includes('memory') && entry.dataKey !== 'memory' ? ' GB' :
+                                    entry.dataKey.includes('frequency') ? ' MHz' :
+                                        entry.dataKey.includes('load') || entry.dataKey === 'cpu' || entry.dataKey === 'memory' || entry.dataKey === 'swap' ? '%' : ''}
+                            </span>
+                        </div>
+                    ))}
+                </div>
+            );
+        }
+        return null;
+    };
+
+    // Calculate statistics
+    const stats = useMemo(() => {
+        if (!filteredData.length) {
+            console.log('⚠️ No filtered data available for stats');
+            return null;
+        }
+
+        console.log('📊 Calculating stats from', filteredData.length, 'data points');
+
+        const latest = filteredData[filteredData.length - 1];
+        const previous = filteredData.length > 1 ? filteredData[filteredData.length - 2] : latest;
+
+        const cpuValues = filteredData.map(d => d.cpu_percent);
+        const memValues = filteredData.map(d => d.mem_percent);
+
+        console.log('📈 Stats calculated:', {
+            cpuRange: [Math.min(...cpuValues), Math.max(...cpuValues)],
+            memRange: [Math.min(...memValues), Math.max(...memValues)]
+        });
+        return {
+            current: {
+                cpu: latest.cpu_percent,
+                memory: latest.mem_percent,
+                memUsedGB: latest.mem_used / (1024 ** 3),
+                memAvailGB: latest.mem_available / (1024 ** 3),
+                memTotalGB: latest.mem_total / (1024 ** 3),
+                frequency: latest.frequency,
+                load: {
+                    min1: latest.load_1min,
+                    min5: latest.load_5min,
+                    min15: latest.load_15min
+                },
+                swap: latest.swap_percent
+            },
+            delta: {
+                cpu: latest.cpu_percent - previous.cpu_percent,
+                memory: latest.mem_percent - previous.mem_percent
+            },
+            averages: {
+                cpu: cpuValues.reduce((a, b) => a + b, 0) / cpuValues.length,
+                memory: memValues.reduce((a, b) => a + b, 0) / memValues.length
+            },
+            peaks: {
+                cpu: Math.max(...cpuValues),
+                memory: Math.max(...memValues)
+            },
+            mins: {
+                cpu: Math.min(...cpuValues),
+                memory: Math.min(...memValues)
+            },
+            std: {
+                cpu: Math.sqrt(cpuValues.reduce((sq, n) => sq + Math.pow(n - (cpuValues.reduce((a, b) => a + b, 0) / cpuValues.length), 2), 0) / cpuValues.length),
+                memory: Math.sqrt(memValues.reduce((sq, n) => sq + Math.pow(n - (memValues.reduce((a, b) => a + b, 0) / memValues.length), 2), 0) / memValues.length)
+            }
+        };
+    }, [filteredData]);
+
+    // Streamlit-like Metric Card Component
+    const MetricCard = ({ title, value, delta }) => (
+        <div style={{
+            backgroundColor: theme.card,
+            border: `1px solid ${theme.border}`,
+            borderRadius: '8px',
+            padding: '24px 20px',
+            boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+        }}>
+            <div style={{
+                fontSize: '14px',
+                color: theme.text.secondary,
+                marginBottom: '8px',
+                fontWeight: '400'
+            }}>
+                {title}
+            </div>
+            <div style={{
+                fontSize: '36px',
+                fontWeight: '600',
+                color: theme.text.primary,
+                lineHeight: '1'
+            }}>
+                {value}
+            </div>
+            {delta !== undefined && delta !== null && (
+                <div style={{
+                    fontSize: '14px',
+                    marginTop: '8px',
+                    color: delta >= 0 ? theme.colors.green : theme.colors.red,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '4px'
+                }}>
+                    <span>{delta >= 0 ? '↑' : '↓'}</span>
+                    <span>{Math.abs(delta).toFixed(1)}%</span>
+                </div>
+            )}
+        </div>
+    );
+
+    if (error) {
+        return (
+            <div style={{
+                minHeight: '100vh',
+                backgroundColor: theme.background,
+                padding: '2rem'
+            }}>
+                <div style={{ maxWidth: '800px', margin: '0 auto' }}>
+                    <div style={{
+                        backgroundColor: '#FFF5F5',
+                        border: `1px solid ${theme.colors.red}`,
+                        borderRadius: '8px',
+                        padding: '24px',
+                        marginTop: '48px'
+                    }}>
+                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '12px', marginBottom: '16px' }}>
+                            <FaServer style={{ color: theme.colors.red, fontSize: '24px', marginTop: '4px' }} />
+                            <div>
+                                <h3 style={{ fontSize: '18px', fontWeight: '600', color: theme.text.primary, marginBottom: '8px' }}>
+                                    Monitoring Data Unavailable
+                                </h3>
+                                <p style={{ fontSize: '14px', color: theme.text.secondary }}>
+                                    {error}
+                                </p>
+                            </div>
+                        </div>
+                        <div style={{
+                            backgroundColor: theme.card,
+                            borderRadius: '6px',
+                            padding: '16px',
+                            marginTop: '16px',
+                            fontSize: '14px',
+                            color: theme.text.secondary
+                        }}>
+                            <p style={{ marginBottom: '12px' }}>💡 <strong>To enable monitoring:</strong></p>
+                            <ol style={{ paddingLeft: '20px', lineHeight: '1.8' }}>
+                                <li>Ensure the monitoring script is running on the server</li>
+                                <li>Check that the API endpoint is accessible</li>
+                                <li>Verify the log file path is correct</li>
+                            </ol>
+                        </div>
+                        <button
+                            onClick={fetchMonitoringData}
+                            style={{
+                                marginTop: '16px',
+                                padding: '10px 20px',
+                                backgroundColor: theme.colors.red,
+                                color: 'white',
+                                border: 'none',
+                                borderRadius: '6px',
+                                cursor: 'pointer',
+                                fontSize: '14px',
+                                fontWeight: '500',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '8px'
+                            }}
+                            onMouseEnter={(e) => e.target.style.opacity = '0.9'}
+                            onMouseLeave={(e) => e.target.style.opacity = '1'}
+                        >
+                            <FaSync />
+                            Retry
+                        </button>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="monitoring-container" style={{ minHeight: '100vh', backgroundColor: 'white' }}>
+            {/* Header - Same as Completeness Control */}
+            <div
+                className="border-b border-slate-200 px-8 py-4"
+                style={{
+                    backgroundColor: 'white',
+                    height: '80px',
+                    boxShadow: `
+                        0 4px 8px rgba(0,0,0,0.15),
+                        0 8px 16px rgba(0,0,0,0.1),
+                        0 2px 4px rgba(0,0,0,0.1),
+                        inset 0 2px 0 rgba(255,255,255,0.8),
+                        inset 0 -2px 0 rgba(0,0,0,0.1)
+                    `
+                }}
+            >
+                <div className="flex items-center justify-between h-full">
+                    {/* HSBC Logo - Left */}
+                    <div className="flex items-center flex-shrink-0">
+                        <HSBCLogo height={64} className="mr-4" />
+                    </div>
+
+                    {/* Title - Center */}
+                    <div className="flex-1 flex justify-center">
+                        <h1 className="text-2xl font-bold text-black text-center">
+                            SYSTEM MONITORING DASHBOARD
+                        </h1>
+                    </div>
+
+                    {/* Last Updated Indicator - Right */}
+                    <div className="flex-shrink-0 flex items-center gap-2">
+                        {lastUpdated && (
+                            <div className="px-3 py-1 rounded-lg text-sm font-medium bg-blue-100 text-blue-800 flex items-center gap-2">
+                                <FaClock />
+                                {lastUpdated.toLocaleTimeString()}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+
+            {/* Main Content */}
+            <div style={{
+                backgroundColor: theme.background,
+                padding: '2rem 3rem',
+                minHeight: 'calc(100vh - 80px)'
+            }}>
+
+                {/* Sidebar Controls - Streamlit style */}
+                <div style={{
+                    backgroundColor: theme.card,
+                    border: `1px solid ${theme.border}`,
+                    borderRadius: '8px',
+                    padding: '20px',
+                    marginBottom: '24px',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                }}>
+                    <h3 style={{
+                        fontSize: '16px',
+                        fontWeight: '600',
+                        color: theme.text.primary,
+                        marginBottom: '16px'
+                    }}>
+                        ⚙️ Configuration
+                    </h3>
+
+                    {/* Server Selector */}
+                    {servers.length > 0 && (
+                        <div style={{ marginBottom: '16px' }}>
+                            <label style={{
+                                fontSize: '14px',
+                                fontWeight: '500',
+                                color: theme.text.secondary,
+                                display: 'block',
+                                marginBottom: '8px'
+                            }}>
+                                Select Server
+                            </label>
+                            <select
+                                value={selectedServer || ''}
+                                onChange={(e) => setSelectedServer(e.target.value)}
+                                style={{
+                                    width: '100%',
+                                    padding: '10px 12px',
+                                    border: `1px solid ${theme.border}`,
+                                    borderRadius: '6px',
+                                    fontSize: '14px',
+                                    color: theme.text.primary,
+                                    backgroundColor: theme.card,
+                                    cursor: 'pointer',
+                                    outline: 'none'
+                                }}
+                            >
+                                {servers.map((server) => (
+                                    <option key={server.log_file} value={server.log_file}>
+                                        {server.server_name} ({server.size_mb} MB)
+                                    </option>
+                                ))}
+                            </select>
+                            {servers.length > 1 && (
+                                <div style={{
+                                    marginTop: '8px',
+                                    fontSize: '12px',
+                                    color: theme.text.secondary
+                                }}>
+                                    💡 {servers.length} servers available for monitoring
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Auto-refresh Toggle */}
+                    <div style={{ marginBottom: '12px' }}>
+                        <label style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            cursor: 'pointer',
+                            fontSize: '14px',
+                            color: theme.text.primary
+                        }}>
+                            <input
+                                type="checkbox"
+                                checked={autoRefresh}
+                                onChange={(e) => setAutoRefresh(e.target.checked)}
+                                style={{
+                                    width: '18px',
+                                    height: '18px',
+                                    cursor: 'pointer',
+                                    accentColor: theme.colors.blue
+                                }}
+                            />
+                            <span>Auto-refresh (every 30s)</span>
+                        </label>
+                        {autoRefresh && (
+                            <div style={{
+                                marginTop: '8px',
+                                padding: '8px 12px',
+                                backgroundColor: '#E7F5FF',
+                                borderRadius: '4px',
+                                fontSize: '13px',
+                                color: theme.colors.blue
+                            }}>
+                                ℹ️ Dashboard will refresh automatically
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Refresh Button */}
+                    <button
+                        onClick={fetchMonitoringData}
+                        disabled={isLoading}
+                        style={{
+                            width: '100%',
+                            padding: '10px 16px',
+                            backgroundColor: theme.colors.blue,
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: '6px',
+                            cursor: isLoading ? 'not-allowed' : 'pointer',
+                            fontSize: '14px',
+                            fontWeight: '500',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: '8px',
+                            opacity: isLoading ? 0.6 : 1
+                        }}
+                        onMouseEnter={(e) => !isLoading && (e.target.style.opacity = '0.9')}
+                        onMouseLeave={(e) => !isLoading && (e.target.style.opacity = '1')}
+                    >
+                        <FaSync className={isLoading ? 'animate-spin' : ''} />
+                        Refresh Now
+                    </button>
+                </div>
+
+                {/* Loading State */}
+                {isLoading && !stats && (
+                    <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        padding: '48px 0',
+                        backgroundColor: theme.card,
+                        borderRadius: '8px',
+                        border: `1px solid ${theme.border}`
+                    }}>
+                        <div style={{ textAlign: 'center' }}>
+                            <FaSync style={{
+                                fontSize: '32px',
+                                color: theme.colors.blue,
+                                marginBottom: '12px'
+                            }} className="animate-spin" />
+                            <p style={{ fontSize: '14px', color: theme.text.secondary }}>
+                                Loading monitoring data...
+                            </p>
+                        </div>
+                    </div>
+                )}
+
+                {/* Statistics */}
+                {stats && (
+                    <>
+                        {/* Current Metrics - Streamlit style */}
+                        <div style={{ marginBottom: '32px' }}>
+                            <h2 style={{
+                                fontSize: '28px',
+                                fontWeight: '600',
+                                color: theme.text.primary,
+                                marginBottom: '20px'
+                            }}>
+                                📈 Current Statistics
+                            </h2>
+                            <div style={{
+                                display: 'grid',
+                                gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                                gap: '16px'
+                            }}>
+                                <MetricCard
+                                    title="Current CPU Usage"
+                                    value={`${stats.current.cpu.toFixed(1)}%`}
+                                    delta={stats.delta.cpu}
+                                />
+                                <MetricCard
+                                    title="Average CPU"
+                                    value={`${stats.averages.cpu.toFixed(1)}%`}
+                                />
+                                <MetricCard
+                                    title="Peak CPU"
+                                    value={`${stats.peaks.cpu.toFixed(1)}%`}
+                                />
+                                <MetricCard
+                                    title="Memory Usage"
+                                    value={`${stats.current.memory.toFixed(1)}%`}
+                                    delta={stats.delta.memory}
+                                />
+                                <MetricCard
+                                    title="Memory Used"
+                                    value={`${stats.current.memUsedGB.toFixed(2)} GB`}
+                                />
+                                <MetricCard
+                                    title="Memory Available"
+                                    value={`${stats.current.memAvailGB.toFixed(2)} GB`}
+                                />
+                            </div>
+                        </div>
+
+                        {/* Main Charts - Streamlit style */}
+                        <div style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fit, minmax(500px, 1fr))',
+                            gap: '20px',
+                            marginBottom: '32px'
+                        }}>
+                            {/* CPU Usage Chart */}
+                            <div style={{
+                                backgroundColor: theme.card,
+                                border: `1px solid ${theme.border}`,
+                                borderRadius: '8px',
+                                padding: '24px',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                            }}>
+                                <h3 style={{
+                                    fontSize: '18px',
+                                    fontWeight: '600',
+                                    color: theme.text.primary,
+                                    marginBottom: '16px'
+                                }}>
+                                    💻 CPU Usage Over Time
+                                </h3>
+                                <ResponsiveContainer width="100%" height={350}>
+                                    <AreaChart data={chartData} margin={{ top: 20, right: 40, left: 20, bottom: 80 }}>
+                                        <defs>
+                                            <linearGradient id="cpuGradient" x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="5%" stopColor={chartColors.primary} stopOpacity={0.4} />
+                                                <stop offset="50%" stopColor={chartColors.primary} stopOpacity={0.2} />
+                                                <stop offset="95%" stopColor={chartColors.primary} stopOpacity={0.05} />
+                                            </linearGradient>
+                                        </defs>
+                                        <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                        <XAxis
+                                            dataKey="time"
+                                            stroke="#64748b"
+                                            fontSize={11}
+                                            tick={{ fontSize: 10, fill: '#64748b', angle: -90, textAnchor: 'end' }}
+                                            axisLine={false}
+                                            tickLine={false}
+                                            height={80}
+                                        />
+                                        <YAxis
+                                            domain={[0, 100]}
+                                            stroke="#64748b"
+                                            fontSize={11}
+                                            tick={{ fontSize: 10, fill: '#64748b' }}
+                                            axisLine={false}
+                                            tickLine={false}
+                                            width={60}
+                                            label={{
+                                                value: 'CPU Usage (%)',
+                                                angle: -90,
+                                                position: 'insideLeft',
+                                                style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                            }}
+                                        />
+                                        <Tooltip content={<CustomTooltip />} />
+                                        <Area
+                                            type="monotone"
+                                            dataKey="cpu"
+                                            stroke={chartColors.primary}
+                                            strokeWidth={3}
+                                            fillOpacity={1}
+                                            fill="url(#cpuGradient)"
+                                            dot={false}
+                                            activeDot={{
+                                                r: 6,
+                                                stroke: chartColors.primary,
+                                                strokeWidth: 2,
+                                                fill: 'white'
+                                            }}
+                                        />
+                                    </AreaChart>
+                                </ResponsiveContainer>
+                            </div>
+
+                            {/* Memory Usage Chart */}
+                            <div style={{
+                                backgroundColor: theme.card,
+                                border: `1px solid ${theme.border}`,
+                                borderRadius: '8px',
+                                padding: '24px',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                            }}>
+                                <h3 style={{
+                                    fontSize: '18px',
+                                    fontWeight: '600',
+                                    color: theme.text.primary,
+                                    marginBottom: '16px'
+                                }}>
+                                    🧠 Memory Usage Over Time
+                                </h3>
+                                <ResponsiveContainer width="100%" height={350}>
+                                    <AreaChart data={chartData} margin={{ top: 20, right: 40, left: 20, bottom: 80 }}>
+                                        <defs>
+                                            <linearGradient id="memoryGradient" x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="5%" stopColor={chartColors.warning} stopOpacity={0.4} />
+                                                <stop offset="50%" stopColor={chartColors.warning} stopOpacity={0.2} />
+                                                <stop offset="95%" stopColor={chartColors.warning} stopOpacity={0.05} />
+                                            </linearGradient>
+                                        </defs>
+                                        <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                        <XAxis
+                                            dataKey="time"
+                                            stroke="#64748b"
+                                            fontSize={11}
+                                            tick={{ fontSize: 10, fill: '#64748b', angle: -90, textAnchor: 'end' }}
+                                            axisLine={false}
+                                            tickLine={false}
+                                            height={80}
+                                        />
+                                        <YAxis
+                                            domain={[0, 100]}
+                                            stroke="#64748b"
+                                            fontSize={11}
+                                            tick={{ fontSize: 10, fill: '#64748b' }}
+                                            axisLine={false}
+                                            tickLine={false}
+                                            width={60}
+                                            label={{
+                                                value: 'Memory Usage (%)',
+                                                angle: -90,
+                                                position: 'insideLeft',
+                                                style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                            }}
+                                        />
+                                        <Tooltip content={<CustomTooltip />} />
+                                        <Area
+                                            type="monotone"
+                                            dataKey="memory"
+                                            stroke={chartColors.warning}
+                                            strokeWidth={3}
+                                            fillOpacity={1}
+                                            fill="url(#memoryGradient)"
+                                            dot={false}
+                                            activeDot={{
+                                                r: 6,
+                                                stroke: chartColors.warning,
+                                                strokeWidth: 2,
+                                                fill: 'white'
+                                            }}
+                                        />
+                                    </AreaChart>
+                                </ResponsiveContainer>
+                            </div>
+                        </div>
+
+                        {/* Memory Details - Streamlit style */}
+                        <div style={{
+                            backgroundColor: theme.card,
+                            border: `1px solid ${theme.border}`,
+                            borderRadius: '8px',
+                            padding: '24px',
+                            marginBottom: '32px',
+                            boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                        }}>
+                            <h3 style={{
+                                fontSize: '18px',
+                                fontWeight: '600',
+                                color: theme.text.primary,
+                                marginBottom: '16px'
+                            }}>
+                                💾 Memory Details (GB)
+                            </h3>
+                            <ResponsiveContainer width="100%" height={350}>
+                                <AreaChart data={chartData} margin={{ top: 20, right: 40, left: 20, bottom: 80 }}>
+                                    <defs>
+                                        <linearGradient id="memoryUsedGradient" x1="0" y1="0" x2="0" y2="1">
+                                            <stop offset="5%" stopColor={chartColors.secondary} stopOpacity={0.4} />
+                                            <stop offset="50%" stopColor={chartColors.secondary} stopOpacity={0.2} />
+                                            <stop offset="95%" stopColor={chartColors.secondary} stopOpacity={0.05} />
+                                        </linearGradient>
+                                        <linearGradient id="memoryAvailableGradient" x1="0" y1="0" x2="0" y2="1">
+                                            <stop offset="5%" stopColor={chartColors.success} stopOpacity={0.4} />
+                                            <stop offset="50%" stopColor={chartColors.success} stopOpacity={0.2} />
+                                            <stop offset="95%" stopColor={chartColors.success} stopOpacity={0.05} />
+                                        </linearGradient>
+                                    </defs>
+                                    <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                    <XAxis
+                                        dataKey="time"
+                                        stroke="#64748b"
+                                        fontSize={11}
+                                        tick={{ fontSize: 10, fill: '#64748b', angle: -90, textAnchor: 'end' }}
+                                        axisLine={false}
+                                        tickLine={false}
+                                        height={80}
+                                    />
+                                    <YAxis
+                                        stroke="#64748b"
+                                        fontSize={11}
+                                        tick={{ fontSize: 10, fill: '#64748b' }}
+                                        axisLine={false}
+                                        tickLine={false}
+                                        width={60}
+                                        label={{
+                                            value: 'Memory (GB)',
+                                            angle: -90,
+                                            position: 'insideLeft',
+                                            style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                        }}
+                                    />
+                                    <Tooltip content={<CustomTooltip />} />
+                                    <Legend
+                                        verticalAlign="top"
+                                        height={36}
+                                        iconType="circle"
+                                        wrapperStyle={{ paddingBottom: '10px' }}
+                                    />
+                                    <Area
+                                        type="monotone"
+                                        dataKey="memoryUsed"
+                                        stackId="1"
+                                        stroke={chartColors.secondary}
+                                        strokeWidth={3}
+                                        fillOpacity={1}
+                                        fill="url(#memoryUsedGradient)"
+                                        name="Used Memory"
+                                        dot={false}
+                                    />
+                                    <Area
+                                        type="monotone"
+                                        dataKey="memoryAvailable"
+                                        stackId="1"
+                                        stroke={chartColors.success}
+                                        strokeWidth={3}
+                                        fillOpacity={1}
+                                        fill="url(#memoryAvailableGradient)"
+                                        name="Available Memory"
+                                        dot={false}
+                                    />
+                                </AreaChart>
+                            </ResponsiveContainer>
+                            <div style={{ marginTop: '10px', fontSize: '12px', color: theme.text.secondary }}>
+                                📊 Green shows Available Memory, Red shows Used Memory
+                            </div>
+                        </div>
+
+                        {/* Additional Charts - Streamlit style */}
+                        <div style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fit, minmax(500px, 1fr))',
+                            gap: '20px',
+                            marginBottom: '32px'
+                        }}>
+                            {/* CPU Frequency */}
+                            {stats.current.frequency && (
+                                <div style={{
+                                    backgroundColor: theme.card,
+                                    border: `1px solid ${theme.border}`,
+                                    borderRadius: '8px',
+                                    padding: '24px',
+                                    boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                                }}>
+                                    <h3 style={{
+                                        fontSize: '18px',
+                                        fontWeight: '600',
+                                        color: theme.text.primary,
+                                        marginBottom: '16px'
+                                    }}>
+                                        🔄 CPU Frequency
+                                    </h3>
+                                    <ResponsiveContainer width="100%" height={300}>
+                                        <LineChart data={chartData} margin={{ top: 20, right: 40, left: 20, bottom: 80 }}>
+                                            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                            <XAxis
+                                                dataKey="time"
+                                                stroke="#64748b"
+                                                fontSize={11}
+                                                tick={{ fontSize: 10, fill: '#64748b', angle: -90, textAnchor: 'end' }}
+                                                axisLine={false}
+                                                tickLine={false}
+                                                height={80}
+                                            />
+                                            <YAxis
+                                                stroke="#64748b"
+                                                fontSize={11}
+                                                tick={{ fontSize: 10, fill: '#64748b' }}
+                                                axisLine={false}
+                                                tickLine={false}
+                                                width={60}
+                                                label={{
+                                                    value: 'Frequency (MHz)',
+                                                    angle: -90,
+                                                    position: 'insideLeft',
+                                                    style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                                }}
+                                            />
+                                            <Tooltip content={<CustomTooltip />} />
+                                            <Line
+                                                type="monotone"
+                                                dataKey="frequency"
+                                                stroke={chartColors.purple}
+                                                strokeWidth={3}
+                                                dot={{ r: 4, fill: chartColors.purple, stroke: 'white', strokeWidth: 2 }}
+                                                activeDot={{
+                                                    r: 8,
+                                                    stroke: chartColors.purple,
+                                                    strokeWidth: 3,
+                                                    fill: 'white',
+                                                    style: { filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.2))' }
+                                                }}
+                                            />
+                                        </LineChart>
+                                    </ResponsiveContainer>
+                                </div>
+                            )}
+
+                            {/* Load Average */}
+                            {stats.current.load.min1 !== undefined && (
+                                <div style={{
+                                    backgroundColor: theme.card,
+                                    border: `1px solid ${theme.border}`,
+                                    borderRadius: '8px',
+                                    padding: '24px',
+                                    boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                                }}>
+                                    <h3 style={{
+                                        fontSize: '18px',
+                                        fontWeight: '600',
+                                        color: theme.text.primary,
+                                        marginBottom: '16px'
+                                    }}>
+                                        ⚖️ Load Average
+                                    </h3>
+                                    <ResponsiveContainer width="100%" height={300}>
+                                        <LineChart data={chartData} margin={{ top: 20, right: 40, left: 20, bottom: 80 }}>
+                                            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                            <XAxis
+                                                dataKey="time"
+                                                stroke="#64748b"
+                                                fontSize={11}
+                                                tick={{ fontSize: 10, fill: '#64748b', angle: -90, textAnchor: 'end' }}
+                                                axisLine={false}
+                                                tickLine={false}
+                                                height={80}
+                                            />
+                                            <YAxis
+                                                stroke="#64748b"
+                                                fontSize={11}
+                                                tick={{ fontSize: 10, fill: '#64748b' }}
+                                                axisLine={false}
+                                                tickLine={false}
+                                                width={60}
+                                                label={{
+                                                    value: 'Load Average',
+                                                    angle: -90,
+                                                    position: 'insideLeft',
+                                                    style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                                }}
+                                            />
+                                            <Tooltip content={<CustomTooltip />} />
+                                            <Legend
+                                                verticalAlign="top"
+                                                height={36}
+                                                iconType="circle"
+                                                wrapperStyle={{ paddingBottom: '10px' }}
+                                            />
+                                            <Line
+                                                type="monotone"
+                                                dataKey="load1min"
+                                                stroke={chartColors.success}
+                                                strokeWidth={3}
+                                                dot={{ r: 4, fill: chartColors.success, stroke: 'white', strokeWidth: 2 }}
+                                                activeDot={{
+                                                    r: 8,
+                                                    stroke: chartColors.success,
+                                                    strokeWidth: 3,
+                                                    fill: 'white',
+                                                    style: { filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.2))' }
+                                                }}
+                                                name="1 min"
+                                            />
+                                            <Line
+                                                type="monotone"
+                                                dataKey="load5min"
+                                                stroke={chartColors.secondary}
+                                                strokeWidth={3}
+                                                dot={{ r: 4, fill: chartColors.secondary, stroke: 'white', strokeWidth: 2 }}
+                                                activeDot={{
+                                                    r: 8,
+                                                    stroke: chartColors.secondary,
+                                                    strokeWidth: 3,
+                                                    fill: 'white',
+                                                    style: { filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.2))' }
+                                                }}
+                                                name="5 min"
+                                            />
+                                            <Line
+                                                type="monotone"
+                                                dataKey="load15min"
+                                                stroke={chartColors.purple}
+                                                strokeWidth={3}
+                                                dot={{ r: 4, fill: chartColors.purple, stroke: 'white', strokeWidth: 2 }}
+                                                activeDot={{
+                                                    r: 8,
+                                                    stroke: chartColors.purple,
+                                                    strokeWidth: 3,
+                                                    fill: 'white',
+                                                    style: { filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.2))' }
+                                                }}
+                                                name="15 min"
+                                            />
+                                        </LineChart>
+                                    </ResponsiveContainer>
+                                    <div style={{ marginTop: '10px', fontSize: '12px', color: theme.text.secondary }}>
+                                        📊 Green: 1min, Red: 5min, Purple: 15min load averages
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Swap Usage - Streamlit style */}
+                        {stats.current.swap > 0 && (
+                            <div style={{
+                                backgroundColor: theme.card,
+                                border: `1px solid ${theme.border}`,
+                                borderRadius: '8px',
+                                padding: '24px',
+                                marginBottom: '32px',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                            }}>
+                                <h3 style={{
+                                    fontSize: '18px',
+                                    fontWeight: '600',
+                                    color: theme.text.primary,
+                                    marginBottom: '16px'
+                                }}>
+                                    🔄 Swap Memory Usage
+                                </h3>
+                                <ResponsiveContainer width="100%" height={300}>
+                                    <AreaChart data={chartData} margin={{ top: 20, right: 40, left: 20, bottom: 80 }}>
+                                        <defs>
+                                            <linearGradient id="swapGradient" x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="5%" stopColor={chartColors.pink} stopOpacity={0.4} />
+                                                <stop offset="50%" stopColor={chartColors.pink} stopOpacity={0.2} />
+                                                <stop offset="95%" stopColor={chartColors.pink} stopOpacity={0.05} />
+                                            </linearGradient>
+                                        </defs>
+                                        <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                        <XAxis
+                                            dataKey="time"
+                                            stroke="#64748b"
+                                            fontSize={11}
+                                            tick={{ fontSize: 10, fill: '#64748b', angle: -90, textAnchor: 'end' }}
+                                            axisLine={false}
+                                            tickLine={false}
+                                            height={80}
+                                        />
+                                        <YAxis
+                                            domain={[0, 100]}
+                                            stroke="#64748b"
+                                            fontSize={11}
+                                            tick={{ fontSize: 10, fill: '#64748b' }}
+                                            axisLine={false}
+                                            tickLine={false}
+                                            width={60}
+                                            label={{
+                                                value: 'Swap Usage (%)',
+                                                angle: -90,
+                                                position: 'insideLeft',
+                                                style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                            }}
+                                        />
+                                        <Tooltip content={<CustomTooltip />} />
+                                        <Area
+                                            type="monotone"
+                                            dataKey="swap"
+                                            stroke={chartColors.pink}
+                                            strokeWidth={3}
+                                            fillOpacity={1}
+                                            fill="url(#swapGradient)"
+                                            dot={false}
+                                            activeDot={{
+                                                r: 6,
+                                                stroke: chartColors.pink,
+                                                strokeWidth: 2,
+                                                fill: 'white'
+                                            }}
+                                        />
+                                    </AreaChart>
+                                </ResponsiveContainer>
+                            </div>
+                        )}
+
+                        {/* Per-Core CPU Usage Heatmap - Streamlit style */}
+                        {filteredData.length > 0 && filteredData[0].core_usage && filteredData[0].core_usage.length > 0 && (
+                            <div style={{
+                                backgroundColor: theme.card,
+                                border: `1px solid ${theme.border}`,
+                                borderRadius: '8px',
+                                padding: '24px',
+                                marginBottom: '32px',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                            }}>
+                                <h3 style={{
+                                    fontSize: '18px',
+                                    fontWeight: '600',
+                                    color: theme.text.primary,
+                                    marginBottom: '16px'
+                                }}>
+                                    🔥 Per-Core CPU Usage (Latest Sample)
+                                </h3>
+                                {(() => {
+                                    const latestData = filteredData[filteredData.length - 1];
+                                    if (!latestData || !latestData.core_usage) return <div>No core data available</div>;
+
+                                    // Helper function to get color based on usage
+                                    const getColorForUsage = (usage) => {
+                                        if (usage > 80) return chartColors.secondary; // Red for high
+                                        if (usage > 60) return chartColors.warning;   // Amber for medium
+                                        return chartColors.success;                    // Green for low
+                                    };
+
+                                    const coreData = latestData.core_usage.map((usage, index) => ({
+                                        core: `Core ${index}`,
+                                        usage: usage,
+                                        fill: getColorForUsage(usage)
+                                    }));
+
+                                    return (
+                                        <ResponsiveContainer width="100%" height={350}>
+                                            <BarChart data={coreData} margin={{ top: 20, right: 40, left: 20, bottom: 20 }}>
+                                                <defs>
+                                                    {/* Gradients for each color state */}
+                                                    <linearGradient id="coreGradientGreen" x1="0" y1="0" x2="0" y2="1">
+                                                        <stop offset="5%" stopColor={chartColors.success} stopOpacity={0.9} />
+                                                        <stop offset="95%" stopColor={chartColors.success} stopOpacity={0.6} />
+                                                    </linearGradient>
+                                                    <linearGradient id="coreGradientAmber" x1="0" y1="0" x2="0" y2="1">
+                                                        <stop offset="5%" stopColor={chartColors.warning} stopOpacity={0.9} />
+                                                        <stop offset="95%" stopColor={chartColors.warning} stopOpacity={0.6} />
+                                                    </linearGradient>
+                                                    <linearGradient id="coreGradientRed" x1="0" y1="0" x2="0" y2="1">
+                                                        <stop offset="5%" stopColor={chartColors.secondary} stopOpacity={0.9} />
+                                                        <stop offset="95%" stopColor={chartColors.secondary} stopOpacity={0.6} />
+                                                    </linearGradient>
+                                                </defs>
+                                                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                                <XAxis
+                                                    dataKey="core"
+                                                    stroke="#64748b"
+                                                    fontSize={11}
+                                                    tick={{ fontSize: 10, fill: '#64748b' }}
+                                                    axisLine={false}
+                                                    tickLine={false}
+                                                    height={40}
+                                                />
+                                                <YAxis
+                                                    domain={[0, 100]}
+                                                    stroke="#64748b"
+                                                    fontSize={11}
+                                                    tick={{ fontSize: 10, fill: '#64748b' }}
+                                                    axisLine={false}
+                                                    tickLine={false}
+                                                    width={60}
+                                                    label={{
+                                                        value: 'CPU Usage (%)',
+                                                        angle: -90,
+                                                        position: 'insideLeft',
+                                                        style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                                    }}
+                                                />
+                                                <Tooltip
+                                                    content={({ active, payload, label }) => {
+                                                        if (active && payload && payload.length) {
+                                                            const value = payload[0].value;
+                                                            const color = getColorForUsage(value);
+
+                                                            return (
+                                                                <div style={{
+                                                                    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+                                                                    border: '1px solid #e5e7eb',
+                                                                    borderRadius: '12px',
+                                                                    padding: '16px',
+                                                                    boxShadow: '0 10px 25px rgba(0, 0, 0, 0.15)',
+                                                                    backdropFilter: 'blur(8px)',
+                                                                    fontSize: '14px',
+                                                                    minWidth: '150px'
+                                                                }}>
+                                                                    <div style={{
+                                                                        marginBottom: '8px',
+                                                                        fontWeight: '600',
+                                                                        color: '#1f2937',
+                                                                        fontSize: '15px'
+                                                                    }}>
+                                                                        🔥 {label}
+                                                                    </div>
+                                                                    <div style={{
+                                                                        display: 'flex',
+                                                                        alignItems: 'center',
+                                                                        justifyContent: 'space-between'
+                                                                    }}>
+                                                                        <span style={{ color: '#374151', fontWeight: '500' }}>
+                                                                            CPU Usage
+                                                                        </span>
+                                                                        <span style={{
+                                                                            fontWeight: '600',
+                                                                            color: color,
+                                                                            backgroundColor: 'rgba(0,0,0,0.05)',
+                                                                            padding: '4px 12px',
+                                                                            borderRadius: '8px',
+                                                                            fontSize: '16px'
+                                                                        }}>
+                                                                            {value.toFixed(1)}%
+                                                                        </span>
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        }
+                                                        return null;
+                                                    }}
+                                                />
+                                                <Bar
+                                                    dataKey="usage"
+                                                    radius={[6, 6, 0, 0]}
+                                                >
+                                                    {coreData.map((entry, index) => {
+                                                        let gradientId = 'coreGradientGreen';
+                                                        if (entry.usage > 80) gradientId = 'coreGradientRed';
+                                                        else if (entry.usage > 60) gradientId = 'coreGradientAmber';
+
+                                                        return (
+                                                            <Cell
+                                                                key={`cell-${index}`}
+                                                                fill={`url(#${gradientId})`}
+                                                                stroke="rgba(255,255,255,0.3)"
+                                                                strokeWidth={1}
+                                                            />
+                                                        );
+                                                    })}
+                                                </Bar>
+                                            </BarChart>
+                                        </ResponsiveContainer>
+                                    );
+                                })()}
+                                <div style={{
+                                    marginTop: '12px',
+                                    fontSize: '13px',
+                                    color: theme.text.secondary,
+                                    textAlign: 'center'
+                                }}>
+                                    💡 Green = Low usage, Yellow = Moderate, Red = High usage
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Statistics Tables - Streamlit style */}
+                        <h2 style={{
+                            fontSize: '28px',
+                            fontWeight: '600',
+                            color: theme.text.primary,
+                            marginBottom: '20px',
+                            marginTop: '16px'
+                        }}>
+                            📊 Detailed Statistics
+                        </h2>
+                        <div style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fit, minmax(400px, 1fr))',
+                            gap: '20px',
+                            marginBottom: '32px'
+                        }}>
+                            {/* CPU Statistics */}
+                            <div style={{
+                                backgroundColor: theme.card,
+                                border: `1px solid ${theme.border}`,
+                                borderRadius: '8px',
+                                padding: '24px',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                            }}>
+                                <h3 style={{
+                                    fontSize: '16px',
+                                    fontWeight: '600',
+                                    color: theme.text.primary,
+                                    marginBottom: '16px'
+                                }}>
+                                    CPU Statistics
+                                </h3>
+                                <table style={{ width: '100%', fontSize: '14px', borderCollapse: 'collapse' }}>
+                                    <thead>
+                                        <tr style={{ borderBottom: `2px solid ${theme.border}` }}>
+                                            <th style={{
+                                                textAlign: 'left',
+                                                padding: '12px 0',
+                                                fontWeight: '500',
+                                                color: theme.text.secondary
+                                            }}>Metric</th>
+                                            <th style={{
+                                                textAlign: 'right',
+                                                padding: '12px 0',
+                                                fontWeight: '500',
+                                                color: theme.text.secondary
+                                            }}>Value</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody style={{ color: theme.text.primary }}>
+                                        <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
+                                            <td style={{ padding: '12px 0' }}>Average CPU</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.averages.cpu.toFixed(2)}%</td>
+                                        </tr>
+                                        <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
+                                            <td style={{ padding: '12px 0' }}>Minimum CPU</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.mins.cpu.toFixed(2)}%</td>
+                                        </tr>
+                                        <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
+                                            <td style={{ padding: '12px 0' }}>Maximum CPU</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.peaks.cpu.toFixed(2)}%</td>
+                                        </tr>
+                                        <tr>
+                                            <td style={{ padding: '12px 0' }}>Std Deviation</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.std.cpu.toFixed(2)}%</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            {/* Memory Statistics */}
+                            <div style={{
+                                backgroundColor: theme.card,
+                                border: `1px solid ${theme.border}`,
+                                borderRadius: '8px',
+                                padding: '24px',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                            }}>
+                                <h3 style={{
+                                    fontSize: '16px',
+                                    fontWeight: '600',
+                                    color: theme.text.primary,
+                                    marginBottom: '16px'
+                                }}>
+                                    Memory Statistics
+                                </h3>
+                                <table style={{ width: '100%', fontSize: '14px', borderCollapse: 'collapse' }}>
+                                    <thead>
+                                        <tr style={{ borderBottom: `2px solid ${theme.border}` }}>
+                                            <th style={{
+                                                textAlign: 'left',
+                                                padding: '12px 0',
+                                                fontWeight: '500',
+                                                color: theme.text.secondary
+                                            }}>Metric</th>
+                                            <th style={{
+                                                textAlign: 'right',
+                                                padding: '12px 0',
+                                                fontWeight: '500',
+                                                color: theme.text.secondary
+                                            }}>Value</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody style={{ color: theme.text.primary }}>
+                                        <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
+                                            <td style={{ padding: '12px 0' }}>Average Memory</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.averages.memory.toFixed(2)}%</td>
+                                        </tr>
+                                        <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
+                                            <td style={{ padding: '12px 0' }}>Minimum Memory</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.mins.memory.toFixed(2)}%</td>
+                                        </tr>
+                                        <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
+                                            <td style={{ padding: '12px 0' }}>Maximum Memory</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.peaks.memory.toFixed(2)}%</td>
+                                        </tr>
+                                        <tr>
+                                            <td style={{ padding: '12px 0' }}>Std Deviation</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.std.memory.toFixed(2)}%</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        {/* Footer - Streamlit style */}
+                        <div style={{
+                            backgroundColor: theme.card,
+                            border: `1px solid ${theme.border}`,
+                            borderRadius: '8px',
+                            padding: '16px 20px',
+                            marginTop: '24px',
+                            fontSize: '13px',
+                            color: theme.text.secondary
+                        }}>
+                            <div style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                flexWrap: 'wrap',
+                                gap: '12px'
+                            }}>
+                                <div>
+                                    <strong style={{ color: theme.text.primary }}>Server:</strong> {servers.find(s => s.log_file === selectedServer)?.server_name || 'Unknown'} (UTC)
+                                </div>
+                                <div>
+                                    <strong style={{ color: theme.text.primary }}>Last Updated:</strong> {new Date().toLocaleString()} ({Intl.DateTimeFormat().resolvedOptions().timeZone})
+                                </div>
+                                <div>
+                                    <strong style={{ color: theme.text.primary }}>Total Records:</strong> {filteredData.length}
+                                </div>
+                                {filteredData.length > 0 && (
+                                    <div style={{ width: '100%', marginTop: '8px', paddingTop: '12px', borderTop: `1px solid ${theme.border}` }}>
+                                        <strong style={{ color: theme.text.primary }}>Data Range:</strong>{' '}
+                                        {new Date(filteredData[0].timestamp).toLocaleString()} to {new Date(filteredData[filteredData.length - 1].timestamp).toLocaleString()}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </>
+                )}
+            </div>
+        </div>
+    );
+};
+
+export default SystemMonitoring;
+/**
+     * Get System Monitoring Data
+     * Fetches CPU and memory monitoring data for dashboard
+     * @param {string} timeRange - Time range to fetch (1h, 6h, 12h, 24h, all)
+     * @param {string} logFile - Optional path to specific log file
+     * @returns {Promise<Object>} Monitoring data
+     */
+    static async getSystemMonitoring(timeRange = '1h', logFile = null, maxPoints = 1200) {
+        return this.retryRequest(async () => {
+            // console.log(`Fetching system monitoring data (range: ${timeRange}, log: ${logFile || 'default'})`);
+
+            let url = `${API_BASE_URL}/monitoring?range=${timeRange}&max_points=${maxPoints}`;
+            if (logFile) {
+                url += `&log_file=${encodeURIComponent(logFile)}`;
+            }
+
+            const response = await this.fetchWithTimeout(
+                url,
+                {
+                    method: 'GET',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                }
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to fetch monitoring data: ${response.statusText}`);
+            }
+
+            const result = await response.json();
+            // console.log(`Monitoring data fetched successfully (${result.data?.length || 0} records)`);
+
+            return result;
+        });
+    }
+
+
