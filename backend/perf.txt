@@ -1,1 +1,293 @@
+import pandas as pd
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+import polars as pl
+from pathlib import Path
+
+
+def safe_save_parquet(
+    df: pd.DataFrame,
+    path: str,
+    engine: str = "auto",           # "polars" | "pyarrow" | "auto"
+    chunk_size: int = 500_000,      # rows per chunk for huge datasets
+    compression: str = "snappy",    # snappy | zstd | lz4 | gzip
+) -> None:
+    """
+    Safely saves a huge pandas DataFrame to parquet.
+    Handles dtype issues, mixed types, nulls without full-cast to string.
+    """
+    path = Path(path)
+
+    # ── Step 1: Fix dtypes in-place (minimal memory overhead) ─────────────
+    df = _fix_dtypes(df)
+
+    # ── Step 2: Choose engine ──────────────────────────────────────────────
+    if engine == "auto":
+        engine = "polars" if _polars_available() else "pyarrow"
+
+    if engine == "polars":
+        _save_via_polars(df, path, compression)
+    else:
+        _save_via_pyarrow(df, path, compression, chunk_size)
+
+    print(f"✅ Saved → {path} ({path.stat().st_size / 1e6:.2f} MB)")
+
+
+# ── dtype fixer: works column by column, no full DataFrame copy ───────────
+def _fix_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy(deep=False)  # shallow copy — only metadata, not data
+
+    for col in df.columns:
+        col_dtype = df[col].dtype
+
+        # Mixed object columns — most common failure point
+        if col_dtype == object:
+            df[col] = _fix_object_column(df[col])
+
+        # Nullable int/float with pandas ExtensionTypes
+        elif col_dtype in ["Int8","Int16","Int32","Int64",
+                           "UInt8","UInt16","UInt32","UInt64"]:
+            df[col] = df[col].astype(pd.Int64Dtype())  # pyarrow handles this
+
+        # Inf values break parquet — replace with null
+        elif np.issubdtype(col_dtype, np.floating):
+            df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+
+    return df
+
+
+def _fix_object_column(series: pd.Series) -> pd.Series:
+    # Try numeric first — most common mixed-type case
+    converted = pd.to_numeric(series, errors="coerce")
+    if converted.notna().sum() / max(len(series), 1) > 0.8:
+        return converted  # mostly numeric → keep as float
+
+    # Try datetime
+    try:
+        converted = pd.to_datetime(series, errors="coerce", infer_datetime_format=True)
+        if converted.notna().sum() / max(len(series), 1) > 0.8:
+            return converted
+    except Exception:
+        pass
+
+    # Fallback: stringify only this column, nullify empties
+    return (
+        series
+        .where(series.notna(), other=None)        # NaN → None (pyarrow null)
+        .apply(lambda x: str(x) if x is not None else None)
+    )
+
+
+# ── Polars path: fastest, most memory efficient ────────────────────────────
+def _save_via_polars(df: pd.DataFrame, path: Path, compression: str) -> None:
+    # Polars from_pandas handles most dtype mismatches natively
+    pl_df = pl.from_pandas(df, nan_to_null=True)  # NaN → null (not string)
+    pl_df.write_parquet(
+        str(path),
+        compression=compression,
+        use_pyarrow=True,            # pyarrow backend for max compatibility
+        statistics=True,             # enables predicate pushdown later
+    )
+
+
+# ── PyArrow path: chunked write — for files that don't fit in RAM ──────────
+def _save_via_pyarrow(
+    df: pd.DataFrame, path: Path, compression: str, chunk_size: int
+) -> None:
+    writer = None
+    try:
+        for start in range(0, len(df), chunk_size):
+            chunk = df.iloc[start : start + chunk_size]
+            table = _to_arrow_table(chunk)
+
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    str(path),
+                    schema=table.schema,
+                    compression=compression,
+                    use_dictionary=True,    # great for low-cardinality strings
+                    write_statistics=True,
+                )
+            writer.write_table(table)
+            print(f"  written rows {start} → {start + len(chunk)}")
+    finally:
+        if writer:
+            writer.close()
+
+
+def _to_arrow_table(chunk: pd.DataFrame) -> pa.Table:
+    try:
+        return pa.Table.from_pandas(chunk, preserve_index=False)
+    except pa.ArrowInvalid as e:
+        # Column-level fallback: find the bad column and cast it
+        print(f"⚠️  Arrow conversion issue: {e} — running column fallback")
+        arrays, fields = [], []
+        for col in chunk.columns:
+            try:
+                arr = pa.array(chunk[col].tolist(), from_pandas=True)
+            except Exception:
+                # Last resort: cast bad column to string, keep nulls as null
+                arr = pa.array(
+                    [str(v) if pd.notna(v) else None for v in chunk[col]],
+                    type=pa.string(),
+                )
+            arrays.append(arr)
+            fields.append(pa.field(col, arr.type))
+        return pa.table(dict(zip(chunk.columns, arrays)))
+
+
+def _polars_available() -> bool:
+    try:
+        import polars
+        return True
+    except ImportError:
+        return False
+Solution 1: Streaming .collect() — Never Load Full Dataset
+The biggest memory killer is materializing the entire parquet into RAM. Use streaming=True:
+import polars as pl
+
+def read_parquet_streaming(path: str, filters: dict = None):
+    query = pl.scan_parquet(path)
+    
+    # Push predicates DOWN before collect — Polars won't load filtered rows
+    if filters:
+        query = query.filter(pl.col(filters["col"]) == filters["val"])
+    
+    # streaming=True = chunked execution, never loads full file into RAM
+    return query.collect(streaming=True)
+Why this wins on memory: Polars processes data in chunks (~8MB default). A 10GB parquet file never fully lives in RAM.
+Solution 2: Full Production-Grade Implementation
+import asyncio
+import os
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import asynccontextmanager
+from functools import lru_cache
+from typing import Any
+
+import polars as pl
+import pyarrow.dataset as ds
+from fastapi import FastAPI, Query
+from fastapi.responses import ORJSONResponse  # faster JSON than default
+
+# ── Tune Polars before anything imports it ─────────────────────────────────
+os.environ["RAYON_NUM_THREADS"] = str(max(2, os.cpu_count() // 2))
+os.environ["POLARS_STREAMING_CHUNK_SIZE"] = "131072"  # 128k rows per chunk
+
+# ── Globals ────────────────────────────────────────────────────────────────
+_executor: ProcessPoolExecutor = None
+_semaphore: asyncio.Semaphore = None
+
+
+# ── Lifespan: clean startup/shutdown ──────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _executor, _semaphore
+    workers = max(2, os.cpu_count() // 2)
+    _executor = ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_worker_init,  # each worker pre-warms Polars
+    )
+    _semaphore = asyncio.Semaphore(workers * 2)  # prevent oversubscription
+    yield
+    _executor.shutdown(wait=True)
+
+
+app = FastAPI(lifespan=lifespan, default_response_class=ORJSONResponse)
+
+
+# ── Worker initializer: runs once per process ──────────────────────────────
+def _worker_init():
+    """Pre-import and warm up Polars in each worker process."""
+    import polars as pl
+    os.environ["RAYON_NUM_THREADS"] = str(max(2, os.cpu_count() // 2))
+    # Warm JIT / schema cache
+    pl.DataFrame({"warmup": [1]}).lazy().collect()
+
+
+# ── Core query function (runs in worker process) ──────────────────────────
+def _execute_query(path: str, col_filter: str | None, val_filter: Any | None):
+    import polars as pl
+
+    query = pl.scan_parquet(
+        path,
+        parallel="prefiltered",   # best for selective queries on large files
+        low_memory=True,          # trades speed for memory on huge files
+        cache=True,               # schema/metadata caching
+    )
+
+    # Predicate pushdown — happens at Arrow/Parquet level, not in RAM
+    if col_filter and val_filter is not None:
+        query = query.filter(pl.col(col_filter) == val_filter)
+
+    return (
+        query
+        .select(pl.all())         # add column pruning here for extra savings
+        .collect(streaming=True)  # ← streaming: chunked, memory-bounded
+        .to_dicts()
+    )
+
+
+# ── Route ──────────────────────────────────────────────────────────────────
+@app.get("/data")
+async def get_data(
+    path: str,
+    filter_col: str | None = Query(default=None),
+    filter_val: str | None = Query(default=None),
+):
+    loop = asyncio.get_running_loop()
+
+    async with _semaphore:  # bound concurrency — prevents memory spike
+        result = await loop.run_in_executor(
+            _executor,
+            _execute_query,
+            path,
+            filter_col,
+            filter_val,
+        )
+
+    return result
+Solution 3: Schema + Metadata Caching (Kills Latency on Repeated Calls)
+Parquet schema reads are expensive on first call. Cache them:
+from functools import lru_cache
+import polars as pl
+
+@lru_cache(maxsize=256)
+def _get_schema(path: str) -> dict:
+    """Cache schema so repeated scans skip metadata IO."""
+    return pl.read_parquet_schema(path)
+
+def _execute_query(path: str, columns: list[str] | None = None):
+    schema = _get_schema(path)  # instant after first call
+    
+    # Only select columns you need — column pruning at Parquet reader level
+    target_cols = columns or list(schema.keys())
+    
+    return (
+        pl.scan_parquet(path)
+        .select(target_cols)        # Parquet skips unselected column chunks
+        .collect(streaming=True)
+    )
+Solution 4: Arrow IPC Over JSON for Inter-service Latency
+If you're passing DataFrames between services, never serialize to JSON — use Arrow IPC (zero-copy):
+import io
+from fastapi.responses import Response
+
+@app.get("/data/arrow")
+async def get_data_arrow(path: str):
+    loop = asyncio.get_running_loop()
+    
+    async with _semaphore:
+        df: pl.DataFrame = await loop.run_in_executor(
+            _executor, _execute_query_raw, path
+        )
+    
+    # Arrow IPC: 10-50x faster than JSON, preserves types
+    buf = io.BytesIO()
+    df.write_ipc(buf)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.apache.arrow.stream"
+    )
+
 
