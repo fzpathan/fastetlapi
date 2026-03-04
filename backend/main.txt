@@ -1,937 +1,588 @@
-reference File Searvice
-
-"""
-Reference File Service
-Handles reading CSV and ZIP reference files with configurable delimiters and encodings.
-Uses Polars for efficient data operations.
-"""
-from __future__ import annotations
-
-import io
-import math
-import re
-import zipfile
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
-
-import polars as pl
-
-# Resolve project root (api/ directory)
-_API_DIR = Path(__file__).parent
-_PROJECT_ROOT = _API_DIR.parent
-
-
-def _resolve_path(path_str: str) -> Path:
-    """Resolve a file path relative to the project root if not absolute."""
-    p = Path(path_str)
-    if p.is_absolute():
-        return p
-    return (_PROJECT_ROOT / p).resolve()
-
-
-def _load_df(file_spec: dict) -> pl.DataFrame:
-    """Load a reference file (CSV, ZIP+CSV, or Parquet) into a Polars DataFrame."""
-    path = _resolve_path(file_spec["path"])
-    fmt = file_spec.get("format", "csv").lower()
-
-    if fmt == "parquet":
-        return pl.read_parquet(str(path))
-
-    delimiter = file_spec.get("delimiter", ",")
-    encoding = file_spec.get("encoding", "utf-8")
-    has_header = file_spec.get("has_header", True)
-
-    if fmt == "zip":
-        inner_file = file_spec.get("inner_file")
-        if not inner_file:
-            raise ValueError("ZIP format requires 'inner_file' in file spec")
-        with zipfile.ZipFile(str(path)) as zf:
-            with zf.open(inner_file) as f:
-                raw = f.read()
-        return pl.read_csv(
-            io.BytesIO(raw),
-            separator=delimiter,
-            encoding=encoding,
-            has_header=has_header,
-            infer_schema_length=1000,
-            ignore_errors=True,
-        )
-
-    # CSV / TSV / other text-delimited formats
-    return pl.read_csv(
-        str(path),
-        separator=delimiter,
-        encoding=encoding,
-        has_header=has_header,
-        infer_schema_length=1000,
-        ignore_errors=True,
-    )
-
-
-def _sanitize(obj):
-    """Replace NaN/Inf floats with None for JSON safety."""
-    if isinstance(obj, float):
-        return None if (math.isnan(obj) or math.isinf(obj)) else obj
-    if isinstance(obj, dict):
-        return {k: _sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_sanitize(v) for v in obj]
-    return obj
-
-
-class ReferenceFileService:
-    """Service for reading known reference files with configurable specs."""
-
-    # ------------------------------------------------------------------ #
-    # Metadata                                                             #
-    # ------------------------------------------------------------------ #
-
-    def get_file_metadata(self, file_spec: dict) -> dict:
-        """
-        Return column names and total row count for a reference file.
-        Tries to read only the schema (fast) before falling back to full load.
-        """
-        path = _resolve_path(file_spec["path"])
-        fmt = file_spec.get("format", "csv").lower()
-
-        # If columns are provided in the spec, return them directly
-        spec_columns = file_spec.get("columns")
-
-        if fmt == "parquet":
-            # Lazy scan for Parquet – very fast on large files
-            try:
-                lf = pl.scan_parquet(str(path))
-                columns = lf.schema.names()
-                total_rows = lf.select(pl.len()).collect().item()
-            except Exception:
-                df = pl.read_parquet(str(path))
-                columns = df.columns
-                total_rows = len(df)
-        elif fmt == "zip":
-            # Must fully load for ZIPs (no lazy scan inside archives)
-            df = _load_df(file_spec)
-            columns = df.columns
-            total_rows = len(df)
-        else:
-            # Lazy scan for CSV – much faster on large files
-            delimiter = file_spec.get("delimiter", ",")
-            encoding = file_spec.get("encoding", "utf-8")
-            has_header = file_spec.get("has_header", True)
-            try:
-                lf = pl.scan_csv(
-                    str(path),
-                    separator=delimiter,
-                    encoding=encoding,
-                    has_header=has_header,
-                    infer_schema_length=1000,
-                    ignore_errors=True,
-                )
-                columns = lf.schema.names()
-                total_rows = lf.select(pl.len()).collect().item()
-            except Exception:
-                df = _load_df(file_spec)
-                columns = df.columns
-                total_rows = len(df)
-
-        # Override with spec columns if provided (for display purposes)
-        if spec_columns:
-            # Use spec columns as the canonical list; still report actual total_rows
-            columns = spec_columns
-
-        return {
-            "columns": columns,
-            "total_rows": total_rows,
-            "file_format": fmt,
-            "path": str(path),
-        }
-
-    # ------------------------------------------------------------------ #
-    # Paginated browsing                                                   #
-    # ------------------------------------------------------------------ #
-
-    def read_file_paginated(
-        self,
-        file_spec: dict,
-        page: int = 1,
-        page_size: int = 50,
-        sort_column: Optional[str] = None,
-        sort_direction: str = "asc",
-    ) -> dict:
-        """
-        Return a page of rows from the reference file, with optional sorting.
-        """
-        df = _load_df(file_spec)
-        columns = df.columns
-        total_rows = len(df)
-
-        if sort_column and sort_column in df.columns:
-            descending = sort_direction.lower() == "desc"
-            df = df.sort(sort_column, descending=descending, nulls_last=True)
-
-        start = (page - 1) * page_size
-        end = start + page_size
-        page_df = df.slice(start, page_size)
-
-        total_pages = (total_rows + page_size - 1) // page_size if total_rows > 0 else 0
-
-        data = _sanitize(page_df.to_dicts())
-
-        return {
-            "data": data,
-            "columns": columns,
-            "pagination": {
-                "current_page": page,
-                "page_size": page_size,
-                "total_rows": total_rows,
-                "total_pages": total_pages,
-                "has_next": page < total_pages,
-                "has_previous": page > 1,
-            },
-        }
-
-    # ------------------------------------------------------------------ #
-    # Search                                                               #
-    # ------------------------------------------------------------------ #
-
-    def search_in_file(
-        self,
-        file_spec: dict,
-        query: str,
-        column: Optional[str] = None,
-        limit: int = 5000,
-    ) -> dict:
-        """
-        Search for a query string (regex supported) across all or a specific column.
-        Returns up to `limit` matching rows.
-        """
-        df = _load_df(file_spec)
-
-        if column:
-            # Scope search to a single column
-            if column not in df.columns:
-                return {"results": [], "results_limited": False, "limit_applied": limit}
-            mask = df[column].cast(pl.Utf8).str.contains(query, literal=False)
-        else:
-            # Search across all columns (OR condition)
-            masks = [
-                df[col].cast(pl.Utf8).str.contains(query, literal=False)
-                for col in df.columns
-            ]
-            if not masks:
-                return {"results": [], "results_limited": False, "limit_applied": limit}
-            mask = masks[0]
-            for m in masks[1:]:
-                mask = mask | m
-
-        filtered = df.filter(mask)
-        total_found = len(filtered)
-        results_limited = total_found > limit
-
-        limited = filtered.head(limit)
-        results = _sanitize(limited.to_dicts())
-
-        return {
-            "results": results,
-            "total_found": total_found,
-            "results_limited": results_limited,
-            "limit_applied": limit,
-        }
-
-    # ------------------------------------------------------------------ #
-    # Multi-value search (Excel paste)                                     #
-    # ------------------------------------------------------------------ #
-
-    def search_multiple_values(
-        self,
-        file_spec: dict,
-        values: list,
-        column: str,
-        limit: int = 5000,
-        exact_match: bool = True,
-    ) -> dict:
-        """
-        Search a specific column for any of the provided values (Excel paste mode).
-        Uses is_in() for exact matching or str.contains() OR-chain for partial matching.
-        Column is required — multi-value search across all columns is not supported.
-        """
-        if not values:
-            return {"results": [], "total_found": 0, "results_limited": False, "limit_applied": limit}
-
-        df = _load_df(file_spec)
-
-        if column not in df.columns:
-            return {"results": [], "total_found": 0, "results_limited": False, "limit_applied": limit,
-                    "error": f"Column '{column}' not found in file"}
-
-        col_str = df[column].cast(pl.Utf8)
-
-        if exact_match:
-            # Cast values to string for consistent comparison
-            str_values = [str(v).strip() for v in values if str(v).strip()]
-            mask = col_str.is_in(str_values)
-        else:
-            # Partial / contains matching — OR across all values
-            masks = [col_str.str.contains(str(v).strip(), literal=True) for v in values if str(v).strip()]
-            if not masks:
-                return {"results": [], "total_found": 0, "results_limited": False, "limit_applied": limit}
-            mask = masks[0]
-            for m in masks[1:]:
-                mask = mask | m
-
-        filtered = df.filter(mask)
-        total_found = len(filtered)
-        results_limited = total_found > limit
-        results = _sanitize(filtered.head(limit).to_dicts())
-
-        return {
-            "results": results,
-            "total_found": total_found,
-            "results_limited": results_limited,
-            "limit_applied": limit,
-            "values_searched": len(values),
-        }
-
-
-    # ------------------------------------------------------------------ #
-    # Folder-based discovery                                               #
-    # ------------------------------------------------------------------ #
-
-    def discover_files_in_folder(
-        self,
-        folder_path: str,
-        file_pattern: str = ".*",
-        date_from: Optional[str] = None,
-        date_to: Optional[str] = None,
-        date_group_index: int = 1,
-        date_format: str = "%Y%m%d",
-    ) -> list:
-        """
-        Scan a folder and return files whose names match file_pattern (regex).
-        Optionally filter by date range extracted from a capture group in the pattern.
-        date_from / date_to are ISO strings (YYYY-MM-DD).
-        """
-        folder = _resolve_path(folder_path)
-        if not folder.exists() or not folder.is_dir():
-            return []
-
-        try:
-            pattern = re.compile(file_pattern)
-        except re.error:
-            return []
-
-        dt_from = None
-        dt_to = None
-        if date_from:
-            try:
-                dt_from = datetime.strptime(date_from, "%Y-%m-%d")
-            except ValueError:
-                pass
-        if date_to:
-            try:
-                dt_to = datetime.strptime(date_to, "%Y-%m-%d")
-            except ValueError:
-                pass
-
-        found = []
-        for f in sorted(folder.iterdir()):
-            if not f.is_file():
-                continue
-            m = pattern.search(f.name)
-            if not m:
-                continue
-
-            file_date = None
-            try:
-                if m.lastindex and m.lastindex >= date_group_index:
-                    date_str = m.group(date_group_index)
-                    file_date = datetime.strptime(date_str, date_format)
-            except (ValueError, IndexError):
-                pass
-
-            if dt_from and file_date and file_date < dt_from:
-                continue
-            if dt_to and file_date and file_date > dt_to:
-                continue
-
-            found.append({
-                "path": str(f),
-                "name": f.name,
-                "date": file_date.strftime("%Y-%m-%d") if file_date else None,
-            })
-
-        return found
-
-    # ------------------------------------------------------------------ #
-    # Cross-folder search                                                  #
-    # ------------------------------------------------------------------ #
-
-    def search_across_folder(
-        self,
-        file_spec: dict,
-        query: str,
-        column: Optional[str] = None,
-        limit: int = 5000,
-        date_from: Optional[str] = None,
-        date_to: Optional[str] = None,
-        file_regex: Optional[str] = None,
-    ) -> dict:
-        """
-        Search across all files in a folder that match the discovery criteria.
-        file_regex overrides the spec's file_pattern if provided.
-        Results from all matching files are combined up to limit.
-        """
-        folder_path = file_spec.get("folder_path", "")
-        file_pattern = file_regex if file_regex else file_spec.get("file_pattern", ".*")
-        date_group_index = file_spec.get("date_group_index", 1)
-        date_format_str = file_spec.get("date_format", "%Y%m%d")
-
-        discovered = self.discover_files_in_folder(
-            folder_path=folder_path,
-            file_pattern=file_pattern,
-            date_from=date_from,
-            date_to=date_to,
-            date_group_index=date_group_index,
-            date_format=date_format_str,
-        )
-
-        if not discovered:
-            return {
-                "results": [],
-                "total_found": 0,
-                "results_limited": False,
-                "limit_applied": limit,
-                "files_searched": 0,
-                "files_available": 0,
-            }
-
-        all_results = []
-        files_searched = 0
-        for file_info in discovered:
-            if len(all_results) >= limit:
-                break
-            single_spec = {**file_spec, "path": file_info["path"]}
-            remaining = limit - len(all_results)
-            try:
-                result = self.search_in_file(
-                    file_spec=single_spec,
-                    query=query,
-                    column=column,
-                    limit=remaining,
-                )
-                all_results.extend(result.get("results", []))
-                files_searched += 1
-            except Exception:
-                pass
-
-        results_limited = len(all_results) >= limit
-        return {
-            "results": all_results[:limit],
-            "total_found": len(all_results),
-            "results_limited": results_limited,
-            "limit_applied": limit,
-            "files_searched": files_searched,
-            "files_available": len(discovered),
-        }
-
-
-# Singleton instance
-reference_file_service = ReferenceFileService()
-
-
-
-
-Ref Search 
-
-
-"""
-Reference File Search Router
-Provides search and browse functionality for known reference files (CSV, ZIP).
-File specifications are loaded from api/data/reference_files.json.
-"""
-from fastapi import APIRouter, HTTPException
-from typing import Optional, List
-from pydantic import BaseModel
-from datetime import datetime
-import logging
-from pathlib import Path
-import sys
-import json
-import subprocess
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from .utils import make_json_safe
-
-logger = logging.getLogger(__name__)
-
-router = APIRouter(prefix="/api/reference-search", tags=["reference-search"])
-
-
-class MultiValueSearchRequest(BaseModel):
-    column: str
-    values: List[str]
-    exact_match: bool = True
-    page: int = 1
-    page_size: int = 50
-    limit: int = 5000
-
-SUBPROCESS_TIMEOUT = 300  # seconds
-
-# Path to the file specs config
-_API_DIR = Path(__file__).parent.parent
-REFERENCE_FILES_CONFIG = _API_DIR / "data" / "reference_search.json"
-
-
-# ------------------------------------------------------------------ #
-# Helpers                                                              #
-# ------------------------------------------------------------------ #
-
-def _load_reference_files() -> dict:
-    """Load reference file specs from JSON config. Returns dict keyed by file id."""
-    if not REFERENCE_FILES_CONFIG.exists():
-        logger.warning(f"Reference files config not found: {REFERENCE_FILES_CONFIG}")
-        return {}
-    try:
-        with open(REFERENCE_FILES_CONFIG, "r", encoding="utf-8") as f:
-            config = json.load(f)
-        return {entry["id"]: entry for entry in config.get("files", [])}
-    except Exception as e:
-        logger.error(f"Failed to load reference files config: {e}")
-        return {}
-
-
-def _run_reference_subprocess(mode: str, request: dict):
-    """Run the reference_sub.py subprocess and return the result."""
-    script_path = Path(__file__).with_name("reference_sub.py")
-    payload = {"mode": mode, "request": request}
-    proc = subprocess.run(
-        [sys.executable, str(script_path)],
-        input=json.dumps(payload),
-        text=True,
-        capture_output=True,
-        timeout=SUBPROCESS_TIMEOUT,
-        check=False,
-    )
-
-    if proc.returncode != 0:
-        logger.error(
-            f"Reference subprocess failed ({mode}): stdout={proc.stdout[:500]} stderr={proc.stderr[:500]}"
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Reference file subprocess failed ({mode}): {proc.stderr[:300]}"
-        )
-
-    try:
-        response = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        logger.error(f"Invalid JSON from reference subprocess ({mode}): {proc.stdout[:500]}")
-        raise HTTPException(status_code=500, detail=f"Invalid subprocess response ({mode})")
-
-    if not response.get("success", False):
-        logger.error(f"Reference subprocess error ({mode}): {response}")
-        raise HTTPException(
-            status_code=500,
-            detail=response.get("error", f"Subprocess error ({mode})")
-        )
-
-    return response.get("result")
-
-
-# ------------------------------------------------------------------ #
-# Endpoints                                                            #
-# ------------------------------------------------------------------ #
-
-@router.get("/files")
-def list_files():
-    """List all available reference files from the JSON config."""
-    try:
-        files_map = _load_reference_files()
-        files = [
-            {
-                "id": spec["id"],
-                "name": spec.get("name", spec["id"]),
-                "description": spec.get("description", ""),
-                "format": spec.get("format", "csv"),
-                "category": spec.get("category", ""),
-                "is_folder_type": bool(spec.get("folder_path")),
-            }
-            for spec in files_map.values()
-        ]
-        return {
-            "success": True,
-            "files": files,
-            "total": len(files),
-            "retrieved_at": datetime.now().isoformat(),
-        }
-    except Exception as e:
-        logger.error(f"Error listing reference files: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/files/{file_id}/columns")
-def get_columns(file_id: str):
-    """
-    Get column names for a reference file.
-    Returns columns from the JSON spec if defined, otherwise reads from the file itself.
-    """
-    try:
-        files_map = _load_reference_files()
-        if file_id not in files_map:
-            raise HTTPException(status_code=404, detail=f"File '{file_id}' not found in config")
-
-        spec = files_map[file_id]
-
-        # Use columns from spec if available (fast path, no file I/O)
-        spec_columns = spec.get("columns")
-        if spec_columns:
-            return {
-                "success": True,
-                "columns": spec_columns,
-                "file_id": file_id,
-                "source": "spec",
-                "retrieved_at": datetime.now().isoformat(),
-            }
-
-        # Otherwise read metadata from the file via subprocess
-        metadata = _run_reference_subprocess("metadata", {"file_spec": spec})
-        return {
-            "success": True,
-            "columns": metadata.get("columns", []),
-            "total_rows": metadata.get("total_rows", 0),
-            "file_id": file_id,
-            "source": "file",
-            "retrieved_at": datetime.now().isoformat(),
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting columns for {file_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/files/{file_id}/discover")
-def discover_file_entries(
-    file_id: str,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    file_regex: Optional[str] = None,
-):
-    """
-    For folder-type file specs, list actual files matching the pattern.
-    Supports optional date range (YYYY-MM-DD) and regex override for filename matching.
-    Returns is_folder_type=False for single-file specs.
-    """
-    try:
-        files_map = _load_reference_files()
-        if file_id not in files_map:
-            raise HTTPException(status_code=404, detail=f"File '{file_id}' not found in config")
-
-        spec = files_map[file_id]
-        if not spec.get("folder_path"):
-            return {
-                "success": True,
-                "is_folder_type": False,
-                "files": [],
-                "total": 0,
-                "retrieved_at": datetime.now().isoformat(),
-            }
-
-        result = _run_reference_subprocess(
-            "discover_files",
-            {
-                "folder_path": spec["folder_path"],
-                "file_pattern": file_regex or spec.get("file_pattern", ".*"),
-                "date_from": date_from,
-                "date_to": date_to,
-                "date_group_index": spec.get("date_group_index", 1),
-                "date_format": spec.get("date_format", "%Y%m%d"),
-            },
-        )
-        return {
-            "success": True,
-            "is_folder_type": True,
-            "files": result.get("files", []),
-            "total": result.get("total", 0),
-            "retrieved_at": datetime.now().isoformat(),
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error discovering files for {file_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/files/{file_id}/data")
-def browse_file(
-    file_id: str,
-    page: int = 1,
-    page_size: int = 50,
-    sort_column: Optional[str] = None,
-    sort_direction: str = "asc",
-):
-    """
-    Browse reference file data with pagination.
-    Returns first page (50 rows) by default on initial load.
-    """
-    try:
-        files_map = _load_reference_files()
-        if file_id not in files_map:
-            raise HTTPException(status_code=404, detail=f"File '{file_id}' not found in config")
-
-        spec = files_map[file_id]
-
-        result = _run_reference_subprocess(
-            "read_paginated",
-            {
-                "file_spec": spec,
-                "page": page,
-                "page_size": page_size,
-                "sort_column": sort_column,
-                "sort_direction": sort_direction,
-            },
-        )
-
-        response = {
-            "success": True,
-            "results": result.get("data", []),
-            "columns": result.get("columns", []),
-            "pagination": result.get("pagination", {}),
-            "total_matches": result.get("pagination", {}).get("total_rows", 0),
-            "file_id": file_id,
-            "file_name": spec.get("name", file_id),
-            "mode": "browse",
-            "retrieved_at": datetime.now().isoformat(),
-        }
-
-        return make_json_safe(response)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error browsing file {file_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/files/{file_id}/search")
-def search_file(
-    file_id: str,
-    query: str,
-    column: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 50,
-    limit: int = 5000,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    file_regex: Optional[str] = None,
-):
-    """
-    Search a reference file for a query string.
-    Supports regex patterns. Optionally scope search to a specific column.
-    For folder-type specs, use date_from/date_to (YYYY-MM-DD) and file_regex to
-    filter which files in the folder are included before searching.
-    """
-    try:
-        if not query or not query.strip():
-            raise HTTPException(status_code=400, detail="Search query cannot be empty")
-
-        files_map = _load_reference_files()
-        if file_id not in files_map:
-            raise HTTPException(status_code=404, detail=f"File '{file_id}' not found in config")
-
-        spec = files_map[file_id]
-        is_folder_type = bool(spec.get("folder_path"))
-
-        if is_folder_type:
-            search_result = _run_reference_subprocess(
-                "search_folder",
-                {
-                    "file_spec": spec,
-                    "query": query.strip(),
-                    "column": column,
-                    "limit": limit,
-                    "date_from": date_from,
-                    "date_to": date_to,
-                    "file_regex": file_regex,
-                },
-            )
-        else:
-            search_result = _run_reference_subprocess(
-                "search",
-                {
-                    "file_spec": spec,
-                    "query": query.strip(),
-                    "column": column,
-                    "limit": limit,
-                },
-            )
-
-        # Apply pagination to the full results list
-        all_results = search_result.get("results", [])
-        total_matches = len(all_results)
-
-        start = (page - 1) * page_size
-        end = start + page_size
-        paginated = all_results[start:end]
-
-        total_pages = (total_matches + page_size - 1) // page_size if total_matches > 0 else 0
-
-        # Get columns: use spec if available, otherwise derive from results
-        spec_columns = spec.get("columns")
-        if spec_columns:
-            columns = spec_columns
-        elif paginated:
-            columns = list(paginated[0].keys())
-        else:
-            columns = []
-
-        response = {
-            "success": True,
-            "results": paginated,
-            "columns": columns,
-            "total_matches": total_matches,
-            "query": query.strip(),
-            "searched_column": column,
-            "pagination": {
-                "current_page": page,
-                "page_size": page_size,
-                "total_rows": total_matches,
-                "total_pages": total_pages,
-                "has_next": page < total_pages,
-                "has_previous": page > 1,
-            },
-            "results_limited": search_result.get("results_limited", False),
-            "limit_applied": search_result.get("limit_applied", limit),
-            "file_id": file_id,
-            "file_name": spec.get("name", file_id),
-            "mode": "search",
-            "retrieved_at": datetime.now().isoformat(),
-        }
-
-        if is_folder_type:
-            response["files_searched"] = search_result.get("files_searched", 0)
-            response["files_available"] = search_result.get("files_available", 0)
-
-        return make_json_safe(response)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error searching file {file_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/files/{file_id}/search-multi")
-def search_file_multi(file_id: str, body: MultiValueSearchRequest):
-    """
-    Search a reference file for multiple values in a specific column (Excel paste mode).
-    Accepts a list of values and matches rows where the column equals any of them.
-    Supports exact matching (default) or partial/contains matching.
-    """
-    try:
-        if not body.values:
-            raise HTTPException(status_code=400, detail="Values list cannot be empty")
-        if not body.column:
-            raise HTTPException(status_code=400, detail="Column is required for multi-value search")
-
-        # Clean values: strip whitespace, remove empty strings
-        clean_values = [v.strip() for v in body.values if v and v.strip()]
-        if not clean_values:
-            raise HTTPException(status_code=400, detail="No valid values provided after cleaning")
-
-        files_map = _load_reference_files()
-        if file_id not in files_map:
-            raise HTTPException(status_code=404, detail=f"File '{file_id}' not found in config")
-
-        spec = files_map[file_id]
-
-        search_result = _run_reference_subprocess(
-            "search_multi",
-            {
-                "file_spec": spec,
-                "values": clean_values,
-                "column": body.column,
-                "limit": body.limit,
-                "exact_match": body.exact_match,
-            },
-        )
-
-        all_results = search_result.get("results", [])
-        total_matches = len(all_results)
-
-        start = (body.page - 1) * body.page_size
-        paginated = all_results[start: start + body.page_size]
-        total_pages = (total_matches + body.page_size - 1) // body.page_size if total_matches > 0 else 0
-
-        spec_columns = spec.get("columns")
-        if spec_columns:
-            columns = spec_columns
-        elif paginated:
-            columns = list(paginated[0].keys())
-        else:
-            columns = []
-
-        response = {
-            "success": True,
-            "results": paginated,
-            "columns": columns,
-            "total_matches": total_matches,
-            "searched_column": body.column,
-            "values_searched": len(clean_values),
-            "exact_match": body.exact_match,
-            "pagination": {
-                "current_page": body.page,
-                "page_size": body.page_size,
-                "total_rows": total_matches,
-                "total_pages": total_pages,
-                "has_next": body.page < total_pages,
-                "has_previous": body.page > 1,
-            },
-            "results_limited": search_result.get("results_limited", False),
-            "limit_applied": search_result.get("limit_applied", body.limit),
-            "file_id": file_id,
-            "file_name": spec.get("name", file_id),
-            "mode": "search_multi",
-            "retrieved_at": datetime.now().isoformat(),
-        }
-
-        return make_json_safe(response)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in multi-value search for {file_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-
-
-sub.
-
-    if mode == "discover_files":
-        files = reference_file_service.discover_files_in_folder(
-            folder_path=request.get("folder_path", ""),
-            file_pattern=request.get("file_pattern", ".*"),
-            date_from=request.get("date_from"),
-            date_to=request.get("date_to"),
-            date_group_index=request.get("date_group_index", 1),
-            date_format=request.get("date_format", "%Y%m%d"),
-        )
-        return {"files": files, "total": len(files)}
-
-    if mode == "search_folder":
-        return reference_file_service.search_across_folder(
-            file_spec=file_spec,
-            query=request["query"],
-            column=request.get("column"),
-            limit=request.get("limit", 5000),
-            date_from=request.get("date_from"),
-            date_to=request.get("date_to"),
-            file_regex=request.get("file_regex"),
-        )
-
-globals.css
-
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Desktop-specific optimizations */
+@media (max-width: 1024px) {
+  body::before {
+    content: "This application is optimized for desktop screens (1024px and above). Please use a larger screen for the best experience.";
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    background: #ef4444;
+    color: white;
+    padding: 1rem;
+    text-align: center;
+    z-index: 9999;
+    font-weight: bold;
+  }
+}
+
+/* Desktop-optimized scrollbars */
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 6px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 6px;
+  border: 2px solid #f1f5f9;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Desktop-specific focus states */
+*:focus {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+}
+
+/* Desktop-optimized button hover states */
+button:hover {
+  transform: translateY(-1px);
+  transition: transform 0.2s ease;
+}
+
+/* Desktop-specific table optimizations */
+.ag-theme-alpine {
+  --ag-background-color: var(--sd-surface);
+  --ag-foreground-color: var(--sd-text);
+  --ag-border-color: var(--sd-border);
+  --ag-header-background-color: #f1f5f9;
+  --ag-header-foreground-color: var(--sd-text);
+  --ag-odd-row-background-color: #fcfdff;
+  --ag-row-hover-color: #f8fafc;
+  --ag-selected-row-background-color: #eff6ff;
+  --ag-font-size: 13px;
+  --ag-row-height: 38px;
+  --ag-header-height: 46px;
+}
+
+/* Desktop-optimized node interactions */
+.react-flow__node {
+  transition: all 0.2s ease;
+}
+
+.react-flow__node:hover {
+  transform: scale(1.05);
+}
+
+/* Desktop-specific sidebar optimizations */
+.sidebar-content {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 #f1f5f9;
+}
+
+/* Desktop-optimized form inputs */
+input,
+select,
+textarea {
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* Desktop-specific spacing */
+.desktop-padding {
+  padding: 1.5rem;
+}
+
+.desktop-margin {
+  margin: 1.5rem;
+}
+
+/* Desktop-optimized text sizes */
+.desktop-text-lg {
+  font-size: 1.125rem;
+  line-height: 1.75rem;
+}
+
+.desktop-text-xl {
+  font-size: 1.25rem;
+  line-height: 1.75rem;
+}
+
+.desktop-text-2xl {
+  font-size: 1.5rem;
+  line-height: 2rem;
+}
+
+/* Fix for FastAPI template overflow:hidden issue */
+body {
+  overflow: auto !important;
+  overflow-x: auto !important;
+  overflow-y: auto !important;
+}
+
+/* Ensure proper scrolling behavior */
+html, body, #root {
+  height: 100%;
+  overflow: auto;
+}
+
+/* Fix for monitoring page overflow */
+.monitoring-container {
+  overflow: visible !important;
+  height: auto !important;
+  min-height: 100vh;
+}
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+  --sd-bg: #f8fafc;
+  --sd-surface: #ffffff;
+  --sd-text: #0f172a;
+  --sd-text-muted: #475569;
+  --sd-border: #cbd5e1;
+  --sd-unrem-group: #7f1d1d;
+  --sd-unrem-light: #fef2f2;
+  --sd-unrem-accent: #dc2626;
+  --sd-unrem-text: #7f1d1d;
+  --sd-unrem-subtext: #b91c1c;
+  --sd-total-group: #1e3a8a;
+  --sd-total-light: #eff6ff;
+  --sd-total-accent: #2563eb;
+  --sd-total-text: #1e3a8a;
+  --sd-total-subtext: #1d4ed8;
+  --sd-shadow-soft: 0 1px 2px rgba(15, 23, 42, 0.06), 0 8px 24px rgba(15, 23, 42, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+/* Supervisory dashboard cell actions */
+.supervisory-cell {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  padding-right: 20px;
+}
+
+.supervisory-cell-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.supervisory-cell-action {
+  opacity: 0;
+  position: absolute;
+  right: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 11px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #0f172a;
+  transition: opacity 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+
+.ag-cell:hover .supervisory-cell-action {
+  opacity: 1;
+}
+
+.supervisory-cell-action:hover {
+  background: #f1f5f9;
+  border-color: #94a3b8;
+}
+
+/* Supervisory dashboard header colors */
+.ag-theme-alpine .supervisory-header-groupby {
+  background: #0f172a !important;
+  color: #f8fafc !important;
+}
+
+.ag-theme-alpine .ag-header-group-cell.supervisory-header-unremediated-group {
+  background: var(--sd-unrem-group) !important;
+  color: #ffffff !important;
+}
+
+.ag-theme-alpine .supervisory-header-unremediated {
+  background: var(--sd-unrem-light) !important;
+  color: #7f1d1d !important;
+  border-bottom: 2px solid var(--sd-unrem-accent) !important;
+}
+
+.ag-theme-alpine .ag-header-group-cell.supervisory-header-total-group {
+  background: var(--sd-total-group) !important;
+  color: #ffffff !important;
+}
+
+.ag-theme-alpine .supervisory-header-total {
+  background: var(--sd-total-light) !important;
+  color: var(--sd-total-group) !important;
+  border-bottom: 2px solid var(--sd-total-accent) !important;
+}
+
+/* Supervisory dashboard visual system */
+.supervisory-page-canvas {
+  background: var(--sd-bg);
+  color: var(--sd-text);
+}
+
+.supervisory-app-header {
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05), 0 8px 20px rgba(15, 23, 42, 0.05);
+}
+
+.supervisory-app-subtitle {
+  color: var(--sd-text-muted);
+}
+
+.supervisory-app-badge {
+  border: 1px solid #dbe1ea;
+}
+
+.supervisory-surface {
+  background: var(--sd-surface);
+}
+
+.supervisory-sidebar {
+  background: linear-gradient(180deg, #ffffff 0%, #fbfdff 100%);
+}
+
+.supervisory-sidebar-header {
+  padding: 2px 2px 10px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.supervisory-clear-btn {
+  color: #b91c1c;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-weight: 600;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.supervisory-clear-btn:hover {
+  background: #fee2e2;
+  border-color: #fca5a5;
+}
+
+.supervisory-sidebar-card {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.supervisory-section-label {
+  color: #334155;
+  letter-spacing: 0.01em;
+}
+
+.supervisory-field {
+  border-color: #cbd5e1;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+}
+
+.supervisory-field:hover {
+  border-color: #94a3b8;
+}
+
+.supervisory-field:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+  outline: none;
+}
+
+.supervisory-save-btn {
+  box-shadow: 0 1px 2px rgba(30, 58, 138, 0.24);
+}
+
+.supervisory-save-btn:hover {
+  background: #1d4ed8;
+}
+
+.supervisory-sidebar-resizer:hover {
+  background: linear-gradient(180deg, rgba(37, 99, 235, 0.12) 0%, rgba(30, 64, 175, 0.22) 100%);
+}
+
+.supervisory-filter-label {
+  color: #334155;
+  letter-spacing: 0.01em;
+}
+
+.supervisory-filter-trigger {
+  border-color: #cbd5e1;
+  background: #ffffff;
+  min-height: 32px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+}
+
+.supervisory-filter-trigger:hover {
+  border-color: #94a3b8;
+  background: #fcfdff;
+}
+
+.supervisory-filter-trigger:focus-within {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
+}
+
+.supervisory-filter-value {
+  color: #0f172a;
+}
+
+.supervisory-filter-value-empty {
+  color: #94a3b8;
+}
+
+.supervisory-filter-caret {
+  color: #64748b;
+}
+
+.supervisory-filter-trigger-badge {
+  color: #1e3a8a;
+  background: #e0ecff;
+  border: 1px solid #bfd4fe;
+  border-radius: 999px;
+  min-width: 18px;
+  height: 18px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  padding: 0 5px;
+}
+
+.supervisory-filter-menu {
+  border-color: #cbd5e1;
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.16);
+  border-radius: 10px;
+}
+
+.supervisory-filter-search-wrap {
+  background: #f8fafc;
+  border-color: #e2e8f0;
+}
+
+.supervisory-filter-search {
+  background: #ffffff;
+  border-color: #cbd5e1;
+}
+
+.supervisory-filter-search:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.14);
+  outline: none;
+}
+
+.supervisory-filter-actions {
+  background: #f8fafc;
+  border-color: #e2e8f0;
+}
+
+.supervisory-filter-meta {
+  color: #64748b;
+  font-weight: 600;
+}
+
+.supervisory-filter-action {
+  font-weight: 600;
+}
+
+.supervisory-filter-option {
+  border-bottom: 1px solid #f1f5f9;
+  transition: background-color 0.15s ease;
+}
+
+.supervisory-filter-option:last-child {
+  border-bottom: none;
+}
+
+.supervisory-filter-option:hover {
+  background: #eff6ff !important;
+}
+
+.supervisory-filter-option-selected {
+  background: #f0f7ff;
+}
+
+.supervisory-filter-checkbox {
+  background: #ffffff;
+}
+
+.supervisory-filter-checkbox-selected {
+  box-shadow: 0 0 0 1px rgba(29, 78, 216, 0.1);
+}
+
+.supervisory-filter-option-text {
+  color: #0f172a;
+}
+
+.supervisory-filter-empty {
+  color: #64748b;
+  text-align: center;
+}
+
+.supervisory-filter-card-title {
+  color: #64748b;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.supervisory-sidebar-stats {
+  color: #475569;
+}
+
+.supervisory-elevated {
+  box-shadow: var(--sd-shadow-soft);
+}
+
+.supervisory-summary-card {
+  box-shadow: var(--sd-shadow-soft);
+}
+
+.supervisory-summary-unrem {
+  background: #fff7f7;
+  border-color: #fecaca;
+}
+
+.supervisory-summary-total {
+  background: #f3f7ff;
+  border-color: #bfdbfe;
+}
+
+.supervisory-kpi-card {
+  background: var(--sd-surface);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+}
+
+.supervisory-summary-title-unrem {
+  color: var(--sd-unrem-text);
+}
+
+.supervisory-summary-subtitle-unrem {
+  color: var(--sd-unrem-subtext);
+}
+
+.supervisory-summary-title-total {
+  color: var(--sd-total-text);
+}
+
+.supervisory-summary-subtitle-total {
+  color: var(--sd-total-subtext);
+}
+
+.supervisory-toggle-input-unrem {
+  accent-color: var(--sd-unrem-accent);
+}
+
+.supervisory-toggle-input-total {
+  accent-color: var(--sd-total-accent);
+}
+
+.supervisory-toggle-label-unrem {
+  color: var(--sd-unrem-text);
+}
+
+.supervisory-toggle-label-total {
+  color: var(--sd-total-text);
+}
+
+/* Config Search + Config Validator AG Grid styling aligned to Supervisory visuals */
+.config-grid-theme.ag-theme-alpine {
+  --ag-background-color: var(--sd-surface);
+  --ag-foreground-color: var(--sd-text);
+  --ag-border-color: var(--sd-border);
+  --ag-header-background-color: #f1f5f9;
+  --ag-header-foreground-color: var(--sd-text);
+  --ag-odd-row-background-color: #fcfdff;
+  --ag-row-hover-color: #f8fafc;
+  --ag-selected-row-background-color: #eff6ff;
+}
+
+.config-grid-theme .ag-menu,
+.config-grid-theme .ag-popup,
+.config-grid-theme .ag-filter {
+  min-width: 320px;
+}
+
+.config-grid-theme .ag-filter,
+.config-grid-theme .ag-filter-body {
+  padding: 12px 12px 10px 12px;
+}
+
+.config-grid-theme .ag-filter-apply-panel {
+  padding-top: 8px;
+  gap: 8px;
+}
+
+.config-grid-theme .ag-input-field-input,
+.config-grid-theme .ag-filter-filter,
+.config-grid-theme .ag-mini-filter,
+.config-grid-theme .ag-picker-field-wrapper {
+  border-radius: 8px;
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.config-grid-theme .ag-input-field-input:focus,
+.config-grid-theme .ag-filter-filter:focus,
+.config-grid-theme .ag-mini-filter:focus {
+  outline: none;
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.16);
+  background: #fff;
+}
+
+.config-grid-theme .ag-filter-select,
+.config-grid-theme .ag-picker-field-display {
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.config-grid-theme .ag-filter-apply-panel .ag-standard-button {
+  border-radius: 8px;
+  background: #0f172a;
+  color: #fff;
+  border: none;
+  padding: 6px 12px;
+}
+
+.config-grid-theme .ag-filter-apply-panel .ag-standard-button:hover {
+  background: #1e293b;
+}
+
+.config-grid-theme .ag-filter-apply-panel .ag-standard-button:disabled {
+  background: #9ca3af;
+}
 
 /* Controls Hub landscape layout */
 .controls-landscape-wrap {
@@ -1050,1317 +701,30 @@ globals.css
   }
 }
 
+@media (prefers-contrast: more) {
+  :root {
+    --sd-bg: #f1f5f9;
+    --sd-surface: #ffffff;
+    --sd-text: #020617;
+    --sd-text-muted: #0f172a;
+    --sd-border: #64748b;
+    --sd-unrem-group: #7f1d1d;
+    --sd-unrem-light: #fff1f1;
+    --sd-unrem-accent: #b91c1c;
+    --sd-unrem-text: #7f1d1d;
+    --sd-unrem-subtext: #991b1b;
+    --sd-total-group: #1e3a8a;
+    --sd-total-light: #eef4ff;
+    --sd-total-accent: #1d4ed8;
+    --sd-total-text: #1e3a8a;
+    --sd-total-subtext: #1e40af;
+    --sd-shadow-soft: 0 0 0 rgba(0, 0, 0, 0);
+  }
 
-
-page.jsss
-
-
-import React, { useState } from 'react';
-import { FaChartLine, FaCheckCircle, FaCog, FaServer, FaDesktop, FaFlask, FaRobot, FaChartBar, FaSearch, FaFileAlt, FaDatabase } from 'react-icons/fa';
-import './globals.css';
-import HSBCLogo from './components/HSBCLogo';
-import { useUser } from './contexts/UserContext';
-
-function HomePage() {
-  const { hasAccess } = useUser();
-  const [activeSection, setActiveSection] = useState(null);
-  const [hoveredSection, setHoveredSection] = useState(null);
-
-  const openNewInstance = (type) => {
-    // Generate a unique ID using timestamp and random number
-    const uniqueId = `${type}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    // Open the instance page in a new tab
-    window.open(`/instances/${type}/${uniqueId}`, '_blank');
-  };
-
-  const openMonitoring = () => {
-    // Open monitoring dashboard in new tab
-    window.open('/monitoring', '_blank');
-  };
-
-  const openValidator = () => {
-    // Open validator page in new tab
-    window.open('/validator', '_blank');
-  };
-
-  const openControlStatus = () => {
-    // Open control status dashboard in new tab
-    window.open('/control-status', '_blank');
-  };
-
-  const openControlRuns = () => {
-    // Open control runs page in new tab
-    window.open('/control-runs', '_blank');
-  };
-
-  const openAutoConfigDeployment = () => {
-    // Open AutoConfig Deployment page in new tab
-    window.open('/auto-config-deployment', '_blank');
-  };
-
-  const openAIAssistant = () => {
-    // Open AI Assistant page in new tab
-    window.open('/ai-assistant', '_blank');
-  };
-
-  const openJudgmentAnalytics = () => {
-    // Open Judgment Analytics page in new tab
-    window.open('/judgment-analytics', '_blank');
-  };
-
-  const openConfigSearch = () => {
-    window.open('/config-search', '_blank');
-  };
-
-  const openConfigValidator = () => {
-    window.open('/config-validator', '_blank');
-  };
-
-  const openSupervisoryDashboard = () => {
-    window.open('/supervisory-dashboard', '_blank');
-  };
-
-  const openReferenceSearch = () => {
-    window.open('/reference-search', '_blank');
-  };
-
-  const controlsTowerItems = [
-    {
-      title: 'Control Execution Status',
-      description: 'Real-time dashboard for monitoring control run status and performance. Analyse run status and execution trends including filtering by regulation, asset class, and control type.',
-      icon: FaChartLine,
-      onClick: openControlStatus
-    },
-    {
-      title: 'Control Input File Monitoring',
-      description: 'Real-time dashboard for monitoring expected vs actual arrival status of control input files. Analyse status and trends including filtering by regulation, asset class, and control type.',
-      icon: FaDatabase,
-      onClick: openReferenceSearch
-    },
-    {
-      title: 'Control Output Health Monitoring',
-      description: 'Dashboard of automated daily regression testing and integrity checks on the outputs of the Controls Platform. Provide a final layer of assurance, detecting systemic issues, data processing errors, or unexpected deviations from established operational baselines.',
-      icon: FaChartLine
-    },
-    {
-      title: 'System Health Monitoring',
-      description: 'Provides real-time dashboards for monitoring DHP KVM virtual servers\' health and performance, tracking key metrics like CPU, memory, and resource utilization to ensure system stability.',
-      icon: FaDesktop,
-      onClick: openMonitoring
-    }
-  ];
-
-  const controlsWorkbenchItems = [
-    {
-      title: 'Completeness Workbench',
-      description: 'Build and test full outer-join population reconciliation controls to verify data completeness between source and target systems.',
-      icon: FaCheckCircle,
-      onClick: () => openNewInstance('completeness')
-    },
-    {
-      title: 'QA Workbench',
-      description: 'Build and test attribute-level accuracy and validity tests to ensure data integrity back to source as well as Collateral and Valuations Daily Submission completeness. Also used for data Pre-Processing.',
-      icon: FaChartLine,
-      onClick: () => openNewInstance('quality')
-    },
-    {
-      title: 'Controls Runner',
-      description: 'Run Controls in batch mode. Includes real-time execution monitoring, detailed logging, run history, and comprehensive status tracking.',
-      icon: FaServer,
-      onClick: hasAccess('control-run') ? openControlRuns : null
-    }
-  ];
-
-  const controlConfigurationItems = [
-    {
-      title: 'Configuration Function Simulator',
-      description: 'An interactive tool for rapidly testing and validating data transformation logic. Instantly execute functions and formulas on sample data to analyze results before deployment.',
-      icon: FaFlask,
-      onClick: openValidator
-    },
-    {
-      title: 'Configuration Explorer',
-      description: 'A powerful global search engine to instantly find and analyse logic across the entire library of control configurations, including rules, enrichments, and transformations.',
-      icon: FaSearch,
-      onClick: openConfigSearch
-    },
-    {
-      title: 'Configuration Validator',
-      description: 'A pre-deployment validation service that scans configuration files for syntax errors, missing values, and invalid references, providing detailed reports to ensure quality.',
-      icon: FaFileAlt,
-      onClick: openConfigValidator
-    },
-    {
-      title: 'Configuration AI Assistant',
-      description: 'A generative AI-powered chat assistant trained on the Controls Framework. Accelerates configuration development by generating rules, formulas, and logic in seconds.',
-      icon: FaRobot,
-      onClick: hasAccess('ai-assistant') ? openAIAssistant : null
-    },
-    {
-      title: 'Configuration Auto-Deployer',
-      description: 'A utility to automatically deploy control configurations to Production after first checking the config runs successfully using a sample subset of the input data; complete with real-time logging and status tracking.',
-      icon: FaCog,
-      onClick: openAutoConfigDeployment
-    },
-    {
-      title: 'Data Analyzer',
-      description: 'A visual, drag-and-drop workflow builder for designing and prototyping complex data pipelines and ETL processes without writing code. Primarily used for building temporary test harnesses for testing complex code changes to the platform.',
-      icon: FaChartLine,
-      onClick: hasAccess('workflow') ? () => openNewInstance('workflow') : null
-    }
-  ];
-
-  const aiOpsOversightItems = [
-    {
-      title: 'Controls Configuration AI Assistant Performance Analytics',
-      description: 'An automated quality assurance module that evaluates the performance and accuracy of the GenAI Config Assistant responses, providing analytics on its accuracy and other key metrics.',
-      icon: FaChartBar,
-      onClick: hasAccess('judgment-analytics') ? openJudgmentAnalytics : null
-    }
-  ];
-
-  const operationalGovernanceItems = [
-    {
-      title: 'Supervisory Dashboard',
-      description: 'Monitor, prioritize, and manage the remediation of control breaks. Features aged break analysis and dynamic pivot-table aggregations.',
-      icon: FaChartBar,
-      onClick: openSupervisoryDashboard
-    }
-  ];
-
-  const sections = [
-    {
-      name: 'Controls Tower',
-      description: 'A suite of dashboards providing visibility into control execution status as well as underlying platform and system health.',
-      items: controlsTowerItems
-    },
-    {
-      name: 'Controls Workbench',
-      description: 'A dedicated environment for authoring, testing, and managing the business logic for all controls, providing specialized modules for different control types.',
-      items: controlsWorkbenchItems
-    },
-    {
-      name: 'Control Configuration Toolbox',
-      description: 'A comprehensive suite of integrated tools designed to streamline and accelerate the entire lifecycle of creating, testing, and deploying configurations for Controls. It empowers configuration authors to build robust and accurate control logic with maximum efficiency and confidence.',
-      items: controlConfigurationItems
-    },
-    {
-      name: 'AI Ops Oversight',
-      description: 'Automated quality assurance capabilities that evaluate the performance and accuracy of GenAI assistants used within TnTR Ops.',
-      items: aiOpsOversightItems
-    },
-    {
-      name: 'Operational Governance Dashboard',
-      description: 'An interactive dashboard for TnTR Operations to monitor, prioritize, and manage the day-to-day operational effort of Control Output explains and remediation.',
-      items: operationalGovernanceItems
-    }
-  ];
-
-  const visibleSectionName = hoveredSection || activeSection;
-  const visibleSection = sections.find((section) => section.name === visibleSectionName);
-
-  return (
-    <div className="relative isolate min-h-screen controls-hub-typography" style={{ backgroundColor: '#F5F5F5', color: 'black' }}>
-      {/* Navigation */}
-      <nav className="fixed top-0 left-0 right-0 z-50" style={{ backgroundColor: '#ffffff' }}>
-        <div className="max-w-7xl mx-auto px-8">
-          <div className="flex items-center justify-between h-16 px-0">
-            <div className="flex items-center flex-shrink-0">
-              <HSBCLogo height={64} className="mr-2" />
-            </div>
-
-            {/* Desktop menu only */}
-            <div className="flex items-center space-x-8">
-              <a href="#features" className="text-black hover:text-slate-700 transition-colors">Features</a>
-              <button className="text-black hover:text-slate-700 transition-colors bg-transparent border-none cursor-pointer">Documentation</button>
-              <button className="text-black hover:text-slate-700 transition-colors bg-transparent border-none cursor-pointer">Support</button>
-            </div>
-          </div>
-        </div>
-      </nav>
-
-      <div className="flex flex-col min-h-screen">
-        {/* Hero section with desktop-optimized padding */}
-        <div className="px-8 pt-32 pb-12">
-          <div className="mx-auto max-w-2xl text-center">
-            <h1 className="text-6xl font-bold tracking-tight text-black">
-              Controls Hub
-            </h1>
-            <p className="mt-6 text-lg leading-8 text-black">
-              An integrated platform for the end-to-end lifecycle of Trade and Transaction Regulatory Reporting Controls. The Hub provides a suite of tools for authoring, executing, monitoring, and analysing data completeness and quality assurance controls to ensure reporting completeness, validity, and accuracy.
-            </p>
-          </div>
-        </div>
-
-        {/* Features section with desktop-optimized layout */}
-        <div
-          id="features"
-          className="controls-landscape-wrap mx-auto w-full max-w-[1800px] px-8 pb-24"
-          onMouseLeave={() => {
-            if (!activeSection) setHoveredSection(null);
-          }}
-        >
-          <div className="mb-4 text-sm text-slate-700">Hover or click a section card to view its pages.</div>
-          <div className="controls-parent-grid">
-            {sections.map((section) => (
-              <button
-                type="button"
-                key={section.name}
-                onMouseEnter={() => setHoveredSection(section.name)}
-                onClick={() => setActiveSection((current) => (current === section.name ? null : section.name))}
-                className={`controls-parent-card ${
-                  visibleSectionName === section.name ? 'controls-parent-card-active' : ''
-                }`}
-                aria-pressed={visibleSectionName === section.name}
-              >
-                <div className="flex items-center gap-3 mb-3">
-                  <div className="p-3 rounded-lg bg-white text-red-500">
-                    <FaCog size={24} />
-                  </div>
-                  <span className="controls-item-count">{section.items.length}</span>
-                  <h2 className="text-xl font-bold text-black leading-tight">{section.name}</h2>
-                </div>
-                <p className="controls-parent-desc text-black text-sm leading-6 text-left">{section.description}</p>
-              </button>
-            ))}
-          </div>
-
-          {visibleSection && (
-            <div className="controls-subpanel controls-subpanel-animate mt-8">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-2xl font-bold text-black">{visibleSection.name}</h3>
-                <button
-                  type="button"
-                  className="text-sm text-slate-700 bg-white border border-slate-300 rounded px-3 py-1"
-                  onClick={() => {
-                    setActiveSection(null);
-                    setHoveredSection(null);
-                  }}
-                >
-                  Close
-                </button>
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                {visibleSection.items.map((item, index) => {
-                  const Icon = item.icon;
-                  const isClickable = Boolean(item.onClick);
-                  return (
-                    <div
-                      key={item.title}
-                      onClick={item.onClick}
-                      style={{ animationDelay: `${index * 70}ms` }}
-                      className={`rounded-lg border border-slate-200 p-5 transition-all duration-300 ease-in-out bg-white ${
-                        isClickable
-                          ? 'cursor-pointer hover:scale-[1.02] hover:shadow-xl hover:shadow-slate-700/10 transform-gpu'
-                          : 'cursor-default'
-                      } controls-subcard-animate`}
-                    >
-                      <div className="flex items-center gap-4 mb-3">
-                        <div className="p-2 rounded-lg bg-white text-red-500 transition-colors">
-                          <Icon size={24} />
-                        </div>
-                        <h4 className="text-lg font-semibold text-black">{item.title}</h4>
-                      </div>
-                      <p className="text-black text-sm leading-6">{item.description}</p>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
+  .supervisory-summary-card,
+  .supervisory-elevated,
+  .supervisory-kpi-card {
+    box-shadow: none;
+    border-width: 1.5px;
+  }
 }
-
-export default HomePage;
-
-
-
-page.js Ref
-
-
-import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { AgGridReact } from 'ag-grid-react';
-import { ModuleRegistry, AllCommunityModule } from 'ag-grid-community';
-import 'ag-grid-community/styles/ag-grid.css';
-import 'ag-grid-community/styles/ag-theme-alpine.css';
-import ApiService from '../../services/api';
-import {
-    FaSearch, FaSync, FaDownload, FaFilter,
-    FaDatabase, FaTable, FaClipboardList, FaTimes, FaFolder,
-} from 'react-icons/fa';
-import HSBCLogo from '../../components/HSBCLogo';
-
-ModuleRegistry.registerModules([AllCommunityModule]);
-
-// Parse pasted Excel text into clean values array.
-// Excel copies a column as newline-separated values (each line may have tabs if multi-col).
-// We take only the first tab-delimited token per line.
-function parseExcelPaste(text) {
-    return text
-        .split(/\r?\n/)
-        .map(line => line.split('\t')[0].trim())
-        .filter(v => v.length > 0);
-}
-
-/**
- * Reference File Search Page
- * Browse and search known reference files (CSV, ZIP) with configurable delimiters.
- * Supports single-term search and multi-value Excel paste search.
- */
-const ReferenceSearchPage = () => {
-    // File list
-    const [files, setFiles] = useState([]);
-    const [isLoadingFiles, setIsLoadingFiles] = useState(true);
-
-    // Selected file
-    const [selectedFileId, setSelectedFileId] = useState('');
-    const [selectedFile, setSelectedFile] = useState(null);
-    const [columns, setColumns] = useState([]);
-
-    // Results
-    const [results, setResults] = useState([]);
-    const [totalRows, setTotalRows] = useState(0);
-    const [currentPage, setCurrentPage] = useState(1);
-    const [totalPages, setTotalPages] = useState(0);
-    const [pageSize] = useState(50);
-
-    // Search state
-    const [searchQuery, setSearchQuery] = useState('');
-    const [selectedColumn, setSelectedColumn] = useState('');
-    const [mode, setMode] = useState('browse'); // 'browse' | 'search' | 'search_multi'
-
-    // Paste mode state
-    const [pasteMode, setPasteMode] = useState(false);
-    const [pasteText, setPasteText] = useState('');
-    const [pastedValues, setPastedValues] = useState([]); // parsed values for display
-    const [exactMatch, setExactMatch] = useState(true);
-
-    // Active multi-values (stored so pagination can re-use them)
-    const activeMultiValues = useRef([]);
-
-    // Folder-type file state
-    const [isFolderType, setIsFolderType] = useState(false);
-    const [fileDate, setFileDate] = useState('');   // single date filter (YYYY-MM-DD)
-    const [fileRegex, setFileRegex] = useState('');
-    const [folderStats, setFolderStats] = useState(null); // { searched, available }
-    // Store active folder filters at search time for export re-use
-    const activeFolderFilters = useRef({});
-
-    // UI state
-    const [isLoading, setIsLoading] = useState(false);
-    const [isExporting, setIsExporting] = useState(false);
-    const [error, setError] = useState(null);
-    const [hasLoaded, setHasLoaded] = useState(false);
-
-    // ── Load file list on mount ───────────────────────────────────────────
-    useEffect(() => {
-        const loadFiles = async () => {
-            try {
-                setIsLoadingFiles(true);
-                const response = await ApiService.getReferenceFiles();
-                if (response.success) {
-                    setFiles(response.files || []);
-                    if (response.files && response.files.length > 0) {
-                        setSelectedFileId(response.files[0].id);
-                    }
-                }
-            } catch (err) {
-                setError(`Failed to load reference files: ${err.message}`);
-            } finally {
-                setIsLoadingFiles(false);
-            }
-        };
-        loadFiles();
-    }, []);
-
-    // ── When file selection changes ───────────────────────────────────────
-    useEffect(() => {
-        if (!selectedFileId) return;
-
-        const fileObj = files.find(f => f.id === selectedFileId) || null;
-        const isFolder = fileObj?.is_folder_type || false;
-
-        setSelectedFile(fileObj);
-        setIsFolderType(isFolder);
-        setSearchQuery('');
-        setSelectedColumn('');
-        setPasteText('');
-        setPastedValues([]);
-        activeMultiValues.current = [];
-        activeFolderFilters.current = {};
-        setResults([]);
-        setHasLoaded(false);
-        setError(null);
-        setCurrentPage(1);
-        setMode('browse');
-        setFolderStats(null);
-        // Reset folder filters on file change
-        setFileDate('');
-        setFileRegex('');
-
-        const loadColumns = async () => {
-            try {
-                const response = await ApiService.getReferenceFileColumns(selectedFileId);
-                if (response.success) setColumns(response.columns || []);
-            } catch (err) {
-                setError(`Failed to load columns: ${err.message}`);
-            }
-        };
-
-        const loadInitialData = async () => {
-            setIsLoading(true);
-            try {
-                const response = await ApiService.getReferenceFileData(selectedFileId, { page: 1, pageSize });
-                if (response.success) {
-                    setResults(response.results || []);
-                    setTotalRows(response.pagination?.total_rows || 0);
-                    setTotalPages(response.pagination?.total_pages || 0);
-                    setCurrentPage(1);
-                    setHasLoaded(true);
-                } else {
-                    setError(response.error || 'Failed to load data');
-                }
-            } catch (err) {
-                setError(`Failed to load file data: ${err.message}`);
-            } finally {
-                setIsLoading(false);
-            }
-        };
-
-        loadColumns();
-        // Folder-type files require an explicit search — skip auto-load
-        if (!isFolder) {
-            loadInitialData();
-        }
-    }, [selectedFileId, files, pageSize]);
-
-    // Parse paste text whenever it changes
-    useEffect(() => {
-        setPastedValues(parseExcelPaste(pasteText));
-    }, [pasteText]);
-
-    // ── Browse ────────────────────────────────────────────────────────────
-    const handleBrowse = useCallback(async (page = 1) => {
-        if (!selectedFileId) return;
-
-        // Folder-type specs have no single path — use search with '.*' to load all rows.
-        if (isFolderType) {
-            const folderOpts = {
-                dateFrom: fileDate || null,
-                dateTo: fileDate || null,
-                fileRegex: fileRegex.trim() || null,
-            };
-            activeFolderFilters.current = folderOpts;
-            setIsLoading(true);
-            setError(null);
-            setMode('browse');
-            try {
-                const response = await ApiService.searchReferenceFile(
-                    selectedFileId, '.*',
-                    { column: null, page, pageSize, ...folderOpts }
-                );
-                if (response.success) {
-                    setResults(response.results || []);
-                    setTotalRows(response.total_matches || 0);
-                    setTotalPages(response.pagination?.total_pages || 0);
-                    setCurrentPage(page);
-                    setHasLoaded(true);
-                    setFolderStats({
-                        searched: response.files_searched || 0,
-                        available: response.files_available || 0,
-                    });
-                } else {
-                    setError(response.error || 'Failed to load data');
-                }
-            } catch (err) {
-                setError(`Load failed: ${err.message}`);
-            } finally {
-                setIsLoading(false);
-            }
-            return;
-        }
-
-        setIsLoading(true);
-        setError(null);
-        setMode('browse');
-        try {
-            const response = await ApiService.getReferenceFileData(selectedFileId, { page, pageSize });
-            if (response.success) {
-                setResults(response.results || []);
-                setTotalRows(response.pagination?.total_rows || 0);
-                setTotalPages(response.pagination?.total_pages || 0);
-                setCurrentPage(page);
-                setHasLoaded(true);
-            } else {
-                setError(response.error || 'Failed to browse data');
-            }
-        } catch (err) {
-            setError(`Browse failed: ${err.message}`);
-        } finally {
-            setIsLoading(false);
-        }
-    }, [selectedFileId, pageSize, isFolderType, fileDate, fileRegex]);
-
-    // ── Single-term search ────────────────────────────────────────────────
-    const handleSearch = useCallback(async (page = 1) => {
-        if (!selectedFileId) { setError('Please select a reference file'); return; }
-        if (!searchQuery.trim()) { setError('Please enter a search query'); return; }
-
-        // Capture folder filters at search time for pagination and export
-        // Single date → pass as both from and to so backend filters to exactly that date
-        const folderOpts = isFolderType
-            ? { dateFrom: fileDate || null, dateTo: fileDate || null, fileRegex: fileRegex.trim() || null }
-            : {};
-        activeFolderFilters.current = folderOpts;
-
-        setIsLoading(true);
-        setError(null);
-        setMode('search');
-        try {
-            const response = await ApiService.searchReferenceFile(
-                selectedFileId,
-                searchQuery.trim(),
-                { column: selectedColumn || null, page, pageSize, ...folderOpts }
-            );
-            if (response.success) {
-                setResults(response.results || []);
-                setTotalRows(response.total_matches || 0);
-                setTotalPages(response.pagination?.total_pages || 0);
-                setCurrentPage(page);
-                setHasLoaded(true);
-                if (isFolderType) {
-                    setFolderStats({
-                        searched: response.files_searched || 0,
-                        available: response.files_available || 0,
-                    });
-                }
-            } else {
-                setError(response.error || 'Search failed');
-                setResults([]);
-            }
-        } catch (err) {
-            setError(`Search failed: ${err.message}`);
-            setResults([]);
-        } finally {
-            setIsLoading(false);
-        }
-    }, [selectedFileId, searchQuery, selectedColumn, pageSize, isFolderType, fileDate, fileRegex]);
-
-    // ── Multi-value (Excel paste) search ──────────────────────────────────
-    const handleMultiSearch = useCallback(async (page = 1, valuesOverride = null) => {
-        if (!selectedFileId) { setError('Please select a reference file'); return; }
-        if (!selectedColumn) { setError('Please select a column for multi-value search'); return; }
-
-        const values = valuesOverride ?? pastedValues;
-        if (values.length === 0) { setError('Please paste at least one value'); return; }
-
-        // Persist values for pagination
-        if (valuesOverride === null) activeMultiValues.current = values;
-
-        setIsLoading(true);
-        setError(null);
-        setMode('search_multi');
-        try {
-            const response = await ApiService.searchReferenceFileMulti(
-                selectedFileId,
-                activeMultiValues.current,
-                selectedColumn,
-                { exactMatch, page, pageSize }
-            );
-            if (response.success) {
-                setResults(response.results || []);
-                setTotalRows(response.total_matches || 0);
-                setTotalPages(response.pagination?.total_pages || 0);
-                setCurrentPage(page);
-                setHasLoaded(true);
-            } else {
-                setError(response.error || 'Multi-value search failed');
-                setResults([]);
-            }
-        } catch (err) {
-            setError(`Multi-value search failed: ${err.message}`);
-            setResults([]);
-        } finally {
-            setIsLoading(false);
-        }
-    }, [selectedFileId, selectedColumn, pastedValues, exactMatch, pageSize]);
-
-    const handleKeyPress = (e) => {
-        if (e.key === 'Enter' && !pasteMode && searchQuery.trim()) handleSearch(1);
-    };
-
-    // ── Reset ─────────────────────────────────────────────────────────────
-    const handleReset = () => {
-        setSearchQuery('');
-        setSelectedColumn('');
-        setPasteText('');
-        setPastedValues([]);
-        activeMultiValues.current = [];
-        activeFolderFilters.current = {};
-        setFileDate('');
-        setFileRegex('');
-        setFolderStats(null);
-        setError(null);
-        setPasteMode(false);
-        if (!isFolderType) handleBrowse(1);
-        else { setResults([]); setHasLoaded(false); }
-    };
-
-    // Toggle paste mode
-    const togglePasteMode = () => {
-        setPasteMode(prev => !prev);
-        setError(null);
-    };
-
-    // Remove a single chip from pasted values
-    const removeChip = (idx) => {
-        const next = pastedValues.filter((_, i) => i !== idx);
-        setPastedValues(next);
-        setPasteText(next.join('\n'));
-    };
-
-    // ── Pagination ────────────────────────────────────────────────────────
-    const handlePrevPage = () => {
-        const p = currentPage - 1;
-        if (p < 1) return;
-        if (mode === 'search_multi') handleMultiSearch(p, activeMultiValues.current);
-        else if (mode === 'search') handleSearch(p);
-        else handleBrowse(p);
-    };
-
-    const handleNextPage = () => {
-        const p = currentPage + 1;
-        if (p > totalPages) return;
-        if (mode === 'search_multi') handleMultiSearch(p, activeMultiValues.current);
-        else if (mode === 'search') handleSearch(p);
-        else handleBrowse(p);
-    };
-
-    // ── Export ────────────────────────────────────────────────────────────
-    // Fetch all filtered results (up to 5000) for export — not just the current page.
-    const fetchAllForExport = async () => {
-        const EXPORT_LIMIT = 5000;
-        if (mode === 'search') {
-            const resp = await ApiService.searchReferenceFile(
-                selectedFileId,
-                searchQuery.trim(),
-                {
-                    column: selectedColumn || null,
-                    page: 1,
-                    pageSize: EXPORT_LIMIT,
-                    limit: EXPORT_LIMIT,
-                    ...activeFolderFilters.current,
-                }
-            );
-            return { data: resp.results || [], cols: resp.columns || columns };
-        }
-        if (mode === 'search_multi') {
-            const resp = await ApiService.searchReferenceFileMulti(
-                selectedFileId,
-                activeMultiValues.current,
-                selectedColumn,
-                { exactMatch, page: 1, pageSize: EXPORT_LIMIT, limit: EXPORT_LIMIT }
-            );
-            return { data: resp.results || [], cols: resp.columns || columns };
-        }
-        // browse mode — folder-type uses search with '.*', single-file uses paginated browse
-        if (isFolderType) {
-            const resp = await ApiService.searchReferenceFile(
-                selectedFileId, '.*',
-                { column: null, page: 1, pageSize: EXPORT_LIMIT, limit: EXPORT_LIMIT, ...activeFolderFilters.current }
-            );
-            return { data: resp.results || [], cols: resp.columns || columns };
-        }
-        const resp = await ApiService.getReferenceFileData(
-            selectedFileId,
-            { page: 1, pageSize: EXPORT_LIMIT }
-        );
-        return { data: resp.results || [], cols: resp.columns || columns };
-    };
-
-    const handleExportCSV = async () => {
-        if (!hasLoaded) return;
-        setIsExporting(true);
-        setError(null);
-        try {
-            const { data: allData, cols: exportCols } = await fetchAllForExport();
-            if (allData.length === 0) return;
-            const headers = exportCols.length > 0 ? exportCols : Object.keys(allData[0] || {});
-            const rows = allData.map(row =>
-                headers.map(col => {
-                    const v = row[col];
-                    if (v === null || v === undefined) return '';
-                    const s = String(v);
-                    return s.includes(',') || s.includes('"') || s.includes('\n')
-                        ? `"${s.replace(/"/g, '""')}"` : s;
-                })
-            );
-            const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-            const blob = new Blob([csv], { type: 'text/csv' });
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = `reference-search-${selectedFileId}-${new Date().toISOString().split('T')[0]}.csv`;
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-            URL.revokeObjectURL(url);
-        } catch (err) {
-            setError(`Export failed: ${err.message}`);
-        } finally {
-            setIsExporting(false);
-        }
-    };
-
-    // ── AG Grid ───────────────────────────────────────────────────────────
-    const columnDefs = useMemo(() => {
-        const cols = columns.length > 0 ? columns : Object.keys(results[0] || {});
-        return cols.map(key => ({
-            headerName: key,
-            field: key,
-            minWidth: 120,
-            flex: 1,
-            resizable: true,
-            sortable: true,
-            filter: true,
-            valueFormatter: (params) =>
-                params.value === null || params.value === undefined ? '' : String(params.value),
-        }));
-    }, [columns, results]);
-
-    const defaultColDef = useMemo(() => ({
-        sortable: true, filter: true, resizable: true, minWidth: 100,
-    }), []);
-
-    // ── Mode badge helper ─────────────────────────────────────────────────
-    const modeBadge = {
-        browse:       { label: 'Browse Mode',       cls: 'bg-green-100 text-green-700' },
-        search:       { label: 'Search Mode',        cls: 'bg-blue-100 text-blue-700' },
-        search_multi: { label: 'Multi-Value Mode',   cls: 'bg-purple-100 text-purple-700' },
-    };
-
-    // ── Loading screen ────────────────────────────────────────────────────
-    if (isLoadingFiles) {
-        return (
-            <div className="min-h-screen bg-gray-100 flex items-center justify-center">
-                <div className="text-center">
-                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-red-500 mx-auto mb-4"></div>
-                    <p className="text-gray-600">Loading reference files...</p>
-                </div>
-            </div>
-        );
-    }
-
-    const canMultiSearch = selectedFileId && selectedColumn && pastedValues.length > 0;
-    const canSearch = selectedFileId && searchQuery.trim();
-
-    return (
-        <div className="min-h-screen supervisory-page-canvas relative flex flex-col">
-
-            {/* Full-page loading overlay */}
-            {isLoading && (
-                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-                    <div className="bg-white rounded-lg p-8 flex flex-col items-center shadow-xl">
-                        <div className="animate-spin rounded-full h-16 w-16 border-4 border-red-500 border-t-transparent mb-4"></div>
-                        <p className="text-gray-700 text-lg font-medium">
-                            {mode === 'search_multi' ? 'Searching values...' : mode === 'search' ? 'Searching...' : 'Loading...'}
-                        </p>
-                        {mode === 'search_multi' && activeMultiValues.current.length > 0 && (
-                            <p className="text-gray-500 text-sm mt-1">
-                                {activeMultiValues.current.length} values in {selectedColumn}
-                            </p>
-                        )}
-                        {selectedFile && mode !== 'search_multi' && (
-                            <p className="text-gray-500 text-sm mt-1">{selectedFile.name}</p>
-                        )}
-                    </div>
-                </div>
-            )}
-
-            {/* Header */}
-            <div className="supervisory-app-header bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between" style={{ height: '64px' }}>
-                <div className="flex items-center justify-between h-full w-full">
-                    <div className="flex items-center gap-4">
-                        <HSBCLogo height={40} />
-                        <div>
-                            <h1 className="text-lg font-semibold text-gray-900">REFERENCE FILE SEARCH</h1>
-                            <p className="text-xs supervisory-app-subtitle">Browse and search known reference files (CSV, ZIP)</p>
-                        </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                        {hasLoaded && (
-                            <span className={`text-xs px-2 py-1 rounded font-medium ${modeBadge[mode]?.cls}`}>
-                                {modeBadge[mode]?.label}
-                            </span>
-                        )}
-                        {hasLoaded && (
-                            <button
-                                onClick={handleExportCSV}
-                                disabled={isExporting || results.length === 0}
-                                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs bg-slate-700 text-white hover:bg-slate-800 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                                {isExporting
-                                    ? <><div className="animate-spin rounded-full h-3 w-3 border-b border-white"></div> Exporting...</>
-                                    : <><FaDownload /> Export CSV (up to 5000)</>
-                                }
-                            </button>
-                        )}
-                    </div>
-                </div>
-            </div>
-
-            {/* Filters Panel */}
-            <div className="flex-1 p-4 overflow-y-auto">
-                <div className="supervisory-surface supervisory-elevated rounded-lg border border-gray-200 p-4 mb-4">
-
-                    {/* Panel header with paste mode toggle */}
-                    <div className="flex items-center justify-between mb-4">
-                        <div className="flex items-center gap-2">
-                            <FaFilter className="text-gray-500" />
-                            <span className="font-medium text-gray-700">Reference File & Search Filters</span>
-                        </div>
-                        <button
-                            onClick={togglePasteMode}
-                            disabled={!selectedFileId}
-                            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border transition-colors ${
-                                pasteMode
-                                    ? 'bg-purple-600 text-white border-purple-600 hover:bg-purple-700'
-                                    : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'
-                            } disabled:opacity-40 disabled:cursor-not-allowed`}
-                        >
-                            <FaClipboardList />
-                            {pasteMode ? 'Paste Mode ON' : 'Paste from Excel'}
-                        </button>
-                    </div>
-
-                    {/* Row 1: file + column + search/paste input + buttons */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 mb-3">
-
-                        {/* File Selector */}
-                        <div>
-                            <label className="block text-sm font-medium text-gray-700 mb-1">Reference File</label>
-                            <select
-                                value={selectedFileId}
-                                onChange={(e) => setSelectedFileId(e.target.value)}
-                                className="w-full px-3 py-2 border border-gray-300 rounded-lg supervisory-field"
-                            >
-                                <option value="">Select File</option>
-                                {files.map(f => (
-                                    <option key={f.id} value={f.id}>{f.name}</option>
-                                ))}
-                            </select>
-                            {selectedFile?.description && (
-                                <p className="text-xs text-gray-500 mt-1 truncate" title={selectedFile.description}>
-                                    {selectedFile.description}
-                                </p>
-                            )}
-                        </div>
-
-                        {/* Column Selector */}
-                        <div>
-                            <label className="block text-sm font-medium text-gray-700 mb-1">
-                                Column {pasteMode ? <span className="text-red-500">*</span> : '(Optional)'}
-                            </label>
-                            <select
-                                value={selectedColumn}
-                                onChange={(e) => setSelectedColumn(e.target.value)}
-                                className={`w-full px-3 py-2 border rounded-lg supervisory-field ${
-                                    pasteMode && !selectedColumn
-                                        ? 'border-red-300 bg-red-50'
-                                        : 'border-gray-300'
-                                }`}
-                                disabled={!selectedFileId}
-                            >
-                                <option value="">{pasteMode ? 'Select Column...' : 'All Columns'}</option>
-                                {columns.map(col => (
-                                    <option key={col} value={col}>{col}</option>
-                                ))}
-                            </select>
-                            {pasteMode && !selectedColumn && (
-                                <p className="text-xs text-red-500 mt-1">Required for paste search</p>
-                            )}
-                        </div>
-
-                        {/* Search Input (single mode) or Paste hint (paste mode) */}
-                        <div className="lg:col-span-2">
-                            {!pasteMode ? (
-                                <>
-                                    <label className="block text-sm font-medium text-gray-700 mb-1">Search Query</label>
-                                    <input
-                                        type="text"
-                                        value={searchQuery}
-                                        onChange={(e) => setSearchQuery(e.target.value)}
-                                        onKeyPress={handleKeyPress}
-                                        placeholder="Enter search term or regex..."
-                                        className="w-full px-3 py-2 border border-gray-300 rounded-lg supervisory-field"
-                                        disabled={!selectedFileId}
-                                    />
-                                    {selectedColumn && searchQuery && (
-                                        <p className="text-xs text-blue-600 mt-1">
-                                            Searching in column: <strong>{selectedColumn}</strong>
-                                        </p>
-                                    )}
-                                </>
-                            ) : (
-                                <>
-                                    <div className="flex items-center justify-between mb-1">
-                                        <label className="block text-sm font-medium text-gray-700">
-                                            Paste Values
-                                            {pastedValues.length > 0 && (
-                                                <span className="ml-2 px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded text-xs font-semibold">
-                                                    {pastedValues.length} values
-                                                </span>
-                                            )}
-                                        </label>
-                                        {/* Exact / Contains toggle */}
-                                        <label className="flex items-center gap-1.5 cursor-pointer text-xs text-gray-600">
-                                            <input
-                                                type="checkbox"
-                                                checked={exactMatch}
-                                                onChange={(e) => setExactMatch(e.target.checked)}
-                                                className="rounded"
-                                            />
-                                            Exact match
-                                        </label>
-                                    </div>
-                                    <textarea
-                                        value={pasteText}
-                                        onChange={(e) => setPasteText(e.target.value)}
-                                        placeholder={`Paste a column from Excel here...\n(one value per line)`}
-                                        className="w-full px-3 py-2 border border-purple-300 rounded-lg supervisory-field text-sm resize-none"
-                                        rows={3}
-                                        disabled={!selectedFileId}
-                                    />
-                                </>
-                            )}
-                        </div>
-
-                        {/* Action Buttons */}
-                        <div className="flex items-end gap-2 flex-wrap">
-                            {!pasteMode ? (
-                                <>
-                                    <button
-                                        onClick={() => handleSearch(1)}
-                                        disabled={isLoading || !canSearch}
-                                        className="flex items-center gap-1.5 px-3 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-800 transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed text-sm"
-                                    >
-                                        <FaSearch />
-                                        Search
-                                    </button>
-                                    <button
-                                        onClick={() => handleBrowse(1)}
-                                        disabled={isLoading || !selectedFileId}
-                                        className="flex items-center gap-1.5 px-3 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed text-sm"
-                                    >
-                                        <FaTable />
-                                        {isFolderType ? 'Load' : 'Browse'}
-                                    </button>
-                                </>
-                            ) : (
-                                <button
-                                    onClick={() => handleMultiSearch(1)}
-                                    disabled={isLoading || !canMultiSearch}
-                                    className="flex items-center gap-1.5 px-3 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed text-sm"
-                                >
-                                    <FaSearch />
-                                    Search {pastedValues.length > 0 ? `(${pastedValues.length})` : ''}
-                                </button>
-                            )}
-                            <button
-                                onClick={handleReset}
-                                disabled={isLoading || !selectedFileId}
-                                className="flex items-center gap-1.5 px-3 py-2 bg-gray-500 text-white rounded-lg hover:bg-gray-600 transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed text-sm"
-                            >
-                                <FaSync />
-                                Reset
-                            </button>
-                        </div>
-                    </div>
-
-                    {/* Folder filter row — only for folder-type files */}
-                    {isFolderType && (
-                        <div className="border border-amber-200 bg-amber-50 rounded-lg p-3 mb-3">
-                            <div className="flex items-center gap-2 mb-2">
-                                <FaFolder className="text-amber-600" />
-                                <span className="text-xs font-medium text-amber-700">
-                                    Folder-type file — filter by date or filename pattern before searching
-                                </span>
-                                {folderStats && (
-                                    <span className="ml-auto text-xs text-amber-600">
-                                        {folderStats.searched} / {folderStats.available} file{folderStats.available !== 1 ? 's' : ''} searched
-                                    </span>
-                                )}
-                            </div>
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                                <div>
-                                    <label className="block text-xs font-medium text-gray-600 mb-1">
-                                        File Date
-                                        <span className="ml-1 font-normal text-gray-400">(leave blank to search all files)</span>
-                                    </label>
-                                    <input
-                                        type="date"
-                                        value={fileDate}
-                                        onChange={(e) => setFileDate(e.target.value)}
-                                        className="w-full px-2 py-1.5 border border-gray-300 rounded supervisory-field text-sm"
-                                        disabled={!selectedFileId}
-                                    />
-                                </div>
-                                <div>
-                                    <label className="block text-xs font-medium text-gray-600 mb-1">
-                                        Filename Regex
-                                        <span className="ml-1 font-normal text-gray-400">(overrides default pattern)</span>
-                                    </label>
-                                    <input
-                                        type="text"
-                                        value={fileRegex}
-                                        onChange={(e) => setFileRegex(e.target.value)}
-                                        placeholder="e.g. positions_2025.*\.csv"
-                                        className="w-full px-2 py-1.5 border border-gray-300 rounded supervisory-field text-sm"
-                                        disabled={!selectedFileId}
-                                    />
-                                </div>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Chips: parsed values preview (paste mode) */}
-                    {pasteMode && pastedValues.length > 0 && (
-                        <div className="border border-purple-200 bg-purple-50 rounded-lg p-3 mt-2">
-                            <div className="flex items-center justify-between mb-2">
-                                <span className="text-xs font-medium text-purple-700">
-                                    {pastedValues.length} value{pastedValues.length !== 1 ? 's' : ''} parsed
-                                    {exactMatch ? ' — exact match' : ' — contains match'}
-                                </span>
-                                <button
-                                    onClick={() => { setPasteText(''); setPastedValues([]); }}
-                                    className="text-xs text-purple-500 hover:text-purple-700"
-                                >
-                                    Clear all
-                                </button>
-                            </div>
-                            <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
-                                {pastedValues.slice(0, 100).map((val, idx) => (
-                                    <span
-                                        key={idx}
-                                        className="inline-flex items-center gap-1 px-2 py-0.5 bg-white border border-purple-300 text-purple-800 rounded-full text-xs"
-                                    >
-                                        {val}
-                                        <button
-                                            onClick={() => removeChip(idx)}
-                                            className="text-purple-400 hover:text-purple-700 ml-0.5"
-                                        >
-                                            <FaTimes size={9} />
-                                        </button>
-                                    </span>
-                                ))}
-                                {pastedValues.length > 100 && (
-                                    <span className="inline-flex items-center px-2 py-0.5 bg-gray-100 text-gray-500 rounded-full text-xs">
-                                        +{pastedValues.length - 100} more
-                                    </span>
-                                )}
-                            </div>
-                        </div>
-                    )}
-
-                    {/* File info bar */}
-                    {selectedFile && (
-                        <div className="flex items-center gap-3 text-xs text-gray-500 border-t border-gray-100 pt-3 mt-3">
-                            <span className="flex items-center gap-1">
-                                <FaDatabase />
-                                Format: <strong className="uppercase">{selectedFile.format}</strong>
-                            </span>
-                            {totalRows > 0 && (
-                                <span>Total rows: <strong>{totalRows.toLocaleString()}</strong></span>
-                            )}
-                            {columns.length > 0 && (
-                                <span>Columns: <strong>{columns.length}</strong></span>
-                            )}
-                        </div>
-                    )}
-                </div>
-
-                {/* Error */}
-                {error && (
-                    <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mb-4">
-                        {error}
-                    </div>
-                )}
-
-                {/* Results Section */}
-                {hasLoaded && !isLoading && (
-                    <div className="supervisory-surface supervisory-elevated rounded-lg border border-gray-200">
-                        {/* Results header */}
-                        <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
-                            <div className="flex items-center gap-2">
-                                <span className="font-medium text-gray-700">
-                                    {mode === 'search' ? 'Search Results'
-                                        : mode === 'search_multi' ? 'Multi-Value Results'
-                                        : 'All Data'}
-                                </span>
-                                <span className="text-sm text-gray-500">
-                                    ({totalRows.toLocaleString()} {totalRows === 1 ? 'row' : 'rows'})
-                                </span>
-                            </div>
-                            <div className="text-sm text-gray-500 flex items-center gap-2 flex-wrap justify-end">
-                                {selectedFile && <span>{selectedFile.name}</span>}
-                                {mode === 'search' && searchQuery && (
-                                    <span className="text-blue-600">
-                                        &mdash; &ldquo;{searchQuery}&rdquo;
-                                        {selectedColumn && ` in ${selectedColumn}`}
-                                    </span>
-                                )}
-                                {mode === 'search_multi' && (
-                                    <span className="text-purple-600">
-                                        &mdash; {activeMultiValues.current.length} values in <strong>{selectedColumn}</strong>
-                                        {exactMatch ? ' (exact)' : ' (contains)'}
-                                    </span>
-                                )}
-                            </div>
-                        </div>
-
-                        {results.length === 0 ? (
-                            <div className="flex flex-col items-center justify-center py-12 text-gray-500">
-                                <FaSearch className="text-4xl mb-3 text-gray-300" />
-                                <p>{mode !== 'browse' ? 'No results found' : 'No data available'}</p>
-                            </div>
-                        ) : (
-                            <>
-                                <div
-                                    className="ag-theme-alpine config-grid-theme"
-                                    style={{ height: 'calc(100vh - 400px)', minHeight: '380px', width: '100%' }}
-                                >
-                                    <AgGridReact
-                                        rowData={results}
-                                        columnDefs={columnDefs}
-                                        defaultColDef={defaultColDef}
-                                        theme="legacy"
-                                        animateRows={true}
-                                        pagination={false}
-                                        enableCellTextSelection={true}
-                                        ensureDomOrder={true}
-                                    />
-                                </div>
-
-                                {totalPages > 1 && (
-                                    <div className="px-4 py-3 border-t border-gray-200 flex items-center justify-between">
-                                        <div className="text-sm text-gray-500">
-                                            Page {currentPage} of {totalPages}
-                                            <span className="ml-2 text-gray-400">
-                                                (showing {results.length} of {totalRows.toLocaleString()} rows)
-                                            </span>
-                                        </div>
-                                        <div className="flex gap-2">
-                                            <button
-                                                onClick={handlePrevPage}
-                                                disabled={currentPage === 1 || isLoading}
-                                                className="px-3 py-1 border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-                                            >
-                                                Previous
-                                            </button>
-                                            <button
-                                                onClick={handleNextPage}
-                                                disabled={currentPage >= totalPages || isLoading}
-                                                className="px-3 py-1 border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-                                            >
-                                                Next
-                                            </button>
-                                        </div>
-                                    </div>
-                                )}
-                            </>
-                        )}
-                    </div>
-                )}
-
-                {/* Initial state — no file selected */}
-                {!hasLoaded && !isLoading && !error && !selectedFileId && (
-                    <div className="supervisory-surface supervisory-elevated rounded-lg border border-gray-200 p-12 text-center">
-                        <FaDatabase className="text-6xl text-gray-300 mx-auto mb-4" />
-                        <h3 className="text-lg font-medium text-gray-700 mb-2">Select a Reference File</h3>
-                        <p className="text-gray-500 max-w-md mx-auto">
-                            Choose a reference file from the dropdown above to browse or search its data.
-                        </p>
-                    </div>
-                )}
-
-                {/* Folder-type: prompt user to browse or search */}
-                {!hasLoaded && !isLoading && !error && selectedFileId && isFolderType && (
-                    <div className="supervisory-surface supervisory-elevated rounded-lg border border-amber-200 bg-amber-50 p-12 text-center">
-                        <FaFolder className="text-6xl text-amber-300 mx-auto mb-4" />
-                        <h3 className="text-lg font-medium text-amber-800 mb-2">Folder-based Reference File</h3>
-                        <p className="text-amber-700 max-w-md mx-auto">
-                            This file spans multiple files in a folder. Optionally select a <strong>File Date</strong> or
-                            enter a <strong>Filename Regex</strong> above, then click <strong>Browse</strong> to load all
-                            rows or <strong>Search</strong> to filter by a query term.
-                        </p>
-                    </div>
-                )}
-            </div>
-        </div>
-    );
-};
-
-export default ReferenceSearchPage;
-
-
-
-api
-    /**
-     * Search a reference file
-     * @param {string} fileId - File ID from config
-     * @param {string} query - Search term (supports regex)
-     * @param {Object} options - column, page, pageSize, limit
-     * @returns {Promise<Object>} Search results with pagination
-     */
-    static async searchReferenceFile(fileId, query, options = {}) {
-        return this.retryRequest(async () => {
-            const { column = null, page = 1, pageSize = 50, limit = 5000 } = options;
-            const params = new URLSearchParams({
-                query: query,
-                page: page.toString(),
-                page_size: pageSize.toString(),
-                limit: limit.toString(),
-            });
-            if (column) params.append('column', column);
-            if (options.dateFrom) params.append('date_from', options.dateFrom);
-            if (options.dateTo) params.append('date_to', options.dateTo);
-            if (options.fileRegex) params.append('file_regex', options.fileRegex);
-
-            const response = await this.fetchWithTimeout(
-                `${API_BASE_URL}/api/reference-search/files/${encodeURIComponent(fileId)}/search?${params.toString()}`
-            );
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `Failed to search file: ${response.statusText}`);
-            }
-            return await response.json();
-        });
-    }
-
-    /**
-     * Discover actual files for a folder-type reference file spec.
-     * Returns is_folder_type=false for single-file specs.
-     * @param {string} fileId - File ID from config
-     * @param {Object} options - dateFrom, dateTo, fileRegex
-     * @returns {Promise<Object>} Discovered files list
-     */
-    static async discoverReferenceFileEntries(fileId, options = {}) {
-        return this.retryRequest(async () => {
-            const params = new URLSearchParams();
-            if (options.dateFrom) params.append('date_from', options.dateFrom);
-            if (options.dateTo) params.append('date_to', options.dateTo);
-            if (options.fileRegex) params.append('file_regex', options.fileRegex);
-            const qs = params.toString();
-            const response = await this.fetchWithTimeout(
-                `${API_BASE_URL}/api/reference-search/files/${encodeURIComponent(fileId)}/discover${qs ? '?' + qs : ''}`
-            );
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `Failed to discover files: ${response.statusText}`);
-            }
-            return await response.json();
-        });
-    }
