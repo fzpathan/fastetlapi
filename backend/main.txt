@@ -1,1347 +1,1227 @@
-"""
-Reference File Service
-Handles reading CSV and ZIP reference files with configurable delimiters and encodings.
+file monitoring.json
+{
+  "input_files": [
+    {
+      "file_id": "emir_fx_trades_raw",
+      "file_name": "EMIR_FX_TRADES_RAW.parquet",
+      "display_name": "EMIR FX Trades Raw",
+      "regulation": "EMIR",
+      "asset_class": "FX",
+      "sub_control_name": "Trade Completeness",
+      "control_name": "EMIR FX Completeness",
+      "frequency": "Daily",
+      "expected_arrival_window_start": "06:00",
+      "expected_arrival_window_end": "08:00",
+      "enabled": true,
+      "source_system": "TradeDB",
+      "description": "Raw FX trade events from TradeDB for EMIR reporting"
+    },
+    {
+      "file_id": "emir_rates_trades_raw",
+      "file_name": "EMIR_RATES_TRADES_RAW.parquet",
+      "display_name": "EMIR Rates Trades Raw",
+      "regulation": "EMIR",
+      "asset_class": "Rates",
+      "sub_control_name": "Trade Completeness",
+      "control_name": "EMIR Rates Completeness",
+      "frequency": "Daily",
+      "expected_arrival_window_start": "06:00",
+      "expected_arrival_window_end": "08:00",
+      "enabled": true,
+      "source_system": "TradeDB",
+      "description": "Raw rates trade events from TradeDB for EMIR reporting"
+    }
+  ]
+}
 
-Memory strategy:
-  - CSV / TSV   : Polars lazy scan (scan_csv)  — streams the file, never loads it fully.
-  - Parquet     : Polars lazy scan (scan_parquet) — row-group predicate pushdown.
-  - ZIP + CSV   : pandas skiprows/nrows for browse; chunked read for search.
-                  ZIP must be decompressed into memory first, so a full eager Polars
-                  load is avoided by using pandas with nrows/chunksize instead.
-"""
-from __future__ import annotations
 
-import io
-import math
-import re
-import zipfile
-from datetime import datetime
+input json file
+
+{
+  "date": "20260309",
+  "file_type": "input",
+  "generated_at": "2026-03-09T08:45:00",
+  "files": [
+    {
+      "file_id": "emir_fx_trades_raw",
+      "status": "received",
+      "arrival_time": "2026-03-09T07:23:14",
+      "file_size_bytes": 104857600,
+      "note": null
+    },
+    {
+      "file_id": "emir_rates_trades_raw",
+      "status": "received",
+      "arrival_time": "2026-03-09T07:45:02",
+      "file_size_bytes": 87654321,
+      "note": null
+    },
+    {
+      "file_id": "cftc_fx_trades_raw",
+      "status": "not_received",
+      "arrival_time": null,
+      "file_size_bytes": null,
+      "note": "Expected by 09:00 - still pending"
+    },
+    {
+      "file_id": "cftc_rates_trades_raw",
+      "status": "received",
+      "arrival_time": "2026-03-09T08:12:55",
+      "file_size_bytes": 65432100,
+      "note": null
+    },
+    {
+      "file_id": "mifid_eq_trades_raw",
+      "status": "received",
+      "arrival_time": "2026-03-09T06:58:33",
+      "file_size_bytes": 134217728,
+      "note": null
+    },
+    {
+      "file_id": "emir_fx_ref_data",
+      "status": "not_received",
+      "arrival_time": null,
+      "file_size_bytes": null,
+      "note": null
+    }
+  ]
+}
+
+output json
+
+{
+  "date": "20260309",
+  "file_type": "output",
+  "generated_at": "2026-03-09T11:30:00",
+  "files": [
+    {
+      "file_id": "emir_fx_completeness_output",
+      "status": "received",
+      "arrival_time": "2026-03-09T10:15:42",
+      "file_size_bytes": 52428800,
+      "note": null
+    },
+    {
+      "file_id": "emir_rates_completeness_output",
+      "status": "received",
+      "arrival_time": "2026-03-09T10:22:18",
+      "file_size_bytes": 43876543,
+      "note": null
+    },
+    {
+      "file_id": "cftc_fx_completeness_output",
+      "status": "not_received",
+      "arrival_time": null,
+      "file_size_bytes": null,
+      "note": "Waiting for input file - CFTC FX input not received"
+    },
+    {
+      "file_id": "mifid_eq_completeness_output",
+      "status": "received",
+      "arrival_time": "2026-03-09T09:44:07",
+      "file_size_bytes": 67108864,
+      "note": null
+    }
+  ]
+}
+
+
+file_monitoring.py
+
+import json
+import logging
+from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
 
-import polars as pl
-import pandas as pd
-
-# Resolve project root (api/ directory)
-_API_DIR = Path(__file__).parent
-_PROJECT_ROOT = _API_DIR.parent
-
-
-def _resolve_path(path_str: str) -> Path:
-    """Resolve a file path relative to the project root if not absolute."""
-    p = Path(path_str)
-    if p.is_absolute():
-        return p
-    return (_PROJECT_ROOT / p).resolve()
-
-
-# ------------------------------------------------------------------ #
-# ZIP helpers                                                          #
-# ------------------------------------------------------------------ #
-
-def _extract_zip_bytes(file_spec: dict) -> bytes:
-    """Decompress and return the inner CSV bytes from a ZIP archive."""
-    path = _resolve_path(file_spec["path"])
-    inner_file = file_spec.get("inner_file")
-    if not inner_file:
-        raise ValueError("ZIP format requires 'inner_file' in file spec")
-    with zipfile.ZipFile(str(path)) as zf:
-        with zf.open(inner_file) as f:
-            return f.read()
-
-
-def _count_zip_csv_rows(raw: bytes, has_header: bool) -> int:
-    """Fast approximate row count by counting newlines in the raw bytes."""
-    count = raw.count(b"\n")
-    if raw and raw[-1:] != b"\n":
-        count += 1  # last line has no trailing newline
-    if has_header and count > 0:
-        count -= 1
-    return max(count, 0)
-
-
-def _zip_csv_columns(raw: bytes, delimiter: str, encoding: str, has_header: bool) -> list:
-    """Return column names without reading the full CSV body."""
-    if has_header:
-        df = pd.read_csv(
-            io.BytesIO(raw), sep=delimiter, encoding=encoding, header=0, nrows=0
-        )
-        return list(df.columns)
-    # No header — auto-numbered; read 1 row to learn the column count
-    df = pd.read_csv(
-        io.BytesIO(raw), sep=delimiter, encoding=encoding, header=None, nrows=1
-    )
-    return [str(c) for c in df.columns]
-
-
-# ------------------------------------------------------------------ #
-# Kept for use in get_file_metadata ZIP fallback only                 #
-# ------------------------------------------------------------------ #
-
-def _load_df(file_spec: dict) -> pl.DataFrame:
-    """Eagerly load a reference file into a Polars DataFrame (ZIP metadata fallback)."""
-    path = _resolve_path(file_spec["path"])
-    fmt = file_spec.get("format", "csv").lower()
-
-    if fmt == "parquet":
-        return pl.read_parquet(str(path))
-
-    delimiter = file_spec.get("delimiter", ",")
-    encoding = file_spec.get("encoding", "utf-8")
-    has_header = file_spec.get("has_header", True)
-
-    if fmt == "zip":
-        inner_file = file_spec.get("inner_file")
-        if not inner_file:
-            raise ValueError("ZIP format requires 'inner_file' in file spec")
-        with zipfile.ZipFile(str(path)) as zf:
-            with zf.open(inner_file) as f:
-                raw = f.read()
-        return pl.read_csv(
-            io.BytesIO(raw),
-            separator=delimiter,
-            encoding=encoding,
-            has_header=has_header,
-            infer_schema_length=1000,
-            ignore_errors=True,
-        )
-
-    return pl.read_csv(
-        str(path),
-        separator=delimiter,
-        encoding=encoding,
-        has_header=has_header,
-        infer_schema_length=1000,
-        ignore_errors=True,
-    )
-
-
-def _sanitize(obj):
-    """Replace NaN/Inf floats with None for JSON safety."""
-    if isinstance(obj, float):
-        return None if (math.isnan(obj) or math.isinf(obj)) else obj
-    if isinstance(obj, dict):
-        return {k: _sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_sanitize(v) for v in obj]
-    return obj
-
-
-def _pd_to_records(df: "pd.DataFrame") -> list:
-    """Convert a pandas DataFrame to a JSON-safe list of dicts."""
-    return _sanitize(df.where(df.notna(), None).to_dict("records"))
-
-
-class ReferenceFileService:
-    """Service for reading known reference files with configurable specs."""
-
-    # ------------------------------------------------------------------ #
-    # Internal lazy-frame builders                                         #
-    # ------------------------------------------------------------------ #
-
-    def _csv_lazy(self, file_spec: dict) -> pl.LazyFrame:
-        path = _resolve_path(file_spec["path"])
-        return pl.scan_csv(
-            str(path),
-            separator=file_spec.get("delimiter", ","),
-            encoding=file_spec.get("encoding", "utf-8"),
-            has_header=file_spec.get("has_header", True),
-            infer_schema_length=1000,
-            ignore_errors=True,
-        )
-
-    def _parquet_lazy(self, file_spec: dict) -> pl.LazyFrame:
-        path = _resolve_path(file_spec["path"])
-        return pl.scan_parquet(str(path))
-
-    @staticmethod
-    def _build_search_expr(schema_names: list, query: str, column: Optional[str]):
-        """Build a Polars boolean expression for regex/substring search."""
-        if column:
-            return pl.col(column).cast(pl.Utf8).str.contains(query, literal=False)
-        exprs = [
-            pl.col(c).cast(pl.Utf8).str.contains(query, literal=False)
-            for c in schema_names
-        ]
-        expr = exprs[0]
-        for e in exprs[1:]:
-            expr = expr | e
-        return expr
-
-    # ------------------------------------------------------------------ #
-    # Metadata                                                             #
-    # ------------------------------------------------------------------ #
-
-    def get_file_metadata(self, file_spec: dict) -> dict:
-        """
-        Return column names and total row count for a reference file.
-        Tries to read only the schema (fast) before falling back to full load.
-        """
-        path = _resolve_path(file_spec["path"])
-        fmt = file_spec.get("format", "csv").lower()
-
-        spec_columns = file_spec.get("columns")
-
-        if fmt == "parquet":
-            try:
-                lf = pl.scan_parquet(str(path))
-                columns = lf.schema.names()
-                total_rows = lf.select(pl.len()).collect().item()
-            except Exception:
-                df = pl.read_parquet(str(path))
-                columns = df.columns
-                total_rows = len(df)
-        elif fmt == "zip":
-            df = _load_df(file_spec)
-            columns = df.columns
-            total_rows = len(df)
-        else:
-            delimiter = file_spec.get("delimiter", ",")
-            encoding = file_spec.get("encoding", "utf-8")
-            has_header = file_spec.get("has_header", True)
-            try:
-                lf = pl.scan_csv(
-                    str(path),
-                    separator=delimiter,
-                    encoding=encoding,
-                    has_header=has_header,
-                    infer_schema_length=1000,
-                    ignore_errors=True,
-                )
-                columns = lf.schema.names()
-                total_rows = lf.select(pl.len()).collect().item()
-            except Exception:
-                df = _load_df(file_spec)
-                columns = df.columns
-                total_rows = len(df)
-
-        if spec_columns:
-            columns = spec_columns
-
-        return {
-            "columns": columns,
-            "total_rows": total_rows,
-            "file_format": fmt,
-            "path": str(path),
-        }
-
-    # ------------------------------------------------------------------ #
-    # Paginated browsing                                                   #
-    # ------------------------------------------------------------------ #
-
-    def read_file_paginated(
-        self,
-        file_spec: dict,
-        page: int = 1,
-        page_size: int = 50,
-        sort_column: Optional[str] = None,
-        sort_direction: str = "asc",
-    ) -> dict:
-        """
-        Return a page of rows from the reference file, with optional sorting.
-
-        CSV / Parquet: Polars lazy scan — only page_size rows ever in memory for
-        the unsorted case; sorted case still streams but Polars sorts in chunks.
-        ZIP + CSV    : pandas skiprows+nrows (no sort) or full load (with sort).
-        """
-        fmt = file_spec.get("format", "csv").lower()
-        offset = (page - 1) * page_size
-        descending = sort_direction.lower() == "desc"
-
-        if fmt == "zip":
-            return self._browse_zip_csv(
-                file_spec, page, page_size, offset, sort_column, descending
-            )
-
-        lf = self._parquet_lazy(file_spec) if fmt == "parquet" else self._csv_lazy(file_spec)
-
-        columns = lf.schema.names()
-        # Streaming count — O(1) memory
-        total_rows = lf.select(pl.len()).collect().item()
-
-        if sort_column and sort_column in columns:
-            lf = lf.sort(sort_column, descending=descending, nulls_last=True)
-
-        # Only page_size rows collected into RAM
-        page_df = lf.slice(offset, page_size).collect()
-        total_pages = (total_rows + page_size - 1) // page_size if total_rows > 0 else 0
-
-        return {
-            "data": _sanitize(page_df.to_dicts()),
-            "columns": columns,
-            "pagination": {
-                "current_page": page,
-                "page_size": page_size,
-                "total_rows": total_rows,
-                "total_pages": total_pages,
-                "has_next": page < total_pages,
-                "has_previous": page > 1,
-            },
-        }
-
-    def _browse_zip_csv(
-        self,
-        file_spec: dict,
-        page: int,
-        page_size: int,
-        offset: int,
-        sort_column: Optional[str],
-        descending: bool,
-    ) -> dict:
-        """
-        Paginated browse for ZIP+CSV using pandas.
-        No sort  → pandas skiprows (int) + nrows  — reads only the page window.
-        With sort → full pandas load + sort + iloc slice (unavoidable for ZIP).
-        """
-        raw = _extract_zip_bytes(file_spec)
-        delimiter = file_spec.get("delimiter", ",")
-        encoding = file_spec.get("encoding", "utf-8")
-        has_header = file_spec.get("has_header", True)
-
-        total_rows = _count_zip_csv_rows(raw, has_header)
-        total_pages = (total_rows + page_size - 1) // page_size if total_rows > 0 else 0
-        columns = _zip_csv_columns(raw, delimiter, encoding, has_header)
-
-        if sort_column and sort_column in columns:
-            # Full load required for sorting
-            full_pd = pd.read_csv(
-                io.BytesIO(raw), sep=delimiter, encoding=encoding,
-                header=0 if has_header else None, dtype=str,
-            )
-            if not has_header:
-                full_pd.columns = columns
-            full_pd = full_pd.sort_values(
-                sort_column, ascending=not descending, na_position="last"
-            )
-            page_pd = full_pd.iloc[offset: offset + page_size]
-        else:
-            # Efficient: skip header (1 row) + offset data rows as a single integer
-            skip_count = (offset + 1) if has_header else offset
-            page_pd = pd.read_csv(
-                io.BytesIO(raw), sep=delimiter, encoding=encoding,
-                header=None, names=columns,
-                skiprows=skip_count, nrows=page_size, dtype=str,
-            )
-
-        return {
-            "data": _pd_to_records(page_pd),
-            "columns": columns,
-            "pagination": {
-                "current_page": page,
-                "page_size": page_size,
-                "total_rows": total_rows,
-                "total_pages": total_pages,
-                "has_next": page < total_pages,
-                "has_previous": page > 1,
-            },
-        }
-
-    # ------------------------------------------------------------------ #
-    # Search                                                               #
-    # ------------------------------------------------------------------ #
-
-    def search_in_file(
-        self,
-        file_spec: dict,
-        query: str,
-        column: Optional[str] = None,
-        limit: int = 5000,
-        offset: int = 0,
-        page_size: Optional[int] = None,
-    ) -> dict:
-        """
-        Search for a query string (regex supported) across all or a specific column.
-
-        offset / page_size enable server-side pagination so the caller receives
-        only one page of results instead of the full result set.
-        Omit page_size (or pass None) to get all results up to `limit` — used
-        internally by search_across_folder when aggregating across multiple files.
-
-        CSV / Parquet: two Polars lazy scans —
-          1st scan: streaming count  (O(1) memory)
-          2nd scan: slice to page    (O(page_size) memory)
-        ZIP + CSV   : pandas chunked read capped at `limit` rows, then paged in RAM.
-        """
-        effective_page = page_size if page_size is not None else limit
-        fmt = file_spec.get("format", "csv").lower()
-
-        if fmt == "zip":
-            return self._search_zip_csv(
-                file_spec, query, column, limit, offset, effective_page
-            )
-
-        lf = self._parquet_lazy(file_spec) if fmt == "parquet" else self._csv_lazy(file_spec)
-        schema_names = lf.schema.names()
-
-        if column and column not in schema_names:
-            return {"results": [], "total_found": 0, "results_limited": False, "limit_applied": limit}
-        if not schema_names:
-            return {"results": [], "total_found": 0, "results_limited": False, "limit_applied": limit}
-
-        filter_expr = self._build_search_expr(schema_names, query, column)
-        filtered_lf = lf.filter(filter_expr)
-
-        # 1st lazy scan: accurate total count, O(1) memory
-        total_found = filtered_lf.select(pl.len()).collect().item()
-        results_limited = total_found > limit
-
-        # Cap pagination to `limit` so we never deliver more than allowed
-        effective_total = min(total_found, limit)
-        safe_offset = min(offset, effective_total)
-        safe_size = min(effective_page, effective_total - safe_offset)
-
-        if safe_size <= 0:
-            return {
-                "results": [],
-                "total_found": effective_total,
-                "results_limited": results_limited,
-                "limit_applied": limit,
-            }
-
-        # 2nd lazy scan: collect only the requested window, O(page_size) memory
-        page_df = filtered_lf.slice(safe_offset, safe_size).collect()
-        return {
-            "results": _sanitize(page_df.to_dicts()),
-            "total_found": effective_total,
-            "results_limited": results_limited,
-            "limit_applied": limit,
-        }
-
-    def _search_zip_csv(
-        self,
-        file_spec: dict,
-        query: str,
-        column: Optional[str],
-        limit: int,
-        offset: int,
-        page_size: int,
-    ) -> dict:
-        """
-        Chunked pandas search inside a ZIP+CSV.
-        Reads CHUNK_SIZE rows at a time, applies the filter, and accumulates
-        matching rows up to `limit`.  Never holds more than limit + CHUNK_SIZE
-        rows in memory simultaneously.
-        """
-        raw = _extract_zip_bytes(file_spec)
-        delimiter = file_spec.get("delimiter", ",")
-        encoding = file_spec.get("encoding", "utf-8")
-        has_header = file_spec.get("has_header", True)
-
-        CHUNK = 50_000
-        collected: list["pd.DataFrame"] = []
-        total_collected = 0
-        total_found = 0
-        columns_out: Optional[list] = None
-
-        for chunk in pd.read_csv(
-            io.BytesIO(raw), sep=delimiter, encoding=encoding,
-            header=0 if has_header else None, chunksize=CHUNK, dtype=str,
-        ):
-            if columns_out is None:
-                columns_out = list(chunk.columns)
-
-            if column:
-                if column not in chunk.columns:
-                    return {
-                        "results": [], "total_found": 0,
-                        "results_limited": False, "limit_applied": limit,
-                    }
-                mask = chunk[column].str.contains(query, na=False, regex=True)
-            else:
-                # Column-wise vectorised OR — much faster than row-wise apply
-                mask = chunk.apply(
-                    lambda s: s.str.contains(query, na=False, regex=True)
-                ).any(axis=1)
-
-            filtered = chunk[mask]
-            total_found += len(filtered)
-
-            if total_collected < limit:
-                take = min(len(filtered), limit - total_collected)
-                collected.append(filtered.head(take))
-                total_collected += take
-
-        results_limited = total_found > limit
-        result_df = pd.concat(collected, ignore_index=True) if collected else pd.DataFrame()
-
-        safe_offset = min(offset, len(result_df))
-        page_pd = result_df.iloc[safe_offset: safe_offset + page_size]
-
-        return {
-            "results": _pd_to_records(page_pd),
-            "total_found": min(total_found, limit),
-            "results_limited": results_limited,
-            "limit_applied": limit,
-        }
-
-    # ------------------------------------------------------------------ #
-    # Multi-value search (Excel paste)                                     #
-    # ------------------------------------------------------------------ #
-
-    def search_multiple_values(
-        self,
-        file_spec: dict,
-        values: list,
-        column: str,
-        limit: int = 5000,
-        exact_match: bool = True,
-        offset: int = 0,
-        page_size: Optional[int] = None,
-    ) -> dict:
-        """
-        Search a specific column for any of the provided values (Excel paste mode).
-
-        CSV / Parquet: Polars lazy scan with is_in() or str.contains() OR-chain.
-        ZIP + CSV    : pandas chunked read.
-        offset / page_size control server-side pagination (same rules as search_in_file).
-        """
-        if not values:
-            return {
-                "results": [], "total_found": 0,
-                "results_limited": False, "limit_applied": limit,
-                "values_searched": 0,
-            }
-
-        effective_page = page_size if page_size is not None else limit
-        str_values = [str(v).strip() for v in values if str(v).strip()]
-        fmt = file_spec.get("format", "csv").lower()
-
-        if fmt == "zip":
-            return self._search_multi_zip_csv(
-                file_spec, str_values, column, limit, exact_match, offset, effective_page
-            )
-
-        lf = self._parquet_lazy(file_spec) if fmt == "parquet" else self._csv_lazy(file_spec)
-        schema_names = lf.schema.names()
-
-        if column not in schema_names:
-            return {
-                "results": [], "total_found": 0, "results_limited": False,
-                "limit_applied": limit,
-                "error": f"Column '{column}' not found in file",
-                "values_searched": len(values),
-            }
-
-        col_expr = pl.col(column).cast(pl.Utf8)
-        if exact_match:
-            filter_expr = col_expr.is_in(str_values)
-        else:
-            masks = [col_expr.str.contains(v, literal=True) for v in str_values]
-            filter_expr = masks[0]
-            for m in masks[1:]:
-                filter_expr = filter_expr | m
-
-        filtered_lf = lf.filter(filter_expr)
-
-        # 1st scan: count
-        total_found = filtered_lf.select(pl.len()).collect().item()
-        results_limited = total_found > limit
-
-        effective_total = min(total_found, limit)
-        safe_offset = min(offset, effective_total)
-        safe_size = min(effective_page, effective_total - safe_offset)
-
-        if safe_size <= 0:
-            return {
-                "results": [], "total_found": effective_total,
-                "results_limited": results_limited, "limit_applied": limit,
-                "values_searched": len(values),
-            }
-
-        # 2nd scan: page data
-        page_df = filtered_lf.slice(safe_offset, safe_size).collect()
-        return {
-            "results": _sanitize(page_df.to_dicts()),
-            "total_found": effective_total,
-            "results_limited": results_limited,
-            "limit_applied": limit,
-            "values_searched": len(values),
-        }
-
-    def _search_multi_zip_csv(
-        self,
-        file_spec: dict,
-        str_values: list,
-        column: str,
-        limit: int,
-        exact_match: bool,
-        offset: int,
-        page_size: int,
-    ) -> dict:
-        raw = _extract_zip_bytes(file_spec)
-        delimiter = file_spec.get("delimiter", ",")
-        encoding = file_spec.get("encoding", "utf-8")
-        has_header = file_spec.get("has_header", True)
-
-        CHUNK = 50_000
-        collected: list["pd.DataFrame"] = []
-        total_collected = 0
-        total_found = 0
-
-        # Pre-build partial-match regex once (re.escape prevents injection)
-        partial_pattern = "|".join(map(re.escape, str_values)) if not exact_match else None
-
-        for chunk in pd.read_csv(
-            io.BytesIO(raw), sep=delimiter, encoding=encoding,
-            header=0 if has_header else None, chunksize=CHUNK, dtype=str,
-        ):
-            if column not in chunk.columns:
-                return {
-                    "results": [], "total_found": 0, "results_limited": False,
-                    "limit_applied": limit,
-                    "error": f"Column '{column}' not found",
-                    "values_searched": len(str_values),
-                }
-
-            col_series = chunk[column].str.strip()
-            mask = (
-                col_series.isin(str_values)
-                if exact_match
-                else col_series.str.contains(partial_pattern, na=False, regex=True)
-            )
-
-            filtered = chunk[mask]
-            total_found += len(filtered)
-
-            if total_collected < limit:
-                take = min(len(filtered), limit - total_collected)
-                collected.append(filtered.head(take))
-                total_collected += take
-
-        results_limited = total_found > limit
-        result_df = pd.concat(collected, ignore_index=True) if collected else pd.DataFrame()
-
-        safe_offset = min(offset, len(result_df))
-        page_pd = result_df.iloc[safe_offset: safe_offset + page_size]
-
-        return {
-            "results": _pd_to_records(page_pd),
-            "total_found": min(total_found, limit),
-            "results_limited": results_limited,
-            "limit_applied": limit,
-            "values_searched": len(str_values),
-        }
-
-    # ------------------------------------------------------------------ #
-    # Folder-based discovery                                               #
-    # ------------------------------------------------------------------ #
-
-    def discover_files_in_folder(
-        self,
-        folder_path: str,
-        file_pattern: str = ".*",
-        date_from: Optional[str] = None,
-        date_to: Optional[str] = None,
-        date_group_index: int = 1,
-        date_format: str = "%Y%m%d",
-    ) -> list:
-        """
-        Scan a folder and return files whose names match file_pattern (regex).
-        Optionally filter by date range extracted from a capture group in the pattern.
-        date_from / date_to are ISO strings (YYYY-MM-DD).
-        """
-        folder = _resolve_path(folder_path)
-        if not folder.exists() or not folder.is_dir():
-            return []
-
-        try:
-            pattern = re.compile(file_pattern)
-        except re.error:
-            return []
-
-        dt_from = None
-        dt_to = None
-        if date_from:
-            try:
-                dt_from = datetime.strptime(date_from, "%Y-%m-%d")
-            except ValueError:
-                pass
-        if date_to:
-            try:
-                dt_to = datetime.strptime(date_to, "%Y-%m-%d")
-            except ValueError:
-                pass
-
-        found = []
-        for f in sorted(folder.iterdir()):
-            if not f.is_file():
-                continue
-            m = pattern.search(f.name)
-            if not m:
-                continue
-
-            file_date = None
-            try:
-                if m.lastindex and m.lastindex >= date_group_index:
-                    date_str = m.group(date_group_index)
-                    file_date = datetime.strptime(date_str, date_format)
-            except (ValueError, IndexError):
-                pass
-
-            if dt_from and file_date and file_date < dt_from:
-                continue
-            if dt_to and file_date and file_date > dt_to:
-                continue
-
-            found.append({
-                "path": str(f),
-                "name": f.name,
-                "date": file_date.strftime("%Y-%m-%d") if file_date else None,
-            })
-
-        return found
-
-    # ------------------------------------------------------------------ #
-    # Cross-folder search                                                  #
-    # ------------------------------------------------------------------ #
-
-    def search_across_folder(
-        self,
-        file_spec: dict,
-        query: str,
-        column: Optional[str] = None,
-        limit: int = 5000,
-        date_from: Optional[str] = None,
-        date_to: Optional[str] = None,
-        file_regex: Optional[str] = None,
-    ) -> dict:
-        """
-        Search across all files in a folder that match the discovery criteria.
-        Results from all matching files are combined up to limit.
-        Pagination of the combined results is handled by the router.
-        """
-        folder_path = file_spec.get("folder_path", "")
-        file_pattern = file_regex if file_regex else file_spec.get("file_pattern", ".*")
-        date_group_index = file_spec.get("date_group_index", 1)
-        date_format_str = file_spec.get("date_format", "%Y%m%d")
-
-        discovered = self.discover_files_in_folder(
-            folder_path=folder_path,
-            file_pattern=file_pattern,
-            date_from=date_from,
-            date_to=date_to,
-            date_group_index=date_group_index,
-            date_format=date_format_str,
-        )
-
-        if not discovered:
-            return {
-                "results": [],
-                "total_found": 0,
-                "results_limited": False,
-                "limit_applied": limit,
-                "files_searched": 0,
-                "files_available": 0,
-            }
-
-        all_results = []
-        files_searched = 0
-        for file_info in discovered:
-            if len(all_results) >= limit:
-                break
-            single_spec = {**file_spec, "path": file_info["path"]}
-            remaining = limit - len(all_results)
-            try:
-                # page_size=None → service returns all matches up to remaining
-                result = self.search_in_file(
-                    file_spec=single_spec,
-                    query=query,
-                    column=column,
-                    limit=remaining,
-                )
-                all_results.extend(result.get("results", []))
-                files_searched += 1
-            except Exception:
-                pass
-
-        results_limited = len(all_results) >= limit
-        return {
-            "results": all_results[:limit],
-            "total_found": len(all_results),
-            "results_limited": results_limited,
-            "limit_applied": limit,
-            "files_searched": files_searched,
-            "files_available": len(discovered),
-        }
-
-
-# Singleton instance
-reference_file_service = ReferenceFileService()
-
-"""
-Subprocess worker for reference file service operations.
-Reads JSON payload from stdin and writes JSON response to stdout.
-Mirrors the pattern of parquet_sub.py.
-"""
-from __future__ import annotations
-
-import json
-import traceback
-from pathlib import Path
-import sys
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from reference_file_service import reference_file_service  # noqa: E402
-
-
-def run_operation(payload: dict) -> dict:
-    mode = payload.get("mode")
-    request = payload.get("request", {})
-    file_spec = request.get("file_spec", {})
-
-    if mode == "metadata":
-        return reference_file_service.get_file_metadata(file_spec)
-
-    if mode == "read_paginated":
-        return reference_file_service.read_file_paginated(
-            file_spec=file_spec,
-            page=request.get("page", 1),
-            page_size=request.get("page_size", 50),
-            sort_column=request.get("sort_column"),
-            sort_direction=request.get("sort_direction", "asc"),
-        )
-
-    if mode == "search":
-        return reference_file_service.search_in_file(
-            file_spec=file_spec,
-            query=request["query"],
-            column=request.get("column"),
-            limit=request.get("limit", 5000),
-            # offset + page_size enable server-side pagination;
-            # omitted (None) when called from search_across_folder
-            offset=request.get("offset", 0),
-            page_size=request.get("page_size"),
-        )
-
-    if mode == "search_multi":
-        return reference_file_service.search_multiple_values(
-            file_spec=file_spec,
-            values=request["values"],
-            column=request["column"],
-            limit=request.get("limit", 5000),
-            exact_match=request.get("exact_match", True),
-            offset=request.get("offset", 0),
-            page_size=request.get("page_size"),
-        )
-
-    if mode == "discover_files":
-        files = reference_file_service.discover_files_in_folder(
-            folder_path=request.get("folder_path", ""),
-            file_pattern=request.get("file_pattern", ".*"),
-            date_from=request.get("date_from"),
-            date_to=request.get("date_to"),
-            date_group_index=request.get("date_group_index", 1),
-            date_format=request.get("date_format", "%Y%m%d"),
-        )
-        return {"files": files, "total": len(files)}
-
-    if mode == "search_folder":
-        return reference_file_service.search_across_folder(
-            file_spec=file_spec,
-            query=request["query"],
-            column=request.get("column"),
-            limit=request.get("limit", 5000),
-            date_from=request.get("date_from"),
-            date_to=request.get("date_to"),
-            file_regex=request.get("file_regex"),
-        )
-
-    raise ValueError(f"Unsupported mode: {mode}")
-
-
-def main() -> int:
-    # Redirect stdout to stderr so any library prints don't corrupt the JSON output.
-    _stdout = sys.stdout
-    sys.stdout = sys.stderr
-    try:
-        payload = json.loads(input())
-        result = run_operation(payload)
-        print(json.dumps({"success": True, "result": result}, default=str), file=_stdout)
-        return 0
-    except Exception as exc:
-        print(
-            json.dumps(
-                {
-                    "success": False,
-                    "error": str(exc),
-                    "traceback": traceback.format_exc(),
-                }
-            ),
-            file=_stdout,
-        )
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-"""
-Reference File Search Router
-Provides search and browse functionality for known reference files (CSV, ZIP).
-File specifications are loaded from api/data/reference_search.json.
-"""
-from fastapi import APIRouter, HTTPException
-from typing import Optional, List
-from pydantic import BaseModel
-from datetime import datetime
-import logging
-from pathlib import Path
-import sys
-import json
-import subprocess
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from .utils import make_json_safe
+from fastapi import APIRouter, HTTPException, Query
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/reference-search", tags=["reference-search"])
+router = APIRouter(prefix="/api/file-monitoring", tags=["file-monitoring"])
+
+BASE_DIR = Path(__file__).parent.parent
+CONFIG_PATH = BASE_DIR / "file_monitoring.json"
+STATUS_DIR = BASE_DIR / "file_status"
 
 
-class MultiValueSearchRequest(BaseModel):
-    column: str
-    values: List[str]
-    exact_match: bool = True
-    page: int = 1
-    page_size: int = 50
-    limit: int = 5000
+def _load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        raise HTTPException(status_code=500, detail="file_monitoring.json config not found")
+    with open(CONFIG_PATH, "r") as f:
+        return json.load(f)
 
 
-SUBPROCESS_TIMEOUT = 300  # seconds
-
-# Path to the file specs config
-_API_DIR = Path(__file__).parent.parent
-REFERENCE_FILES_CONFIG = _API_DIR / "data" / "reference_search.json"
-
-
-# ------------------------------------------------------------------ #
-# Helpers                                                              #
-# ------------------------------------------------------------------ #
-
-def _load_reference_files() -> dict:
-    """Load reference file specs from JSON config. Returns dict keyed by file id."""
-    if not REFERENCE_FILES_CONFIG.exists():
-        logger.warning(f"Reference files config not found: {REFERENCE_FILES_CONFIG}")
-        return {}
+def _load_status_file(file_type: str, date_str: str) -> dict:
+    """Load status file for given file_type and YYYYMMDD date string. Returns empty if missing."""
+    STATUS_DIR.mkdir(parents=True, exist_ok=True)
+    status_path = STATUS_DIR / f"{file_type}_status_{date_str}.json"
+    if not status_path.exists():
+        return {"files": []}
     try:
-        with open(REFERENCE_FILES_CONFIG, "r", encoding="utf-8") as f:
-            config = json.load(f)
-        return {entry["id"]: entry for entry in config.get("files", [])}
+        with open(status_path, "r") as f:
+            return json.load(f)
     except Exception as e:
-        logger.error(f"Failed to load reference files config: {e}")
-        return {}
+        logger.error("Failed to load status file %s: %s", status_path, e)
+        return {"files": []}
 
 
-def _run_reference_subprocess(mode: str, request: dict):
-    """Run the reference_sub.py subprocess and return the result."""
-    script_path = Path(__file__).with_name("reference_sub.py")
-    payload = {"mode": mode, "request": request}
-    proc = subprocess.run(
-        [sys.executable, str(script_path)],
-        input=json.dumps(payload),
-        text=True,
-        capture_output=True,
-        timeout=SUBPROCESS_TIMEOUT,
-        check=False,
-    )
+def _merge_status(config_entries: list, status_data: dict, monitoring_date: str) -> list:
+    """Merge status file entries onto config entries by file_id. Synthesise not_received for missing entries."""
+    status_by_id = {entry["file_id"]: entry for entry in status_data.get("files", [])}
 
-    if proc.returncode != 0:
-        logger.error(
-            f"Reference subprocess failed ({mode}): stdout={proc.stdout[:500]} stderr={proc.stderr[:500]}"
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Reference file subprocess failed ({mode}): {proc.stderr[:300]}"
-        )
+    results = []
+    for cfg in config_entries:
+        if not cfg.get("enabled", True):
+            continue
+        file_id = cfg["file_id"]
+        status_entry = status_by_id.get(file_id, {})
 
-    try:
-        response = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        logger.error(f"Invalid JSON from reference subprocess ({mode}): {proc.stdout[:500]}")
-        raise HTTPException(status_code=500, detail=f"Invalid subprocess response ({mode})")
-
-    if not response.get("success", False):
-        logger.error(f"Reference subprocess error ({mode}): {response}")
-        raise HTTPException(
-            status_code=500,
-            detail=response.get("error", f"Subprocess error ({mode})")
-        )
-
-    return response.get("result")
-
-
-# ------------------------------------------------------------------ #
-# Endpoints                                                            #
-# ------------------------------------------------------------------ #
-
-@router.get("/files")
-def list_files():
-    """List all available reference files from the JSON config."""
-    try:
-        files_map = _load_reference_files()
-        files = [
-            {
-                "id": spec["id"],
-                "name": spec.get("name", spec["id"]),
-                "description": spec.get("description", ""),
-                "format": spec.get("format", "csv"),
-                "category": spec.get("category", ""),
-                "is_folder_type": bool(spec.get("folder_path")),
-            }
-            for spec in files_map.values()
-        ]
-        return {
-            "success": True,
-            "files": files,
-            "total": len(files),
-            "retrieved_at": datetime.now().isoformat(),
-        }
-    except Exception as e:
-        logger.error(f"Error listing reference files: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/files/{file_id}/columns")
-def get_columns(file_id: str):
-    """
-    Get column names for a reference file.
-    Returns columns from the JSON spec if defined, otherwise reads from the file itself.
-    """
-    try:
-        files_map = _load_reference_files()
-        if file_id not in files_map:
-            raise HTTPException(status_code=404, detail=f"File '{file_id}' not found in config")
-
-        spec = files_map[file_id]
-
-        # Use columns from spec if available (fast path, no file I/O)
-        spec_columns = spec.get("columns")
-        if spec_columns:
-            return {
-                "success": True,
-                "columns": spec_columns,
-                "file_id": file_id,
-                "source": "spec",
-                "retrieved_at": datetime.now().isoformat(),
-            }
-
-        # Otherwise read metadata from the file via subprocess
-        metadata = _run_reference_subprocess("metadata", {"file_spec": spec})
-        return {
-            "success": True,
-            "columns": metadata.get("columns", []),
-            "total_rows": metadata.get("total_rows", 0),
+        results.append({
             "file_id": file_id,
-            "source": "file",
-            "retrieved_at": datetime.now().isoformat(),
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting columns for {file_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+            "display_name": cfg.get("display_name", cfg.get("file_name", file_id)),
+            "file_name": cfg.get("file_name", ""),
+            "regulation": cfg.get("regulation", "Unknown"),
+            "asset_class": cfg.get("asset_class", "Unknown"),
+            "sub_control_name": cfg.get("sub_control_name", "Unknown"),
+            "control_name": cfg.get("control_name", "Unknown"),
+            "frequency": cfg.get("frequency", "Daily"),
+            "status": status_entry.get("status", "not_received"),
+            "arrival_time": status_entry.get("arrival_time"),
+            "note": status_entry.get("note"),
+            "monitoring_date": monitoring_date,
+        })
+
+    return results
 
 
-@router.get("/files/{file_id}/discover")
-def discover_file_entries(
-    file_id: str,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    file_regex: Optional[str] = None,
+@router.get("/status")
+def get_file_monitoring_status(
+    file_type: str = Query(..., description="'input' or 'output'"),
+    monitoring_date: Optional[str] = Query(None, description="Date in YYYY-MM-DD format. Defaults to today."),
+    limit: int = Query(5000, ge=1, le=10000),
 ):
-    """
-    For folder-type file specs, list actual files matching the pattern.
-    Supports optional date range (YYYY-MM-DD) and regex override for filename matching.
-    Returns is_folder_type=False for single-file specs.
-    """
-    try:
-        files_map = _load_reference_files()
-        if file_id not in files_map:
-            raise HTTPException(status_code=404, detail=f"File '{file_id}' not found in config")
+    if file_type not in ("input", "output"):
+        raise HTTPException(status_code=400, detail="file_type must be 'input' or 'output'")
 
-        spec = files_map[file_id]
-        if not spec.get("folder_path"):
-            return {
-                "success": True,
-                "is_folder_type": False,
-                "files": [],
-                "total": 0,
-                "retrieved_at": datetime.now().isoformat(),
+    if monitoring_date is None:
+        monitoring_date = date.today().isoformat()
+
+    try:
+        datetime.strptime(monitoring_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="monitoring_date must be in YYYY-MM-DD format")
+
+    date_str = monitoring_date.replace("-", "")
+
+    config = _load_config()
+    config_key = "input_files" if file_type == "input" else "output_files"
+    config_entries = config.get(config_key, [])
+
+    status_data = _load_status_file(file_type, date_str)
+    file_statuses = _merge_status(config_entries, status_data, monitoring_date)
+
+    if limit:
+        file_statuses = file_statuses[:limit]
+
+    return {
+        "file_statuses": file_statuses,
+        "total_count": len(file_statuses),
+        "monitoring_date": monitoring_date,
+        "file_type": file_type,
+        "retrieved_at": datetime.now().isoformat(),
+    }
+
+
+@router.get("/hierarchy")
+def get_file_monitoring_hierarchy(
+    file_type: str = Query("input", description="'input' or 'output'"),
+):
+    if file_type not in ("input", "output"):
+        raise HTTPException(status_code=400, detail="file_type must be 'input' or 'output'")
+
+    config = _load_config()
+    config_key = "input_files" if file_type == "input" else "output_files"
+    entries = [e for e in config.get(config_key, []) if e.get("enabled", True)]
+
+    def unique_sorted(values):
+        return sorted(set(v for v in values if v))
+
+    return {
+        "regulations": unique_sorted(e.get("regulation", "") for e in entries),
+        "asset_classes": unique_sorted(e.get("asset_class", "") for e in entries),
+        "sub_control_names": unique_sorted(e.get("sub_control_name", "") for e in entries),
+        "control_names": unique_sorted(e.get("control_name", "") for e in entries),
+        "frequencies": unique_sorted(e.get("frequency", "") for e in entries),
+        "statuses": ["received", "not_received"],
+    }
+
+
+@router.get("/config")
+def get_file_monitoring_config():
+    config = _load_config()
+    return config
+
+app.js
+import InputFileMonitoringInstance from './instances/file-monitoring/InputFileMonitoringInstance';
+import OutputFileMonitoringInstance from './instances/file-monitoring/OutputFileMonitoringInstance';
+                        <Route path="/input-file-monitoring" element={<InputFileMonitoringInstance />} />
+                        <Route path="/output-file-monitoring" element={<OutputFileMonitoringInstance />} />
+
+page.js
+    {
+      title: 'Control Input File Monitoring',
+      description: 'Real-time dashboard for monitoring expected vs actual arrival status of control input files. Analyse status and trends including filtering by regulation, asset class, and control type.',
+      icon: FaDatabase,
+      onClick: () => window.open('/input-file-monitoring', '_blank')
+    },
+    {
+      title: 'Control Output Health Monitoring',
+      description: 'Dashboard of automated daily regression testing and integrity checks on the outputs of the Controls Platform. Provide a final layer of assurance, detecting systemic issues, data processing errors, or unexpected deviations from established operational baselines.',
+      icon: FaChartLine,
+      onClick: () => window.open('/output-file-monitoring', '_blank')
+    },
+
+page.js
+import React, { useState, useEffect, useMemo } from 'react';
+import HSBCLogo from '../../components/HSBCLogo';
+import { ApiService } from '../../services/api';
+import {
+    BarChart,
+    Bar,
+    XAxis,
+    YAxis,
+    CartesianGrid,
+    Tooltip,
+    Legend,
+    ResponsiveContainer
+} from 'recharts';
+
+export default function FileMonitoringDashboard({ fileType = 'input' }) {
+    const [fileStatuses, setFileStatuses] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [hierarchy, setHierarchy] = useState({
+        regulations: [],
+        asset_classes: [],
+        sub_control_names: [],
+        control_names: [],
+        frequencies: [],
+        statuses: ['received', 'not_received']
+    });
+
+    const getTodayDate = () => {
+        const today = new Date();
+        return today.toISOString().split('T')[0];
+    };
+
+    const [filters, setFilters] = useState({
+        monitoring_date: getTodayDate(),
+        regulation: '',
+        asset_class: '',
+        sub_control_name: '',
+        control_name: '',
+        frequency: '',
+        status: ''
+    });
+
+    const [currentPage, setCurrentPage] = useState(1);
+    const [itemsPerPage, setItemsPerPage] = useState(50);
+    const [sortColumn, setSortColumn] = useState('display_name');
+    const [sortDirection, setSortDirection] = useState('asc');
+    const [chartCategory, setChartCategory] = useState('regulation');
+
+    const [visibleColumns, setVisibleColumns] = useState({
+        display_name: true,
+        status: true,
+        arrival_time: true,
+        regulation: false,
+        asset_class: false,
+        sub_control_name: false,
+        control_name: false,
+        frequency: false,
+        note: true
+    });
+    const [showColumnSelector, setShowColumnSelector] = useState(false);
+
+    const [columnFilters, setColumnFilters] = useState({
+        display_name: '',
+        regulation: '',
+        asset_class: '',
+        sub_control_name: '',
+        control_name: '',
+        frequency: '',
+        status: '',
+        arrival_time: '',
+        note: ''
+    });
+
+    const dashboardTitle = fileType === 'input'
+        ? 'Input File Monitoring'
+        : 'Output File Monitoring';
+
+    const arrivalLabel = fileType === 'input' ? 'Arrival Time' : 'Production Time';
+
+    useEffect(() => {
+        loadHierarchy();
+    }, [fileType]);
+
+    useEffect(() => {
+        loadFileStatuses();
+    }, [filters.monitoring_date, fileType]);
+
+    const loadHierarchy = async () => {
+        try {
+            const data = await ApiService.getFileMonitoringHierarchy(fileType);
+            setHierarchy(data);
+        } catch (err) {
+            // hierarchy load failure is non-fatal
+        }
+    };
+
+    const loadFileStatuses = async () => {
+        setLoading(true);
+        setError(null);
+        try {
+            const data = await ApiService.getFileMonitoringStatus({
+                file_type: fileType,
+                monitoring_date: filters.monitoring_date
+            }, 5000);
+            setFileStatuses(data.file_statuses || []);
+        } catch (err) {
+            setError(err.message || 'Failed to load file monitoring status');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleFilterChange = (key, value) => {
+        setFilters(prev => {
+            const newFilters = { ...prev, [key]: value };
+            if (key === 'regulation') {
+                newFilters.asset_class = '';
+                newFilters.sub_control_name = '';
+                newFilters.control_name = '';
+            } else if (key === 'asset_class') {
+                newFilters.sub_control_name = '';
+                newFilters.control_name = '';
+            } else if (key === 'sub_control_name') {
+                newFilters.control_name = '';
+            }
+            return newFilters;
+        });
+        setCurrentPage(1);
+    };
+
+    const clearFilters = () => {
+        setFilters({
+            monitoring_date: getTodayDate(),
+            regulation: '',
+            asset_class: '',
+            sub_control_name: '',
+            control_name: '',
+            frequency: '',
+            status: ''
+        });
+        setColumnFilters({
+            display_name: '',
+            regulation: '',
+            asset_class: '',
+            sub_control_name: '',
+            control_name: '',
+            frequency: '',
+            status: '',
+            arrival_time: '',
+            note: ''
+        });
+        setCurrentPage(1);
+    };
+
+    // Cascade filters driven from loaded data
+    const filteredAssetClasses = useMemo(() => {
+        if (!filters.regulation) return hierarchy.asset_classes;
+        return [...new Set(
+            fileStatuses
+                .filter(f => f.regulation === filters.regulation)
+                .map(f => f.asset_class)
+        )].sort();
+    }, [filters.regulation, fileStatuses, hierarchy.asset_classes]);
+
+    const filteredSubControlNames = useMemo(() => {
+        if (!filters.regulation && !filters.asset_class) return hierarchy.sub_control_names;
+        return [...new Set(
+            fileStatuses
+                .filter(f =>
+                    (!filters.regulation || f.regulation === filters.regulation) &&
+                    (!filters.asset_class || f.asset_class === filters.asset_class)
+                )
+                .map(f => f.sub_control_name)
+        )].sort();
+    }, [filters.regulation, filters.asset_class, fileStatuses, hierarchy.sub_control_names]);
+
+    const filteredControlNames = useMemo(() => {
+        if (!filters.regulation && !filters.asset_class && !filters.sub_control_name) return hierarchy.control_names;
+        return [...new Set(
+            fileStatuses
+                .filter(f =>
+                    (!filters.regulation || f.regulation === filters.regulation) &&
+                    (!filters.asset_class || f.asset_class === filters.asset_class) &&
+                    (!filters.sub_control_name || f.sub_control_name === filters.sub_control_name)
+                )
+                .map(f => f.control_name)
+        )].sort();
+    }, [filters.regulation, filters.asset_class, filters.sub_control_name, fileStatuses, hierarchy.control_names]);
+
+    const applyClientFilters = (data) => {
+        return data.filter(f => {
+            if (filters.regulation && f.regulation !== filters.regulation) return false;
+            if (filters.asset_class && f.asset_class !== filters.asset_class) return false;
+            if (filters.sub_control_name && f.sub_control_name !== filters.sub_control_name) return false;
+            if (filters.control_name && f.control_name !== filters.control_name) return false;
+            if (filters.frequency && f.frequency !== filters.frequency) return false;
+            if (filters.status && f.status !== filters.status) return false;
+
+            if (columnFilters.display_name && !(f.display_name || '').toLowerCase().includes(columnFilters.display_name.toLowerCase())) return false;
+            if (columnFilters.regulation && f.regulation !== columnFilters.regulation) return false;
+            if (columnFilters.asset_class && f.asset_class !== columnFilters.asset_class) return false;
+            if (columnFilters.sub_control_name && f.sub_control_name !== columnFilters.sub_control_name) return false;
+            if (columnFilters.control_name && f.control_name !== columnFilters.control_name) return false;
+            if (columnFilters.frequency && f.frequency !== columnFilters.frequency) return false;
+            if (columnFilters.status && f.status !== columnFilters.status) return false;
+            if (columnFilters.note && !(f.note || '').toLowerCase().includes(columnFilters.note.toLowerCase())) return false;
+
+            return true;
+        });
+    };
+
+    const sortedAndPaginatedStatuses = useMemo(() => {
+        const filtered = applyClientFilters(fileStatuses);
+        const sorted = [...filtered].sort((a, b) => {
+            let aVal = a[sortColumn] || '';
+            let bVal = b[sortColumn] || '';
+            return sortDirection === 'asc'
+                ? (aVal > bVal ? 1 : aVal < bVal ? -1 : 0)
+                : (aVal < bVal ? 1 : aVal > bVal ? -1 : 0);
+        });
+        const startIndex = (currentPage - 1) * itemsPerPage;
+        return sorted.slice(startIndex, startIndex + itemsPerPage);
+    }, [fileStatuses, filters, columnFilters, sortColumn, sortDirection, currentPage, itemsPerPage]);
+
+    const filteredCount = useMemo(() => applyClientFilters(fileStatuses).length, [fileStatuses, filters, columnFilters]);
+    const totalPages = Math.ceil(filteredCount / itemsPerPage);
+
+    const handleSort = (column) => {
+        if (sortColumn === column) {
+            setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
+        } else {
+            setSortColumn(column);
+            setSortDirection('asc');
+        }
+    };
+
+    const stats = useMemo(() => {
+        const filtered = applyClientFilters(fileStatuses);
+        const total = filtered.length;
+        const received = filtered.filter(f => f.status === 'received').length;
+        const notReceived = filtered.filter(f => f.status === 'not_received').length;
+        const receiptRate = total > 0 ? ((received / total) * 100).toFixed(1) : 0;
+        return { total, received, notReceived, receiptRate };
+    }, [fileStatuses, filters, columnFilters]);
+
+    const getStatusColor = (status) => {
+        switch (status) {
+            case 'received':
+                return 'bg-green-100 text-green-800 border-green-300';
+            case 'not_received':
+                return 'bg-red-100 text-red-800 border-red-300';
+            default:
+                return 'bg-gray-100 text-gray-800 border-gray-300';
+        }
+    };
+
+    const getStatusIcon = (status) => {
+        switch (status) {
+            case 'received': return '✓';
+            case 'not_received': return '✗';
+            default: return '○';
+        }
+    };
+
+    const formatStatusLabel = (status) => {
+        switch (status) {
+            case 'received': return 'Received';
+            case 'not_received': return 'Not Received';
+            default: return status;
+        }
+    };
+
+    const formatDateTime = (isoString) => {
+        if (!isoString) return '-';
+        try {
+            const d = new Date(isoString);
+            return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        } catch {
+            return isoString;
+        }
+    };
+
+    const chartData = useMemo(() => {
+        const filtered = applyClientFilters(fileStatuses);
+        const groups = {};
+        filtered.forEach(f => {
+            const key = f[chartCategory] || 'Unknown';
+            if (!groups[key]) groups[key] = { Received: 0, 'Not Received': 0 };
+            if (f.status === 'received') groups[key].Received++;
+            else groups[key]['Not Received']++;
+        });
+        return Object.entries(groups)
+            .map(([name, counts]) => ({
+                name,
+                Received: counts.Received,
+                'Not Received': counts['Not Received'],
+                total: counts.Received + counts['Not Received']
+            }))
+            .sort((a, b) => b.total - a.total);
+    }, [fileStatuses, chartCategory, filters, columnFilters]);
+
+    const getCategoryLabel = (cat) => {
+        const labels = {
+            regulation: 'Regulation',
+            asset_class: 'Asset Class',
+            sub_control_name: 'Sub-Control Name',
+            control_name: 'Control Name'
+        };
+        return labels[cat] || cat;
+    };
+
+    const columnLabels = {
+        display_name: 'File Name',
+        status: 'Status',
+        arrival_time: arrivalLabel,
+        regulation: 'Regulation',
+        asset_class: 'Asset Class',
+        sub_control_name: 'Sub-Control Name',
+        control_name: 'Control Name',
+        frequency: 'Frequency',
+        note: 'Note'
+    };
+
+    return (
+        <div className="min-h-screen" style={{ backgroundColor: 'white' }}>
+            <div className="flex flex-col h-screen">
+                {/* Header */}
+                <div
+                    className="border-b px-8 py-4 relative overflow-hidden"
+                    style={{
+                        backgroundColor: 'white',
+                        borderBottom: '3px solid #db0011',
+                        height: '80px',
+                        boxShadow: '0 2px 8px rgba(219,0,17,0.1)'
+                    }}
+                >
+                    <div className="flex items-center justify-between h-full relative z-10">
+                        <div className="flex items-center flex-shrink-0">
+                            <HSBCLogo height={64} className="mr-4" />
+                        </div>
+                        <div className="flex-1 flex justify-center">
+                            <h1 className="text-2xl font-bold text-center" style={{ color: '#db0011' }}>
+                                {dashboardTitle}
+                            </h1>
+                        </div>
+                        <div className="flex-shrink-0 w-32"></div>
+                    </div>
+                </div>
+
+                {/* Main Content */}
+                <div className="flex-1 flex overflow-hidden relative" style={{ backgroundColor: '#f5f5f5' }}>
+                    {/* Left Sidebar - Filters */}
+                    <div className="w-80 bg-white border-r border-gray-200 overflow-y-auto shadow-lg">
+                        <div className="p-6">
+                            <div className="flex items-center justify-between mb-6">
+                                <h2 className="text-lg font-semibold text-gray-800">Filters</h2>
+                                <button
+                                    onClick={clearFilters}
+                                    className="px-3 py-1.5 text-sm text-white rounded transition-colors"
+                                    style={{ backgroundColor: '#db0011' }}
+                                    onMouseOver={(e) => e.target.style.backgroundColor = '#a00010'}
+                                    onMouseOut={(e) => e.target.style.backgroundColor = '#db0011'}
+                                >
+                                    Clear All
+                                </button>
+                            </div>
+
+                            <div className="space-y-4">
+                                {/* Monitoring Date */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Monitoring Date
+                                    </label>
+                                    <input
+                                        type="date"
+                                        value={filters.monitoring_date}
+                                        onChange={(e) => handleFilterChange('monitoring_date', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    />
+                                </div>
+
+                                {/* Regulation */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Regulation
+                                    </label>
+                                    <select
+                                        value={filters.regulation}
+                                        onChange={(e) => handleFilterChange('regulation', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    >
+                                        <option value="">All</option>
+                                        {hierarchy.regulations.map((r) => (
+                                            <option key={r} value={r}>{r}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {/* Asset Class */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Asset Class
+                                    </label>
+                                    <select
+                                        value={filters.asset_class}
+                                        onChange={(e) => handleFilterChange('asset_class', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    >
+                                        <option value="">All</option>
+                                        {filteredAssetClasses.map((ac) => (
+                                            <option key={ac} value={ac}>{ac}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {/* Sub-Control Name */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Sub-Control Name
+                                    </label>
+                                    <select
+                                        value={filters.sub_control_name}
+                                        onChange={(e) => handleFilterChange('sub_control_name', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    >
+                                        <option value="">All</option>
+                                        {filteredSubControlNames.map((sc) => (
+                                            <option key={sc} value={sc}>{sc}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {/* Control Name */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Control Name
+                                    </label>
+                                    <select
+                                        value={filters.control_name}
+                                        onChange={(e) => handleFilterChange('control_name', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    >
+                                        <option value="">All</option>
+                                        {filteredControlNames.map((cn) => (
+                                            <option key={cn} value={cn}>{cn}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {/* Frequency */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Frequency
+                                    </label>
+                                    <select
+                                        value={filters.frequency}
+                                        onChange={(e) => handleFilterChange('frequency', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    >
+                                        <option value="">All</option>
+                                        {hierarchy.frequencies.map((freq) => (
+                                            <option key={freq} value={freq}>{freq}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {/* Status */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Status
+                                    </label>
+                                    <select
+                                        value={filters.status}
+                                        onChange={(e) => handleFilterChange('status', e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                    >
+                                        <option value="">All</option>
+                                        <option value="received">Received</option>
+                                        <option value="not_received">Not Received</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Right Content Area */}
+                    <div className="flex-1 overflow-y-auto relative">
+                        <div className="p-6 relative z-10">
+
+                            {/* Loading State */}
+                            {loading && (
+                                <div className="flex items-center justify-center h-64">
+                                    <div className="text-gray-500 text-lg">Loading file monitoring data...</div>
+                                </div>
+                            )}
+
+                            {/* Error State */}
+                            {error && !loading && (
+                                <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg">
+                                    <div className="flex items-center justify-between">
+                                        <span className="text-red-600 font-medium">Error: {error}</span>
+                                        <button
+                                            onClick={loadFileStatuses}
+                                            className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700"
+                                        >
+                                            Retry
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Statistics Cards */}
+                            {!error && !loading && (
+                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                                    <div className="bg-white rounded-lg shadow-md p-4 border-l-4" style={{ borderColor: '#db0011' }}>
+                                        <div className="text-sm text-gray-600 font-medium">Total Files</div>
+                                        <div className="text-2xl font-bold text-gray-800 mt-1">{stats.total}</div>
+                                    </div>
+                                    <div className="bg-white rounded-lg shadow-md p-4 border-l-4 border-green-500">
+                                        <div className="text-sm text-gray-600 font-medium">Received</div>
+                                        <div className="text-2xl font-bold text-green-600 mt-1">{stats.received}</div>
+                                    </div>
+                                    <div className="bg-white rounded-lg shadow-md p-4 border-l-4" style={{ borderColor: '#db0011' }}>
+                                        <div className="text-sm text-gray-600 font-medium">Not Received</div>
+                                        <div className="text-2xl font-bold mt-1" style={{ color: '#db0011' }}>{stats.notReceived}</div>
+                                    </div>
+                                    <div className="bg-white rounded-lg shadow-md p-4 border-l-4" style={{ borderColor: stats.receiptRate >= 80 ? '#10b981' : '#db0011' }}>
+                                        <div className="text-sm text-gray-600 font-medium">Receipt Rate</div>
+                                        <div className="text-2xl font-bold mt-1" style={{ color: stats.receiptRate >= 80 ? '#10b981' : '#db0011' }}>
+                                            {stats.receiptRate}%
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Chart Section */}
+                            {!error && !loading && chartData.length > 0 && (
+                                <div className="bg-white rounded-lg shadow-md p-6 mb-6">
+                                    <div className="flex items-center justify-between mb-4">
+                                        <h2 className="text-lg font-semibold text-gray-800">
+                                            Status Distribution by {getCategoryLabel(chartCategory)}
+                                        </h2>
+                                        <select
+                                            value={chartCategory}
+                                            onChange={(e) => setChartCategory(e.target.value)}
+                                            className="px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-600 text-sm"
+                                        >
+                                            <option value="regulation">Regulation</option>
+                                            <option value="asset_class">Asset Class</option>
+                                            <option value="sub_control_name">Sub-Control Name</option>
+                                            <option value="control_name">Control Name</option>
+                                        </select>
+                                    </div>
+                                    <ResponsiveContainer width="100%" height={350}>
+                                        <BarChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 80 }}>
+                                            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+                                            <XAxis
+                                                dataKey="name"
+                                                angle={-45}
+                                                textAnchor="end"
+                                                height={100}
+                                                tick={{ fontSize: 12 }}
+                                            />
+                                            <YAxis tick={{ fontSize: 12 }} />
+                                            <Tooltip
+                                                contentStyle={{
+                                                    backgroundColor: 'rgba(255,255,255,0.95)',
+                                                    border: '1px solid #e5e7eb',
+                                                    borderRadius: '6px'
+                                                }}
+                                            />
+                                            <Legend />
+                                            <Bar dataKey="Received" stackId="a" fill="#10b981" name="Received" />
+                                            <Bar dataKey="Not Received" stackId="a" fill="#ef4444" name="Not Received" />
+                                        </BarChart>
+                                    </ResponsiveContainer>
+                                </div>
+                            )}
+
+                            {/* Data Table */}
+                            {!error && !loading && (
+                                <div className="bg-white rounded-lg shadow-md overflow-hidden">
+                                    <div className="p-4 border-b border-gray-200 flex items-center justify-between">
+                                        <h2 className="text-lg font-semibold text-gray-800">
+                                            File Status ({fileStatuses.length} total, {filteredCount} filtered)
+                                        </h2>
+                                        <div className="flex items-center gap-3">
+                                            {/* Column Selector */}
+                                            <div className="relative">
+                                                <button
+                                                    onClick={() => setShowColumnSelector(!showColumnSelector)}
+                                                    className="px-3 py-1.5 text-sm bg-gray-100 text-gray-700 rounded hover:bg-gray-200 transition-colors"
+                                                >
+                                                    Columns
+                                                </button>
+                                                {showColumnSelector && (
+                                                    <>
+                                                        <div className="fixed inset-0 z-40" onClick={() => setShowColumnSelector(false)}></div>
+                                                        <div className="absolute right-0 mt-2 w-56 bg-white border border-gray-300 rounded-lg shadow-lg z-50 p-4">
+                                                            <div className="text-sm font-semibold text-gray-700 mb-3">Select Columns</div>
+                                                            <div className="space-y-2">
+                                                                {Object.entries(visibleColumns).map(([key, value]) => (
+                                                                    <label key={key} className="flex items-center space-x-2 cursor-pointer hover:bg-gray-50 p-1 rounded">
+                                                                        <input
+                                                                            type="checkbox"
+                                                                            checked={value}
+                                                                            onChange={(e) => setVisibleColumns(prev => ({ ...prev, [key]: e.target.checked }))}
+                                                                            className="rounded border-gray-300"
+                                                                        />
+                                                                        <span className="text-sm text-gray-700">{columnLabels[key] || key}</span>
+                                                                    </label>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    </>
+                                                )}
+                                            </div>
+
+                                            {/* Items per page */}
+                                            <select
+                                                value={itemsPerPage}
+                                                onChange={(e) => { setItemsPerPage(Number(e.target.value)); setCurrentPage(1); }}
+                                                className="px-2 py-1.5 border border-gray-300 rounded text-sm"
+                                            >
+                                                <option value={25}>25/page</option>
+                                                <option value={50}>50/page</option>
+                                                <option value={100}>100/page</option>
+                                            </select>
+
+                                            {/* Refresh */}
+                                            <button
+                                                onClick={loadFileStatuses}
+                                                className="px-3 py-1.5 text-sm text-white rounded transition-colors"
+                                                style={{ backgroundColor: '#db0011' }}
+                                                onMouseOver={(e) => e.target.style.backgroundColor = '#a00010'}
+                                                onMouseOut={(e) => e.target.style.backgroundColor = '#db0011'}
+                                            >
+                                                Refresh
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div className="overflow-x-auto">
+                                        <table className="min-w-full divide-y divide-gray-200">
+                                            <thead className="bg-gray-50">
+                                                <tr>
+                                                    {visibleColumns.display_name && (
+                                                        <th
+                                                            className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                                                            onClick={() => handleSort('display_name')}
+                                                        >
+                                                            File Name {sortColumn === 'display_name' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}
+                                                        </th>
+                                                    )}
+                                                    {visibleColumns.status && (
+                                                        <th
+                                                            className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                                                            onClick={() => handleSort('status')}
+                                                        >
+                                                            Status {sortColumn === 'status' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}
+                                                        </th>
+                                                    )}
+                                                    {visibleColumns.arrival_time && (
+                                                        <th
+                                                            className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                                                            onClick={() => handleSort('arrival_time')}
+                                                        >
+                                                            {arrivalLabel} {sortColumn === 'arrival_time' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}
+                                                        </th>
+                                                    )}
+                                                    {visibleColumns.regulation && (
+                                                        <th
+                                                            className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                                                            onClick={() => handleSort('regulation')}
+                                                        >
+                                                            Regulation {sortColumn === 'regulation' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}
+                                                        </th>
+                                                    )}
+                                                    {visibleColumns.asset_class && (
+                                                        <th
+                                                            className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                                                            onClick={() => handleSort('asset_class')}
+                                                        >
+                                                            Asset Class {sortColumn === 'asset_class' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}
+                                                        </th>
+                                                    )}
+                                                    {visibleColumns.sub_control_name && (
+                                                        <th
+                                                            className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                                                            onClick={() => handleSort('sub_control_name')}
+                                                        >
+                                                            Sub-Control {sortColumn === 'sub_control_name' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}
+                                                        </th>
+                                                    )}
+                                                    {visibleColumns.control_name && (
+                                                        <th
+                                                            className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                                                            onClick={() => handleSort('control_name')}
+                                                        >
+                                                            Control Name {sortColumn === 'control_name' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}
+                                                        </th>
+                                                    )}
+                                                    {visibleColumns.frequency && (
+                                                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                            Frequency
+                                                        </th>
+                                                    )}
+                                                    {visibleColumns.note && (
+                                                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                                            Note
+                                                        </th>
+                                                    )}
+                                                </tr>
+                                                {/* Column filter row */}
+                                                <tr className="bg-gray-50 border-t border-gray-100">
+                                                    {visibleColumns.display_name && (
+                                                        <th className="px-4 py-2">
+                                                            <input
+                                                                type="text"
+                                                                value={columnFilters.display_name}
+                                                                onChange={(e) => setColumnFilters(prev => ({ ...prev, display_name: e.target.value }))}
+                                                                placeholder="Search..."
+                                                                className="w-full px-2 py-1 text-xs border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-red-400"
+                                                            />
+                                                        </th>
+                                                    )}
+                                                    {visibleColumns.status && (
+                                                        <th className="px-4 py-2">
+                                                            <select
+                                                                value={columnFilters.status}
+                                                                onChange={(e) => setColumnFilters(prev => ({ ...prev, status: e.target.value }))}
+                                                                className="w-full px-1 py-1 text-xs border border-gray-300 rounded focus:outline-none"
+                                                            >
+                                                                <option value="">All</option>
+                                                                <option value="received">Received</option>
+                                                                <option value="not_received">Not Received</option>
+                                                            </select>
+                                                        </th>
+                                                    )}
+                                                    {visibleColumns.arrival_time && <th className="px-4 py-2"></th>}
+                                                    {visibleColumns.regulation && <th className="px-4 py-2"></th>}
+                                                    {visibleColumns.asset_class && <th className="px-4 py-2"></th>}
+                                                    {visibleColumns.sub_control_name && <th className="px-4 py-2"></th>}
+                                                    {visibleColumns.control_name && <th className="px-4 py-2"></th>}
+                                                    {visibleColumns.frequency && <th className="px-4 py-2"></th>}
+                                                    {visibleColumns.note && (
+                                                        <th className="px-4 py-2">
+                                                            <input
+                                                                type="text"
+                                                                value={columnFilters.note}
+                                                                onChange={(e) => setColumnFilters(prev => ({ ...prev, note: e.target.value }))}
+                                                                placeholder="Search..."
+                                                                className="w-full px-2 py-1 text-xs border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-red-400"
+                                                            />
+                                                        </th>
+                                                    )}
+                                                </tr>
+                                            </thead>
+                                            <tbody className="bg-white divide-y divide-gray-200">
+                                                {sortedAndPaginatedStatuses.length === 0 ? (
+                                                    <tr>
+                                                        <td colSpan={Object.values(visibleColumns).filter(Boolean).length} className="px-4 py-8 text-center text-gray-500">
+                                                            No file status records found for the selected filters.
+                                                        </td>
+                                                    </tr>
+                                                ) : (
+                                                    sortedAndPaginatedStatuses.map((file) => (
+                                                        <tr key={file.file_id} className="hover:bg-gray-50 transition-colors">
+                                                            {visibleColumns.display_name && (
+                                                                <td className="px-4 py-3 text-sm text-gray-900 font-medium max-w-xs">
+                                                                    <div className="truncate" title={file.display_name}>{file.display_name}</div>
+                                                                    <div className="text-xs text-gray-400 truncate" title={file.file_name}>{file.file_name}</div>
+                                                                </td>
+                                                            )}
+                                                            {visibleColumns.status && (
+                                                                <td className="px-4 py-3 text-sm">
+                                                                    <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium border ${getStatusColor(file.status)}`}>
+                                                                        <span>{getStatusIcon(file.status)}</span>
+                                                                        {formatStatusLabel(file.status)}
+                                                                    </span>
+                                                                </td>
+                                                            )}
+                                                            {visibleColumns.arrival_time && (
+                                                                <td className="px-4 py-3 text-sm text-gray-700">
+                                                                    {formatDateTime(file.arrival_time)}
+                                                                </td>
+                                                            )}
+                                                            {visibleColumns.regulation && (
+                                                                <td className="px-4 py-3 text-sm text-gray-700">{file.regulation || '-'}</td>
+                                                            )}
+                                                            {visibleColumns.asset_class && (
+                                                                <td className="px-4 py-3 text-sm text-gray-700">{file.asset_class || '-'}</td>
+                                                            )}
+                                                            {visibleColumns.sub_control_name && (
+                                                                <td className="px-4 py-3 text-sm text-gray-700">{file.sub_control_name || '-'}</td>
+                                                            )}
+                                                            {visibleColumns.control_name && (
+                                                                <td className="px-4 py-3 text-sm text-gray-700">{file.control_name || '-'}</td>
+                                                            )}
+                                                            {visibleColumns.frequency && (
+                                                                <td className="px-4 py-3 text-sm text-gray-700">{file.frequency || '-'}</td>
+                                                            )}
+                                                            {visibleColumns.note && (
+                                                                <td className="px-4 py-3 text-sm text-gray-500 max-w-xs">
+                                                                    <div className="truncate" title={file.note || ''}>{file.note || '-'}</div>
+                                                                </td>
+                                                            )}
+                                                        </tr>
+                                                    ))
+                                                )}
+                                            </tbody>
+                                        </table>
+                                    </div>
+
+                                    {/* Pagination */}
+                                    {totalPages > 1 && (
+                                        <div className="px-4 py-3 border-t border-gray-200 flex items-center justify-between bg-gray-50">
+                                            <div className="text-sm text-gray-600">
+                                                Page {currentPage} of {totalPages} ({filteredCount} records)
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <button
+                                                    onClick={() => setCurrentPage(1)}
+                                                    disabled={currentPage === 1}
+                                                    className="px-2 py-1 text-sm border border-gray-300 rounded disabled:opacity-50 hover:bg-gray-100"
+                                                >
+                                                    First
+                                                </button>
+                                                <button
+                                                    onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                                                    disabled={currentPage === 1}
+                                                    className="px-3 py-1 text-sm border border-gray-300 rounded disabled:opacity-50 hover:bg-gray-100"
+                                                >
+                                                    Prev
+                                                </button>
+                                                <span className="px-3 py-1 text-sm bg-white border border-gray-300 rounded">
+                                                    {currentPage}
+                                                </span>
+                                                <button
+                                                    onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                                                    disabled={currentPage === totalPages}
+                                                    className="px-3 py-1 text-sm border border-gray-300 rounded disabled:opacity-50 hover:bg-gray-100"
+                                                >
+                                                    Next
+                                                </button>
+                                                <button
+                                                    onClick={() => setCurrentPage(totalPages)}
+                                                    disabled={currentPage === totalPages}
+                                                    className="px-2 py-1 text-sm border border-gray-300 rounded disabled:opacity-50 hover:bg-gray-100"
+                                                >
+                                                    Last
+                                                </button>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+inputfileinstance
+import React, { useEffect } from 'react';
+import FileMonitoringDashboard from '../../controls/file-monitoring/page';
+
+export default function InputFileMonitoringInstance() {
+    useEffect(() => {
+        document.title = 'Input File Monitoring';
+    }, []);
+
+    return <FileMonitoringDashboard fileType="input" />;
+}
+output
+import React, { useEffect } from 'react';
+import FileMonitoringDashboard from '../../controls/file-monitoring/page';
+
+export default function OutputFileMonitoringInstance() {
+    useEffect(() => {
+        document.title = 'Output File Monitoring';
+    }, []);
+
+    return <FileMonitoringDashboard fileType="output" />;
+}
+
+api
+
+    // ============================================================================
+    // FILE MONITORING API
+    // ============================================================================
+
+    /**
+     * Get file monitoring status for a given date and file type.
+     * @param {Object} params - { file_type: 'input'|'output', monitoring_date: 'YYYY-MM-DD' }
+     * @param {number} limit - Maximum number of records to return
+     * @returns {Promise<Object>} File monitoring status
+     */
+    static async getFileMonitoringStatus(params = {}, limit = 5000) {
+        return this.retryRequest(async () => {
+            const queryParams = new URLSearchParams();
+            queryParams.append('file_type', params.file_type || 'input');
+            if (params.monitoring_date) {
+                queryParams.append('monitoring_date', params.monitoring_date);
+            }
+            queryParams.append('limit', limit.toString());
+
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/file-monitoring/status?${queryParams.toString()}`
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to get file monitoring status: ${response.statusText}`);
             }
 
-        result = _run_reference_subprocess(
-            "discover_files",
-            {
-                "folder_path": spec["folder_path"],
-                "file_pattern": file_regex or spec.get("file_pattern", ".*"),
-                "date_from": date_from,
-                "date_to": date_to,
-                "date_group_index": spec.get("date_group_index", 1),
-                "date_format": spec.get("date_format", "%Y%m%d"),
-            },
-        )
-        return {
-            "success": True,
-            "is_folder_type": True,
-            "files": result.get("files", []),
-            "total": result.get("total", 0),
-            "retrieved_at": datetime.now().isoformat(),
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error discovering files for {file_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+            return await response.json();
+        });
+    }
 
+    /**
+     * Get file monitoring hierarchy (unique filter values).
+     * @param {string} fileType - 'input' or 'output'
+     * @returns {Promise<Object>} Hierarchy filter options
+     */
+    static async getFileMonitoringHierarchy(fileType = 'input') {
+        return this.retryRequest(async () => {
+            const response = await this.fetchWithTimeout(
+                `${API_BASE_URL}/api/file-monitoring/hierarchy?file_type=${fileType}`
+            );
 
-@router.get("/files/{file_id}/data")
-def browse_file(
-    file_id: str,
-    page: int = 1,
-    page_size: int = 50,
-    sort_column: Optional[str] = None,
-    sort_direction: str = "asc",
-):
-    """
-    Browse reference file data with pagination.
-    Service handles offset calculation — only page_size rows returned for CSV/Parquet.
-    """
-    try:
-        files_map = _load_reference_files()
-        if file_id not in files_map:
-            raise HTTPException(status_code=404, detail=f"File '{file_id}' not found in config")
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Failed to get file monitoring hierarchy: ${response.statusText}`);
+            }
 
-        spec = files_map[file_id]
+            return await response.json();
+        });
+    }
 
-        result = _run_reference_subprocess(
-            "read_paginated",
-            {
-                "file_spec": spec,
-                "page": page,
-                "page_size": page_size,
-                "sort_column": sort_column,
-                "sort_direction": sort_direction,
-            },
-        )
-
-        response = {
-            "success": True,
-            "results": result.get("data", []),
-            "columns": result.get("columns", []),
-            "pagination": result.get("pagination", {}),
-            "total_matches": result.get("pagination", {}).get("total_rows", 0),
-            "file_id": file_id,
-            "file_name": spec.get("name", file_id),
-            "mode": "browse",
-            "retrieved_at": datetime.now().isoformat(),
-        }
-
-        return make_json_safe(response)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error browsing file {file_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/files/{file_id}/search")
-def search_file(
-    file_id: str,
-    query: str,
-    column: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 50,
-    limit: int = 5000,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    file_regex: Optional[str] = None,
-):
-    """
-    Search a reference file for a query string (regex supported).
-
-    Single-file specs: pagination is pushed into the service subprocess — only
-    page_size rows are transferred per request (offset computed from page).
-
-    Folder-type specs: the service aggregates results from all matching files up to
-    limit; the router then handles Python-side pagination of the combined list.
-    """
-    try:
-        if not query or not query.strip():
-            raise HTTPException(status_code=400, detail="Search query cannot be empty")
-
-        files_map = _load_reference_files()
-        if file_id not in files_map:
-            raise HTTPException(status_code=404, detail=f"File '{file_id}' not found in config")
-
-        spec = files_map[file_id]
-        spec_columns = spec.get("columns")
-        is_folder_type = bool(spec.get("folder_path"))
-
-        if is_folder_type:
-            # Folder search: service returns all matches up to limit from all files;
-            # router slices the combined list for the requested page.
-            search_result = _run_reference_subprocess(
-                "search_folder",
-                {
-                    "file_spec": spec,
-                    "query": query.strip(),
-                    "column": column,
-                    "limit": limit,
-                    "date_from": date_from,
-                    "date_to": date_to,
-                    "file_regex": file_regex,
-                },
-            )
-            all_results = search_result.get("results", [])
-            total_matches = len(all_results)
-            start = (page - 1) * page_size
-            paginated = all_results[start: start + page_size]
-            total_pages = (total_matches + page_size - 1) // page_size if total_matches > 0 else 0
-
-        else:
-            # Single-file search: pass offset + page_size to the service so it
-            # returns only the requested window.  No Python-side pagination needed.
-            offset = (page - 1) * page_size
-            search_result = _run_reference_subprocess(
-                "search",
-                {
-                    "file_spec": spec,
-                    "query": query.strip(),
-                    "column": column,
-                    "limit": limit,
-                    "offset": offset,
-                    "page_size": page_size,
-                },
-            )
-            paginated = search_result.get("results", [])
-            total_matches = search_result.get("total_found", 0)
-            total_pages = (total_matches + page_size - 1) // page_size if total_matches > 0 else 0
-
-        # Derive column list
-        if spec_columns:
-            columns = spec_columns
-        elif paginated:
-            columns = list(paginated[0].keys())
-        else:
-            columns = []
-
-        response = {
-            "success": True,
-            "results": paginated,
-            "columns": columns,
-            "total_matches": total_matches,
-            "query": query.strip(),
-            "searched_column": column,
-            "pagination": {
-                "current_page": page,
-                "page_size": page_size,
-                "total_rows": total_matches,
-                "total_pages": total_pages,
-                "has_next": page < total_pages,
-                "has_previous": page > 1,
-            },
-            "results_limited": search_result.get("results_limited", False),
-            "limit_applied": search_result.get("limit_applied", limit),
-            "file_id": file_id,
-            "file_name": spec.get("name", file_id),
-            "mode": "search",
-            "retrieved_at": datetime.now().isoformat(),
-        }
-
-        if is_folder_type:
-            response["files_searched"] = search_result.get("files_searched", 0)
-            response["files_available"] = search_result.get("files_available", 0)
-
-        return make_json_safe(response)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error searching file {file_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/files/{file_id}/search-multi")
-def search_file_multi(file_id: str, body: MultiValueSearchRequest):
-    """
-    Search a reference file for multiple values in a specific column (Excel paste mode).
-    Pagination is pushed into the service — only page_size rows transferred per request.
-    """
-    try:
-        if not body.values:
-            raise HTTPException(status_code=400, detail="Values list cannot be empty")
-        if not body.column:
-            raise HTTPException(status_code=400, detail="Column is required for multi-value search")
-
-        clean_values = [v.strip() for v in body.values if v and v.strip()]
-        if not clean_values:
-            raise HTTPException(status_code=400, detail="No valid values provided after cleaning")
-
-        files_map = _load_reference_files()
-        if file_id not in files_map:
-            raise HTTPException(status_code=404, detail=f"File '{file_id}' not found in config")
-
-        spec = files_map[file_id]
-        offset = (body.page - 1) * body.page_size
-
-        search_result = _run_reference_subprocess(
-            "search_multi",
-            {
-                "file_spec": spec,
-                "values": clean_values,
-                "column": body.column,
-                "limit": body.limit,
-                "exact_match": body.exact_match,
-                "offset": offset,
-                "page_size": body.page_size,
-            },
-        )
-
-        paginated = search_result.get("results", [])
-        total_matches = search_result.get("total_found", 0)
-        total_pages = (
-            (total_matches + body.page_size - 1) // body.page_size
-            if total_matches > 0
-            else 0
-        )
-
-        spec_columns = spec.get("columns")
-        if spec_columns:
-            columns = spec_columns
-        elif paginated:
-            columns = list(paginated[0].keys())
-        else:
-            columns = []
-
-        response = {
-            "success": True,
-            "results": paginated,
-            "columns": columns,
-            "total_matches": total_matches,
-            "searched_column": body.column,
-            "values_searched": len(clean_values),
-            "exact_match": body.exact_match,
-            "pagination": {
-                "current_page": body.page,
-                "page_size": body.page_size,
-                "total_rows": total_matches,
-                "total_pages": total_pages,
-                "has_next": body.page < total_pages,
-                "has_previous": body.page > 1,
-            },
-            "results_limited": search_result.get("results_limited", False),
-            "limit_applied": search_result.get("limit_applied", body.limit),
-            "file_id": file_id,
-            "file_name": spec.get("name", file_id),
-            "mode": "search_multi",
-            "retrieved_at": datetime.now().isoformat(),
-        }
-
-        return make_json_safe(response)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in multi-value search for {file_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
