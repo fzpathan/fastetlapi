@@ -1,455 +1,1631 @@
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime, timedelta
+main
+import asyncio
+from pathlib import Path
 import re
-import os
+import sys
+import click
 
-# Page configuration
-st.set_page_config(
-    page_title="System Monitoring Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+from agent.agent import Agent
+from agent.codebase_indexer import build_agent_brief, build_skeleton
+from agent.events import AgentEventType
+from agent.memory_store import SessionMemoryStore
+from agent.persistence import PersistenceManager, SessionSnapshot
+from agent.session import Session
+from config.config import ApprovalPolicy, Config
+from skills.loader import load_all_skills
+from config.loader import load_config
+from renderer.prompt_input import InputSession
+from renderer.rendrerer import TUI, get_console
 
-# Custom CSS
-st.markdown("""
-    <style>
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 20px;
-        border-radius: 10px;
-        margin: 10px 0;
-    }
-    </style>
-""", unsafe_allow_html=True)
+console = get_console()
 
-def parse_memory_value(mem_str):
-    """Parse memory string like '8.50GB' to bytes"""
-    if not mem_str or pd.isna(mem_str):
-        return None
-    
-    units = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
-    
-    match = re.match(r'([\d.]+)([A-Z]+)', mem_str.strip())
-    if match:
-        value, unit = match.groups()
-        return float(value) * units.get(unit, 1)
-    return None
 
-def bytes_to_gb(bytes_value):
-    """Convert bytes to GB"""
-    if bytes_value is None:
-        return None
-    return bytes_value / (1024**3)
+class CLI:
+    _FILE_MENTION_RE = re.compile(r"(?<!\S)@([^\s]+)")
+    _MAX_MENTION_FILE_CHARS = 20_000
 
-def parse_log_file(log_file):
-    """Parse the CPU usage log file"""
-    data = []
-    
-    if not os.path.exists(log_file):
-        return pd.DataFrame()
-    
-    with open(log_file, 'r') as f:
-        for line in f:
-            # Skip header lines and empty lines
-            if line.startswith('=') or line.strip() == '' or 'Monitoring Started' in line:
+    def __init__(self, config: Config):
+        self.agent: Agent | None = None
+        self.config = config
+        self.tui = TUI(config, console)
+        self.skills = load_all_skills(config.cwd)
+        self.input_session = InputSession(config.cwd)
+
+    async def run_single(self, message: str) -> str | None:
+        async with Agent(self.config) as agent:
+            self.agent = agent
+            return await self._process_message(self._expand_file_mentions(message))
+
+    async def run_interactive(self) -> str | None:
+        skill_names = " ".join(sorted(self.skills)) if self.skills else "none"
+        self.tui.print_welcome(
+            "AI Agent",
+            lines=[
+                f"model: {self.config.model_name}",
+                f"cwd: {self.config.cwd}",
+                "commands: /help /config /approval /model /init /exit",
+                f"skills:   {skill_names}",
+            ],
+        )
+
+        async with Agent(
+            self.config,
+            confirmation_callback=self.tui.handle_confirmation,
+        ) as agent:
+            self.agent = agent
+
+            if agent.session.skeleton_stale:
+                console.print("[dim]Codebase index is over 7 days old — run /init to refresh[/dim]")
+
+            while True:
+                try:
+                    user_input = (await self.input_session.prompt()).strip()
+                    if not user_input:
+                        continue
+
+                    if user_input.startswith("/"):
+                        should_continue = await self._handle_command(user_input)
+                        if not should_continue:
+                            break
+                        continue
+
+                    await self._process_message(self._expand_file_mentions(user_input))
+                except KeyboardInterrupt:
+                    console.print("\n[dim]Use /exit to quit[/dim]")
+                except EOFError:
+                    break
+
+        console.print("\n[dim]Goodbye![/dim]")
+
+    def _get_tool_kind(self, tool_name: str) -> str | None:
+        tool_kind = None
+        tool = self.agent.session.tool_registry.get(tool_name)
+        if not tool:
+            tool_kind = None
+
+        tool_kind = tool.kind.value
+
+        return tool_kind
+
+    def _expand_file_mentions(self, message: str) -> str:
+        matches = list(self._FILE_MENTION_RE.finditer(message))
+        if not matches:
+            return message
+
+        attachments: list[str] = []
+        seen_queries: set[str] = set()
+
+        for match in matches:
+            query = match.group(1)
+            if query in seen_queries:
                 continue
-            
-            # Parse log entry
+            seen_queries.add(query)
+
+            resolved = self._resolve_file_mention(query)
+            if resolved is None:
+                continue
+
+            path, content = resolved
+            rel_path = path.relative_to(self.config.cwd).as_posix()
+            attachments.append(
+                "\n".join(
+                    [
+                        f"<attached-file path=\"{rel_path}\">",
+                        content,
+                        "</attached-file>",
+                    ]
+                )
+            )
+
+        if not attachments:
+            return message
+
+        return message.rstrip() + "\n\n" + "\n\n".join(attachments)
+
+    def _resolve_file_mention(self, query: str) -> tuple[Path, str] | None:
+        candidate = (self.config.cwd / query).resolve(strict=False)
+        if candidate.is_file() and self._is_within_cwd(candidate):
+            return candidate, self._read_mention_file(candidate)
+
+        matches = self._search_files(query)
+        if not matches:
+            console.print(
+                f"[warning]No file found for @{query} under {self.config.cwd}[/warning]"
+            )
+            return None
+
+        if len(matches) > 1:
+            options = ", ".join(
+                str(path.relative_to(self.config.cwd).as_posix()) for path in matches[:5]
+            )
+            more = "" if len(matches) <= 5 else f" (+{len(matches) - 5} more)"
+            console.print(
+                f"[warning]@{query} matched multiple files: {options}{more}[/warning]"
+            )
+            return None
+
+        return matches[0], self._read_mention_file(matches[0])
+
+    def _search_files(self, query: str) -> list[Path]:
+        query_lower = query.lower()
+        results: list[tuple[int, str, Path]] = []
+
+        for path in self.config.cwd.rglob("*"):
+            if not path.is_file():
+                continue
+
+            rel_path = path.relative_to(self.config.cwd).as_posix()
+            rel_lower = rel_path.lower()
+            name_lower = path.name.lower()
+
+            score: int | None = None
+            if rel_lower == query_lower or name_lower == query_lower:
+                score = 0
+            elif rel_lower.endswith(query_lower) or name_lower.endswith(query_lower):
+                score = 1
+            elif query_lower in name_lower:
+                score = 2
+            elif query_lower in rel_lower:
+                score = 3
+
+            if score is not None:
+                results.append((score, rel_lower, path))
+
+        results.sort(key=lambda item: (item[0], item[1]))
+        return [path for _, _, path in results[:10]]
+
+    def _is_within_cwd(self, path: Path) -> bool:
+        try:
+            path.relative_to(self.config.cwd.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _read_mention_file(self, path: Path) -> str:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            content = path.read_text(encoding="utf-8", errors="replace")
+
+        if len(content) <= self._MAX_MENTION_FILE_CHARS:
+            return content
+
+        console.print(
+            f"[warning]Attached file truncated for @{path.name} "
+            f"({self._MAX_MENTION_FILE_CHARS} char limit)[/warning]"
+        )
+        return content[: self._MAX_MENTION_FILE_CHARS] + "\n... [truncated]"
+
+    async def _process_message(self, message: str) -> str | None:
+        if not self.agent:
+            return None
+
+        assistant_streaming = False
+        final_response: str | None = None
+
+        async for event in self.agent.run(message):
+            if event.type == AgentEventType.TEXT_DELTA:
+                content = event.data.get("content", "")
+                if not assistant_streaming:
+                    self.tui.begin_assistant()
+                    assistant_streaming = True
+                self.tui.stream_assistant_delta(content)
+            elif event.type == AgentEventType.TEXT_COMPLETE:
+                final_response = event.data.get("content")
+                if assistant_streaming:
+                    self.tui.end_assistant()
+                    assistant_streaming = False
+            elif event.type == AgentEventType.AGENT_ERROR:
+                error = event.data.get("error", "Unknown error")
+                console.print(f"\n[error]Error: {error}[/error]")
+            elif event.type == AgentEventType.TOOL_CALL_START:
+                tool_name = event.data.get("name", "unknown")
+                tool_kind = self._get_tool_kind(tool_name)
+                self.tui.tool_call_start(
+                    event.data.get("call_id", ""),
+                    tool_name,
+                    tool_kind,
+                    event.data.get("arguments", {}),
+                )
+            elif event.type == AgentEventType.TOOL_CALL_COMPLETE:
+                tool_name = event.data.get("name", "unknown")
+                tool_kind = self._get_tool_kind(tool_name)
+                self.tui.tool_call_complete(
+                    event.data.get("call_id", ""),
+                    tool_name,
+                    tool_kind,
+                    event.data.get("success", False),
+                    event.data.get("output", ""),
+                    event.data.get("error"),
+                    event.data.get("metadata"),
+                    event.data.get("diff"),
+                    event.data.get("truncated", False),
+                    event.data.get("exit_code"),
+                )
+
+        return final_response
+
+    async def _handle_command(self, command: str) -> bool:
+        # Use original casing for args but lowercase for command name matching
+        parts = command.strip().split(maxsplit=1)
+        cmd_name = parts[0].lower()
+        cmd_args = parts[1] if len(parts) > 1 else ""
+
+        if cmd_name in ("/exit", "/quit"):
+            return await self._cmd_exit()
+
+        handlers = {
+            "/help":        lambda _: self._cmd_help(),
+            "/clear":       lambda _: self._cmd_clear(),
+            "/config":      lambda _: self._cmd_config(),
+            "/stats":       lambda _: self._cmd_stats(),
+            "/tools":       lambda _: self._cmd_tools(),
+            "/mcp":         lambda _: self._cmd_mcp(),
+            "/save":        lambda _: self._cmd_save(),
+            "/sessions":    lambda _: self._cmd_sessions(),
+            "/checkpoint":  lambda _: self._cmd_checkpoint(),
+            "/init":        lambda _: self._cmd_init(),
+            "/model":       self._cmd_model,
+            "/approval":    self._cmd_approval,
+            "/resume":      self._cmd_resume,
+            "/restore":     self._cmd_restore,
+        }
+
+        if cmd_name in handlers:
+            await handlers[cmd_name](cmd_args)
+        elif cmd_name in self.skills:
+            await self._cmd_skill(cmd_name, cmd_args)
+        else:
+            console.print(f"[error]Unknown command: {cmd_name}[/error]")
+            skill_names = ", ".join(sorted(self.skills)) or "none loaded"
+            console.print(f"[dim]Available skills: {skill_names}[/dim]")
+
+        return True
+
+    async def _cmd_exit(self) -> bool:
+        summary, _ = await self.agent.session.chat_compactor.compress(
+            self.agent.session.context_manager
+        )
+        if summary:
+            SessionMemoryStore().save(
+                self.config.cwd,
+                self.agent.session.session_id,
+                summary,
+            )
+        return False
+
+    def _cmd_help(self) -> None:
+        self.tui.show_help()
+
+    def _cmd_clear(self) -> None:
+        self.agent.session.context_manager.clear()
+        self.agent.session.loop_detector.clear()
+        console.print("[success]Conversation cleared[/success]")
+
+    def _cmd_config(self) -> None:
+        console.print("\n[bold]Current Configuration[/bold]")
+        console.print(f"  Model: {self.config.model_name}")
+        console.print(f"  Temperature: {self.config.temperature}")
+        console.print(f"  Approval: {self.config.approval.value}")
+        console.print(f"  Working Dir: {self.config.cwd}")
+        console.print(f"  Max Turns: {self.config.max_turns}")
+        console.print(f"  Hooks Enabled: {self.config.hooks_enabled}")
+
+    def _cmd_stats(self) -> None:
+        stats = self.agent.session.get_stats()
+        console.print("\n[bold]Session Statistics[/bold]")
+        for key, value in stats.items():
+            console.print(f"   {key}: {value}")
+
+    def _cmd_tools(self) -> None:
+        tools = self.agent.session.tool_registry.get_tools()
+        console.print(f"\n[bold]Available tools ({len(tools)})[/bold]")
+        for tool in tools:
+            console.print(f"  • {tool.name}")
+
+    def _cmd_mcp(self) -> None:
+        mcp_servers = self.agent.session.mcp_manager.get_all_servers()
+        console.print(f"\n[bold]MCP Servers ({len(mcp_servers)})[/bold]")
+        for server in mcp_servers:
+            status = server["status"]
+            color = "green" if status == "connected" else "red"
+            console.print(
+                f"  • {server['name']}: [{color}]{status}[/{color}] ({server['tools']} tools)"
+            )
+
+    def _cmd_save(self) -> None:
+        pm = PersistenceManager()
+        snapshot = SessionSnapshot(
+            session_id=self.agent.session.session_id,
+            created_at=self.agent.session.created_at,
+            updated_at=self.agent.session.updated_at,
+            turn_count=self.agent.session.turn_count,
+            messages=self.agent.session.context_manager.export_messages(),
+            total_usage=self.agent.session.context_manager.total_usage,
+        )
+        pm.save_session(snapshot)
+        console.print(f"[success]Session saved: {self.agent.session.session_id}[/success]")
+
+    def _cmd_sessions(self) -> None:
+        sessions = PersistenceManager().list_sessions()
+        console.print("\n[bold]Saved Sessions[/bold]")
+        for s in sessions:
+            console.print(
+                f"  • {s['session_id']} (turns: {s['turn_count']}, updated: {s['updated_at']})"
+            )
+
+    def _cmd_checkpoint(self) -> None:
+        pm = PersistenceManager()
+        snapshot = SessionSnapshot(
+            session_id=self.agent.session.session_id,
+            created_at=self.agent.session.created_at,
+            updated_at=self.agent.session.updated_at,
+            turn_count=self.agent.session.turn_count,
+            messages=self.agent.session.context_manager.export_messages(),
+            total_usage=self.agent.session.context_manager.total_usage,
+        )
+        checkpoint_id = pm.save_checkpoint(snapshot)
+        console.print(f"[success]Checkpoint created: {checkpoint_id}[/success]")
+
+    def _cmd_init(self) -> None:
+        skeleton = build_skeleton(self.config.cwd)
+        agent_brief = build_agent_brief(self.config.cwd)
+        SessionMemoryStore().save_skeleton(self.config.cwd, agent_brief)
+
+        agent_dir = self.config.cwd / ".ai-agent"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        agent_doc_path = agent_dir / "Agent.md"
+        agent_doc_path.write_text(agent_brief, encoding="utf-8")
+
+        console.print(f"[success]Codebase indexed: {self.config.cwd}[/success]")
+        console.print(f"[success]Project summary saved: {agent_doc_path}[/success]")
+        console.print(skeleton)
+
+    def _cmd_model(self, args: str) -> None:
+        if args:
+            self.config.model_name = args
+            console.print(f"[success]Model changed to: {args}[/success]")
+        else:
+            console.print(f"Current model: {self.config.model_name}")
+
+    def _cmd_approval(self, args: str) -> None:
+        if args:
             try:
-                parts = line.strip().split(' | ')
-                if len(parts) < 3:
-                    continue
-                
-                timestamp_str = parts[0].strip()
-                timestamp = pd.to_datetime(timestamp_str)
-                
-                # Extract CPU percentage
-                cpu_match = re.search(r'CPU:\s+([\d.]+)%', line)
-                cpu_percent = float(cpu_match.group(1)) if cpu_match else None
-                
-                # Extract frequency
-                freq_match = re.search(r'Freq:\s+([\d.]+)MHz', line)
-                freq = float(freq_match.group(1)) if freq_match else None
-                
-                # Extract load averages
-                load_match = re.search(r'Load:\s+([\d.]+)/([\d.]+)/([\d.]+)', line)
-                load_1min = float(load_match.group(1)) if load_match else None
-                load_5min = float(load_match.group(2)) if load_match else None
-                load_15min = float(load_match.group(3)) if load_match else None
-                
-                # Extract memory metrics
-                mem_percent_match = re.search(r'MEM:\s+([\d.]+)%', line)
-                mem_percent = float(mem_percent_match.group(1)) if mem_percent_match else None
-                
-                mem_used_match = re.search(r'Used:\s+([\d.]+[A-Z]+)', line)
-                mem_used = parse_memory_value(mem_used_match.group(1)) if mem_used_match else None
-                
-                mem_avail_match = re.search(r'Avail:\s+([\d.]+[A-Z]+)', line)
-                mem_available = parse_memory_value(mem_avail_match.group(1)) if mem_avail_match else None
-                
-                mem_total_match = re.search(r'Total:\s+([\d.]+[A-Z]+)', line)
-                mem_total = parse_memory_value(mem_total_match.group(1)) if mem_total_match else None
-                
-                swap_match = re.search(r'SWAP:\s+([\d.]+)%', line)
-                swap_percent = float(swap_match.group(1)) if swap_match else None
-                
-                # Extract per-core usage
-                core_match = re.search(r'Per-Core:\s+\[(.*?)\]', line)
-                core_usage = []
-                if core_match:
-                    core_str = core_match.group(1)
-                    core_usage = [float(x.strip('%')) for x in core_str.split(',')]
-                
-                data.append({
-                    'timestamp': timestamp,
-                    'cpu_percent': cpu_percent,
-                    'frequency': freq,
-                    'load_1min': load_1min,
-                    'load_5min': load_5min,
-                    'load_15min': load_15min,
-                    'mem_percent': mem_percent,
-                    'mem_used': mem_used,
-                    'mem_available': mem_available,
-                    'mem_total': mem_total,
-                    'swap_percent': swap_percent,
-                    'core_usage': core_usage
-                })
-            except Exception as e:
-                continue
-    
-    return pd.DataFrame(data)
+                self.config.approval = ApprovalPolicy(args)
+                console.print(f"[success]Approval policy changed to: {args}[/success]")
+            except ValueError:
+                console.print(f"[error]Invalid approval policy: {args}[/error]")
+                console.print(f"Valid options: {', '.join(p.value for p in ApprovalPolicy)}")
+        else:
+            console.print(f"Current approval policy: {self.config.approval.value}")
 
-def main():
-    st.title("📊 System Monitoring Dashboard")
-    st.markdown("Real-time CPU & Memory utilization analysis")
-    
-    # Sidebar
-    st.sidebar.header("⚙️ Configuration")
-    
-    log_file = st.sidebar.text_input("Log File Path", value="cpu_usage.log")
-    
-    # Auto-refresh option
-    auto_refresh = st.sidebar.checkbox("Auto-refresh (every 30s)", value=True)
-    if auto_refresh:
-        st.sidebar.info("Dashboard will refresh automatically")
-        # Auto refresh every 30 seconds
-        st.rerun()
-    
-    # Time range filter
-    st.sidebar.subheader("Time Range")
-    time_range = st.sidebar.selectbox(
-        "Select Range",
-        ["Last 1 Hour", "Last 6 Hours", "Last 12 Hours", "Last 24 Hours", "All Data"]
-    )
-    
-    # Load data
-    df = parse_log_file(log_file)
-    
-    if df.empty:
-        st.error(f"❌ No data found in '{log_file}'. Make sure the monitoring script is running!")
-        st.info("💡 Start the monitoring script first: `python cpu_monitor.py`")
-        return
-    
-    # Filter by time range
-    now = datetime.now()
-    if time_range == "Last 1 Hour":
-        df = df[df['timestamp'] >= now - timedelta(hours=1)]
-    elif time_range == "Last 6 Hours":
-        df = df[df['timestamp'] >= now - timedelta(hours=6)]
-    elif time_range == "Last 12 Hours":
-        df = df[df['timestamp'] >= now - timedelta(hours=12)]
-    elif time_range == "Last 24 Hours":
-        df = df[df['timestamp'] >= now - timedelta(hours=24)]
-    
-    # Summary metrics
-    st.header("📈 Current Statistics")
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    
-    if not df.empty:
-        latest = df.iloc[-1]
-        
-        with col1:
-            st.metric(
-                "Current CPU Usage",
-                f"{latest['cpu_percent']:.1f}%",
-                delta=f"{latest['cpu_percent'] - df.iloc[-2]['cpu_percent']:.1f}%" if len(df) > 1 else None
-            )
-        
-        with col2:
-            st.metric(
-                "Average CPU",
-                f"{df['cpu_percent'].mean():.1f}%"
-            )
-        
-        with col3:
-            st.metric(
-                "Peak CPU",
-                f"{df['cpu_percent'].max():.1f}%"
-            )
-        
-        with col4:
-            if latest['mem_percent']:
-                st.metric(
-                    "Memory Usage",
-                    f"{latest['mem_percent']:.1f}%",
-                    delta=f"{latest['mem_percent'] - df.iloc[-2]['mem_percent']:.1f}%" if len(df) > 1 else None
+    async def _cmd_resume(self, args: str) -> None:
+        if not args:
+            console.print("[error]Usage: /resume <session_id>[/error]")
+            return
+        snapshot = PersistenceManager().load_session(args)
+        if not snapshot:
+            console.print("[error]Session does not exist[/error]")
+            return
+        await self._restore_session(snapshot)
+        console.print(f"[success]Resumed session: {snapshot.session_id}[/success]")
+
+    async def _cmd_restore(self, args: str) -> None:
+        if not args:
+            console.print("[error]Usage: /restore <checkpoint_id>[/error]")
+            return
+        snapshot = PersistenceManager().load_checkpoint(args)
+        if not snapshot:
+            console.print("[error]Checkpoint does not exist[/error]")
+            return
+        await self._restore_session(snapshot)
+        console.print(f"[success]Restored checkpoint: {args}[/success]")
+
+    async def _restore_session(self, snapshot: SessionSnapshot) -> None:
+        session = Session(config=self.config)
+        await session.initialize()
+        session.session_id = snapshot.session_id
+        session.created_at = snapshot.created_at
+        session.updated_at = snapshot.updated_at
+        session.turn_count = snapshot.turn_count
+        session.context_manager.total_usage = snapshot.total_usage
+
+        for msg in self._sanitize_snapshot_messages(snapshot.messages):
+            role = msg.get("role")
+            if role == "system":
+                continue
+            elif role == "user":
+                session.context_manager.add_user_message(msg.get("content", ""))
+            elif role == "assistant":
+                session.context_manager.add_assistant_message(
+                    msg.get("content", ""), msg.get("tool_calls")
                 )
-        
-        with col5:
-            if latest['mem_used']:
-                st.metric(
-                    "Memory Used",
-                    f"{bytes_to_gb(latest['mem_used']):.2f} GB"
+            elif role == "tool":
+                session.context_manager.add_tool_result(
+                    msg.get("tool_call_id", ""), msg.get("content", "")
                 )
-        
-        with col6:
-            if latest['mem_available']:
-                st.metric(
-                    "Memory Available",
-                    f"{bytes_to_gb(latest['mem_available']):.2f} GB"
+
+        await self.agent.session.client.close()
+        await self.agent.session.mcp_manager.shutdown()
+        self.agent.session = session
+
+    def _sanitize_snapshot_messages(self, messages: list[dict]) -> list[dict]:
+        sanitized: list[dict] = []
+        index = 0
+
+        while index < len(messages):
+            message = messages[index]
+            role = message.get("role")
+
+            if role == "tool":
+                index += 1
+                continue
+
+            if role != "assistant":
+                sanitized.append(message)
+                index += 1
+                continue
+
+            tool_calls = message.get("tool_calls") or []
+            expected_ids = {
+                tool_call.get("id")
+                for tool_call in tool_calls
+                if tool_call.get("id")
+            }
+            if not expected_ids:
+                sanitized.append(message)
+                index += 1
+                continue
+
+            collected_tools: list[dict] = []
+            seen_ids: set[str] = set()
+            probe = index + 1
+            while probe < len(messages):
+                next_message = messages[probe]
+                if next_message.get("role") != "tool":
+                    break
+                tool_call_id = next_message.get("tool_call_id")
+                if tool_call_id not in expected_ids:
+                    break
+                collected_tools.append(next_message)
+                seen_ids.add(tool_call_id)
+                probe += 1
+
+            if expected_ids.issubset(seen_ids):
+                sanitized.append(message)
+                sanitized.extend(collected_tools)
+            elif message.get("content"):
+                sanitized.append(
+                    {
+                        "role": "assistant",
+                        "content": message.get("content", ""),
+                    }
                 )
-    
-    # CPU and Memory Usage Charts
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("💻 CPU Usage Over Time")
-        fig_cpu = go.Figure()
-        fig_cpu.add_trace(go.Scatter(
-            x=df['timestamp'],
-            y=df['cpu_percent'],
-            mode='lines',
-            name='CPU Usage',
-            line=dict(color='#1f77b4', width=2),
-            fill='tozeroy',
-            fillcolor='rgba(31, 119, 180, 0.2)'
-        ))
-        
-        fig_cpu.update_layout(
-            xaxis_title="Time",
-            yaxis_title="CPU Usage (%)",
-            hovermode='x unified',
-            height=350,
-            yaxis=dict(range=[0, 100])
-        )
-        
-        st.plotly_chart(fig_cpu, use_container_width=True)
-    
-    with col2:
-        st.subheader("🧠 Memory Usage Over Time")
-        fig_mem = go.Figure()
-        fig_mem.add_trace(go.Scatter(
-            x=df['timestamp'],
-            y=df['mem_percent'],
-            mode='lines',
-            name='Memory Usage',
-            line=dict(color='#ff7f0e', width=2),
-            fill='tozeroy',
-            fillcolor='rgba(255, 127, 14, 0.2)'
-        ))
-        
-        fig_mem.update_layout(
-            xaxis_title="Time",
-            yaxis_title="Memory Usage (%)",
-            hovermode='x unified',
-            height=350,
-            yaxis=dict(range=[0, 100])
-        )
-        
-        st.plotly_chart(fig_mem, use_container_width=True)
-    
-    # Memory Details Chart
-    st.subheader("💾 Memory Details (GB)")
-    
-    if df['mem_used'].notna().any():
-        fig_mem_detail = go.Figure()
-        
-        fig_mem_detail.add_trace(go.Scatter(
-            x=df['timestamp'],
-            y=df['mem_used'].apply(bytes_to_gb),
-            mode='lines',
-            name='Used Memory',
-            line=dict(color='#d62728', width=2),
-            stackgroup='one'
-        ))
-        
-        fig_mem_detail.add_trace(go.Scatter(
-            x=df['timestamp'],
-            y=df['mem_available'].apply(bytes_to_gb),
-            mode='lines',
-            name='Available Memory',
-            line=dict(color='#2ca02c', width=2),
-            stackgroup='one'
-        ))
-        
-        fig_mem_detail.update_layout(
-            xaxis_title="Time",
-            yaxis_title="Memory (GB)",
-            hovermode='x unified',
-            height=350
-        )
-        
-        st.plotly_chart(fig_mem_detail, use_container_width=True)
-    
-    # Additional Charts Row
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # CPU Frequency chart
-        if df['frequency'].notna().any():
-            st.subheader("🔄 CPU Frequency")
-            fig_freq = go.Figure()
-            fig_freq.add_trace(go.Scatter(
-                x=df['timestamp'],
-                y=df['frequency'],
-                mode='lines',
-                name='Frequency',
-                line=dict(color='#9467bd', width=2)
-            ))
-            fig_freq.update_layout(
-                xaxis_title="Time",
-                yaxis_title="Frequency (MHz)",
-                hovermode='x unified',
-                height=300
-            )
-            st.plotly_chart(fig_freq, use_container_width=True)
-    
-    with col2:
-        # Load average chart
-        if df['load_1min'].notna().any():
-            st.subheader("⚖️ Load Average")
-            fig_load = go.Figure()
-            fig_load.add_trace(go.Scatter(
-                x=df['timestamp'],
-                y=df['load_1min'],
-                mode='lines',
-                name='1 min',
-                line=dict(color='#2ca02c')
-            ))
-            fig_load.add_trace(go.Scatter(
-                x=df['timestamp'],
-                y=df['load_5min'],
-                mode='lines',
-                name='5 min',
-                line=dict(color='#d62728')
-            ))
-            fig_load.add_trace(go.Scatter(
-                x=df['timestamp'],
-                y=df['load_15min'],
-                mode='lines',
-                name='15 min',
-                line=dict(color='#9467bd')
-            ))
-            fig_load.update_layout(
-                xaxis_title="Time",
-                yaxis_title="Load",
-                hovermode='x unified',
-                height=300
-            )
-            st.plotly_chart(fig_load, use_container_width=True)
-    
-    # Swap Usage
-    if df['swap_percent'].notna().any() and df['swap_percent'].max() > 0:
-        st.subheader("🔄 Swap Memory Usage")
-        fig_swap = go.Figure()
-        fig_swap.add_trace(go.Scatter(
-            x=df['timestamp'],
-            y=df['swap_percent'],
-            mode='lines',
-            name='Swap Usage',
-            line=dict(color='#e377c2', width=2),
-            fill='tozeroy',
-            fillcolor='rgba(227, 119, 194, 0.2)'
-        ))
-        fig_swap.update_layout(
-            xaxis_title="Time",
-            yaxis_title="Swap Usage (%)",
-            hovermode='x unified',
-            height=300,
-            yaxis=dict(range=[0, 100])
-        )
-        st.plotly_chart(fig_swap, use_container_width=True)
-    
-    # Per-core usage heatmap
-    st.header("🔥 Per-Core CPU Usage")
-    
-    if df['core_usage'].notna().any() and len(df['core_usage'].iloc[-1]) > 0:
-        # Create matrix for heatmap
-        core_data = []
-        timestamps = []
-        for idx, row in df.iterrows():
-            if row['core_usage']:
-                core_data.append(row['core_usage'])
-                timestamps.append(row['timestamp'])
-        
-        if core_data:
-            core_matrix = pd.DataFrame(core_data, index=timestamps)
-            
-            fig_heatmap = go.Figure(data=go.Heatmap(
-                z=core_matrix.T.values,
-                x=core_matrix.index,
-                y=[f"Core {i}" for i in range(len(core_matrix.columns))],
-                colorscale='RdYlGn_r',
-                zmid=50,
-                zmin=0,
-                zmax=100,
-                colorbar=dict(title="CPU %")
-            ))
-            
-            fig_heatmap.update_layout(
-                xaxis_title="Time",
-                yaxis_title="CPU Core",
-                height=300
-            )
-            st.plotly_chart(fig_heatmap, use_container_width=True)
-    
-    # Statistics table
-    st.header("📊 Detailed Statistics")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("CPU Statistics")
-        cpu_stats_df = pd.DataFrame({
-            'Metric': ['Average CPU', 'Minimum CPU', 'Maximum CPU', 'Std Deviation'],
-            'Value': [
-                f"{df['cpu_percent'].mean():.2f}%",
-                f"{df['cpu_percent'].min():.2f}%",
-                f"{df['cpu_percent'].max():.2f}%",
-                f"{df['cpu_percent'].std():.2f}%"
-            ]
-        })
-        st.dataframe(cpu_stats_df, use_container_width=True, hide_index=True)
-    
-    with col2:
-        st.subheader("Memory Statistics")
-        mem_stats_df = pd.DataFrame({
-            'Metric': ['Average Memory', 'Minimum Memory', 'Maximum Memory', 'Std Deviation'],
-            'Value': [
-                f"{df['mem_percent'].mean():.2f}%",
-                f"{df['mem_percent'].min():.2f}%",
-                f"{df['mem_percent'].max():.2f}%",
-                f"{df['mem_percent'].std():.2f}%"
-            ]
-        })
-        st.dataframe(mem_stats_df, use_container_width=True, hide_index=True)
-    
-    # Raw data
-    with st.expander("📋 View Raw Data"):
-        display_df = df.copy()
-        if 'mem_used' in display_df.columns:
-            display_df['mem_used_gb'] = display_df['mem_used'].apply(bytes_to_gb)
-            display_df['mem_available_gb'] = display_df['mem_available'].apply(bytes_to_gb)
-            display_df['mem_total_gb'] = display_df['mem_total'].apply(bytes_to_gb)
-        st.dataframe(display_df.tail(100), use_container_width=True)
-    
-    # Footer
-    st.markdown("---")
-    st.markdown(f"**Last Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | **Total Records:** {len(df)}")
+
+            index = probe if collected_tools else index + 1
+
+        return sanitized
+
+    async def _cmd_skill(self, cmd_name: str, args: str) -> None:
+        skill = self.skills[cmd_name]
+        if not args and not skill.args_optional:
+            hint = skill.args_hint or "<argument>"
+            console.print(f"[error]Usage: {skill.command} {hint}[/error]")
+        else:
+            await self._process_message(skill.render(args))
+
+
+@click.command()
+@click.argument("prompt", required=False)
+@click.option(
+    "--cwd",
+    "-c",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Current working directory",
+)
+def main(
+    prompt: str | None,
+    cwd: Path | None,
+):
+    try:
+        config = load_config(cwd=cwd)
+    except Exception as e:
+        console.print(f"[error]Configuration Error: {e}[/error]")
+
+    errors = config.validate()
+
+    if errors:
+        for error in errors:
+            console.print(f"[error]{error}[/error]")
+
+        sys.exit(1)
+
+    cli = CLI(config)
+
+    # messages = [{"role": "user", "content": prompt}]
+    if prompt:
+        result = asyncio.run(cli.run_single(prompt))
+        if result is None:
+            sys.exit(1)
+    else:
+        asyncio.run(cli.run_interactive())
+
 
 if __name__ == "__main__":
     main()
+
+codebase
+from __future__ import annotations
+
+import ast
+import json
+import os
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    import tomli as tomllib
+
+_SKIP_DIRS = {
+    ".git",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    "venv",
+    "env",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    "target",
+    "out",
+    ".cache",
+    ".tox",
+    ".eggs",
+    "*.egg-info",
+}
+
+_KEY_FILE_PATTERNS = {
+    "readme": ["README*", "readme*"],
+    "agents_spec": [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "AGENT.md",
+        ".ai-agent/Agent.md",
+        ".ai-agent/AGENT.md",
+    ],
+    "entry_points": [
+        "main.py",
+        "app.py",
+        "index.py",
+        "server.py",
+        "run.py",
+        "index.js",
+        "index.ts",
+        "main.js",
+        "main.ts",
+        "app.js",
+        "app.ts",
+    ],
+    "config": [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "package.json",
+        "requirements.txt",
+        "Pipfile",
+        "Cargo.toml",
+        "go.mod",
+        "Makefile",
+        "Dockerfile",
+        "docker-compose.yml",
+        ".env.example",
+        "config.toml",
+        "config.yaml",
+        "config.yml",
+    ],
+}
+
+_MAX_TREE_LINES = 150
+_MAX_FILE_CHARS = 8_000
+_ALLOWED_HIDDEN_RELATIVE_PATHS = {
+    ".ai-agent/Agent.md",
+    ".ai-agent/AGENT.md",
+}
+
+
+def _should_skip(name: str) -> bool:
+    return name in _SKIP_DIRS or name.startswith(".")
+
+
+def _build_tree(root: Path, prefix: str = "", depth: int = 0, max_depth: int = 3) -> list[str]:
+    if depth > max_depth:
+        return []
+
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except (PermissionError, OSError):
+        return []
+
+    entries = [entry for entry in entries if not _should_skip(entry.name)]
+
+    lines: list[str] = []
+    for index, entry in enumerate(entries):
+        connector = "`-- " if index == len(entries) - 1 else "|-- "
+        lines.append(f"{prefix}{connector}{entry.name}")
+        if entry.is_dir() and depth < max_depth:
+            extension = "    " if index == len(entries) - 1 else "|   "
+            lines.extend(_build_tree(entry, prefix + extension, depth + 1, max_depth))
+    return lines
+
+
+def _detect_key_files(root: Path) -> dict[str, list[str]]:
+    found: dict[str, list[str]] = {}
+    for category, patterns in _KEY_FILE_PATTERNS.items():
+        matches: list[str] = []
+        for pattern in patterns:
+            for path in root.rglob(pattern):
+                if not path.is_file():
+                    continue
+                relative_path = path.relative_to(root).as_posix()
+                if (
+                    relative_path not in _ALLOWED_HIDDEN_RELATIVE_PATHS
+                    and any(_should_skip(part) for part in path.relative_to(root).parts)
+                ):
+                    continue
+                matches.append(relative_path)
+        if matches:
+            found[category] = sorted(set(matches))
+    return found
+
+
+def _extension_summary(root: Path) -> str:
+    counter: Counter[str] = Counter()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [directory for directory in dirnames if not _should_skip(directory)]
+        for filename in filenames:
+            ext = Path(filename).suffix.lower() or "(no ext)"
+            counter[ext] += 1
+
+    if not counter:
+        return ""
+
+    return ", ".join(f"{count} {ext}" for ext, count in counter.most_common(8))
+
+
+def _git_info(root: Path) -> str | None:
+    git_dir = root / ".git"
+    if not git_dir.exists():
+        return None
+
+    try:
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        branch = head.replace("ref: refs/heads/", "") if head.startswith("ref:") else head[:8]
+        commit_msg_path = git_dir / "COMMIT_EDITMSG"
+        last_commit = ""
+        if commit_msg_path.exists():
+            message = commit_msg_path.read_text(encoding="utf-8").strip()
+            first_line = message.splitlines()[0] if message else ""
+            if first_line:
+                last_commit = f', last commit: "{first_line}"'
+        return f"branch: {branch}{last_commit}"
+    except Exception:
+        return None
+
+
+def _top_level_summary(root: Path) -> list[str]:
+    lines: list[str] = []
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except (PermissionError, OSError):
+        return lines
+
+    for entry in entries:
+        if _should_skip(entry.name):
+            continue
+        if entry.is_dir():
+            try:
+                child_names = [
+                    child.name
+                    for child in sorted(entry.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+                    if not _should_skip(child.name)
+                ]
+            except (PermissionError, OSError):
+                child_names = []
+            preview = ", ".join(child_names[:4])
+            suffix = f" -> {preview}" if preview else ""
+            if len(child_names) > 4:
+                suffix += f", +{len(child_names) - 4} more"
+            lines.append(f"- `{entry.name}/`{suffix}")
+        else:
+            lines.append(f"- `{entry.name}`")
+    return lines[:20]
+
+
+def _read_text(path: Path, max_chars: int = _MAX_FILE_CHARS) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")[:max_chars]
+    except Exception:
+        return None
+
+
+def _collapse_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _shorten(text: str, limit: int = 220) -> str:
+    compact = _collapse_whitespace(text)
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _first_markdown_heading(text: str) -> str | None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip()
+    return None
+
+
+def _first_paragraph(text: str) -> str | None:
+    paragraph: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if paragraph:
+                break
+            continue
+        if stripped.startswith("#"):
+            continue
+        paragraph.append(stripped)
+        if len(" ".join(paragraph)) > 260:
+            break
+    if not paragraph:
+        return None
+    return _shorten(" ".join(paragraph), limit=220)
+
+
+def _markdown_heading_summary(text: str, limit: int = 6) -> str | None:
+    headings = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            headings.append(stripped.lstrip("#").strip())
+        if len(headings) >= limit:
+            break
+    if not headings:
+        return None
+    return ", ".join(headings[:limit])
+
+
+def _parse_pyproject(text: str) -> str | None:
+    try:
+        data = tomllib.loads(text)
+    except Exception:
+        return None
+
+    project = data.get("project", {})
+    tool_section = data.get("tool", {})
+    name = project.get("name")
+    description = project.get("description")
+    dependencies = project.get("dependencies") or []
+    scripts = project.get("scripts") or {}
+
+    parts: list[str] = []
+    if name:
+        parts.append(f'package "{name}"')
+    if description:
+        parts.append(description)
+    if dependencies:
+        dep_names = [dep.split(">=")[0].split("==")[0].strip() for dep in dependencies[:6]]
+        parts.append("deps: " + ", ".join(dep_names))
+    if scripts:
+        parts.append("scripts: " + ", ".join(list(scripts.keys())[:6]))
+    elif "poetry" in tool_section:
+        scripts_section = tool_section.get("poetry", {}).get("scripts", {})
+        if scripts_section:
+            parts.append("scripts: " + ", ".join(list(scripts_section.keys())[:6]))
+
+    if not parts:
+        return None
+    return "; ".join(parts)
+
+
+def _parse_package_json(text: str) -> str | None:
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None
+
+    parts: list[str] = []
+    if data.get("name"):
+        parts.append(f'package "{data["name"]}"')
+    if data.get("description"):
+        parts.append(_shorten(str(data["description"]), limit=120))
+
+    scripts = list((data.get("scripts") or {}).keys())
+    if scripts:
+        parts.append("scripts: " + ", ".join(scripts[:6]))
+
+    dependencies = list((data.get("dependencies") or {}).keys())
+    if dependencies:
+        parts.append("deps: " + ", ".join(dependencies[:6]))
+
+    return "; ".join(parts) if parts else None
+
+
+def _parse_requirements(text: str) -> str | None:
+    packages: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        package = stripped.split("==")[0].split(">=")[0].split("<=")[0].strip()
+        packages.append(package)
+        if len(packages) >= 8:
+            break
+    if not packages:
+        return None
+    return "deps: " + ", ".join(packages)
+
+
+def _parse_python_symbols(path: Path) -> str | None:
+    text = _read_text(path)
+    if not text:
+        return None
+
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+
+    classes = [
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+    ]
+    functions = [
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    parts: list[str] = []
+    if classes:
+        parts.append("classes: " + ", ".join(classes[:4]))
+    if functions:
+        parts.append("functions: " + ", ".join(functions[:6]))
+    return "; ".join(parts) if parts else None
+
+
+def _summarize_key_file(root: Path, relative_path: str) -> str | None:
+    path = root / relative_path
+    if not path.exists() or not path.is_file():
+        return None
+
+    text = _read_text(path)
+    if text is None:
+        return f"- `{relative_path}`: present but could not be read as UTF-8 text."
+
+    suffix = path.suffix.lower()
+    name_lower = path.name.lower()
+
+    details: list[str] = []
+    if suffix == ".md":
+        heading = _first_markdown_heading(text)
+        paragraph = _first_paragraph(text)
+        headings = _markdown_heading_summary(text)
+        if heading:
+            details.append(f"heading: {heading}")
+        if paragraph:
+            details.append(paragraph)
+        elif headings:
+            details.append("sections: " + headings)
+    elif name_lower == "pyproject.toml":
+        parsed = _parse_pyproject(text)
+        if parsed:
+            details.append(parsed)
+    elif name_lower == "package.json":
+        parsed = _parse_package_json(text)
+        if parsed:
+            details.append(parsed)
+    elif name_lower == "requirements.txt":
+        parsed = _parse_requirements(text)
+        if parsed:
+            details.append(parsed)
+    elif suffix == ".py":
+        parsed = _parse_python_symbols(path)
+        if parsed:
+            details.append(parsed)
+
+    if not details:
+        details.append(f"{path.stat().st_size} bytes")
+
+    return f"- `{relative_path}`: " + "; ".join(details)
+
+
+def build_skeleton(cwd: Path) -> str:
+    """Build a compact markdown overview of the codebase at `cwd`."""
+    lines = [f"## Codebase Structure: `{cwd}`", ""]
+
+    git = _git_info(cwd)
+    if git:
+        lines.append(f"**Git**: {git}")
+        lines.append("")
+
+    ext_summary = _extension_summary(cwd)
+    if ext_summary:
+        lines.append(f"**Files**: {ext_summary}")
+        lines.append("")
+
+    key_files = _detect_key_files(cwd)
+    if key_files:
+        lines.append("**Key files**:")
+        for category, files in key_files.items():
+            label = category.replace("_", " ").title()
+            lines.append(f"- {label}: {', '.join(files[:5])}")
+        lines.append("")
+
+    tree_lines = _build_tree(cwd)
+    if tree_lines:
+        lines.append("**Directory tree** (depth <= 3):")
+        lines.append("```text")
+        lines.append(str(cwd.name) + "/")
+        lines.extend(tree_lines[:_MAX_TREE_LINES])
+        if len(tree_lines) > _MAX_TREE_LINES:
+            lines.append(f"... ({len(tree_lines) - _MAX_TREE_LINES} more entries)")
+        lines.append("```")
+
+    return "\n".join(lines).strip()
+
+
+def build_agent_brief(cwd: Path) -> str:
+    """Build a durable, agent-facing project summary for future sessions."""
+    key_files = _detect_key_files(cwd)
+    tree_lines = _build_tree(cwd)
+
+    lines = [
+        "# Agent Context",
+        "",
+        "This file is generated by `/init` and is intended to help future agent sessions",
+        "understand the project quickly. Refresh it after major structural changes.",
+        "",
+        f"- Generated at: {datetime.now().isoformat(timespec='seconds')}",
+        f"- Project root: `{cwd}`",
+    ]
+
+    git = _git_info(cwd)
+    if git:
+        lines.append(f"- Git: {git}")
+
+    ext_summary = _extension_summary(cwd)
+    if ext_summary:
+        lines.append(f"- File mix: {ext_summary}")
+
+    lines.extend(["", "## Top-Level Layout", ""])
+    top_level = _top_level_summary(cwd)
+    if top_level:
+        lines.extend(top_level)
+    else:
+        lines.append("- No visible top-level entries found.")
+
+    lines.extend(["", "## Important Files", ""])
+    important_entries: list[str] = []
+    for category in ("readme", "agents_spec", "config", "entry_points"):
+        for relative_path in key_files.get(category, [])[:6]:
+            summary = _summarize_key_file(cwd, relative_path)
+            if summary:
+                important_entries.append(summary)
+
+    if important_entries:
+        seen: set[str] = set()
+        for entry in important_entries:
+            if entry in seen:
+                continue
+            seen.add(entry)
+            lines.append(entry)
+    else:
+        lines.append("- No key files were detected.")
+
+    lines.extend(["", "## Directory Tree", "", "```text", str(cwd.name) + "/"])
+    if tree_lines:
+        lines.extend(tree_lines[:_MAX_TREE_LINES])
+        if len(tree_lines) > _MAX_TREE_LINES:
+            lines.append(f"... ({len(tree_lines) - _MAX_TREE_LINES} more entries)")
+    lines.extend(["```", "", "## Usage Notes", "", "- Re-run `/init` whenever major files, folders, dependencies, or workflows change.", "- Keep this summary factual and project-specific so future sessions can rely on it.",])
+
+    return "\n".join(lines).strip() + "\n"
+
+seesion
+from datetime import datetime
+import json
+from typing import Any
+import uuid
+from agent.memory_store import SessionMemoryStore
+from client.llm_client import LLMClient
+from config.config import Config
+from config.loader import get_data_dir
+from context.compaction import ChatCompactor
+from context.loop_detector import LoopDetector
+from context.manager import ContextManager
+from hooks.hook_system import HookSystem
+from safety.approval import ApprovalManager
+from tools.discovery import ToolDiscoveryManager
+from tools.mcp.mcp_manager import MCPManager
+from tools.registry import create_default_registry
+
+
+class Session:
+    def __init__(self, config: Config):
+        self.config = config
+        self.client = LLMClient(config=config)
+        self.tool_registry = create_default_registry(config)
+        self.context_manager: ContextManager | None = None
+        self.discovery_manager = ToolDiscoveryManager(
+            self.config,
+            self.tool_registry,
+        )
+        self.mcp_manager = MCPManager(self.config)
+        self.chat_compactor = ChatCompactor(self.client)
+        self.approval_manager = ApprovalManager(
+            self.config.approval,
+            self.config.cwd,
+        )
+        self.loop_detector = LoopDetector()
+        self.hook_system = HookSystem(config)
+        self.session_id = str(uuid.uuid4())
+        self.created_at = datetime.now()
+        self.updated_at = datetime.now()
+
+        self.turn_count = 0
+        self.skeleton_stale: bool = False
+
+    def _load_project_agent_context(self) -> tuple[str, datetime] | None:
+        candidate_paths = [
+            self.config.cwd / ".ai-agent" / "Agent.md",
+            self.config.cwd / ".ai-agent" / "AGENT.md",
+        ]
+
+        for path in candidate_paths:
+            if not path.exists():
+                continue
+            try:
+                content = path.read_text(encoding="utf-8").strip()
+                if not content:
+                    continue
+                indexed_at = datetime.fromtimestamp(path.stat().st_mtime)
+                return content, indexed_at
+            except Exception:
+                continue
+
+        return None
+
+    async def initialize(self) -> None:
+        await self.mcp_manager.initialize()
+        self.mcp_manager.register_tools(self.tool_registry)
+
+        self.discovery_manager.discover_all()
+
+        user_memory = self._load_memory()
+        memory_store = SessionMemoryStore()
+
+        # Recall past session summaries for this codebase
+        codebase_memory = memory_store.recall(
+            self.config.cwd,
+            top_k=self.config.codebase_memory_top_k,
+        )
+        if codebase_memory:
+            user_memory = (user_memory + "\n\n" + codebase_memory) if user_memory else codebase_memory
+
+        # Inject project summary if available. Prefer the durable Agent.md copy
+        # written by /init, and fall back to the stored summary entry.
+        skeleton_result = self._load_project_agent_context()
+        if skeleton_result is None:
+            skeleton_result = memory_store.load_skeleton(self.config.cwd)
+        if skeleton_result:
+            skeleton_text, indexed_at = skeleton_result
+            age_days = (datetime.now() - indexed_at).days
+            if age_days > 7:
+                self.skeleton_stale = True
+            user_memory = (user_memory + "\n\n" + skeleton_text) if user_memory else skeleton_text
+
+        self.context_manager = ContextManager(
+            config=self.config,
+            user_memory=user_memory,
+            tools=self.tool_registry.get_tools(),
+        )
+
+    def _load_memory(self) -> str | None:
+        data_dir = get_data_dir()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        path = data_dir / "user_memory.json"
+
+        if not path.exists():
+            return None
+
+        try:
+            content = path.read_text(encoding="utf-8")
+            data = json.loads(content)
+            entries = data.get("entries")
+            if not entries:
+                return None
+
+            lines = ["User preferences and notes:"]
+            for key, value in entries.items():
+                lines.append(f"- {key}: {value}")
+
+            return "\n".join(lines)
+        except Exception:
+            return None
+
+    def increment_turn(self) -> int:
+        self.turn_count += 1
+        self.updated_at = datetime.now()
+
+        return self.turn_count
+
+    def get_stats(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "created_at": self.created_at.isoformat(),
+            "turn_count": self.turn_count,
+            "message_count": self.context_manager.message_count,
+            "token_usage": self.context_manager.total_usage,
+            "tools_count": len(self.tool_registry.get_tools()),
+            "mcp_servers": len(self.tool_registry.connected_mcp_servers),
+        }
+manager
+
+from datetime import datetime
+from typing import Any
+from client.response import TokenUsage
+from config.config import Config
+from prompts.system import get_system_prompt
+from dataclasses import dataclass, field
+
+from tools.base import Tool
+from utils.text import count_tokens
+
+
+@dataclass
+class MessageItem:
+    role: str
+    content: str
+    tool_call_id: str | None = None
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    token_count: int | None = None
+    pruned_at: datetime | None = None
+    tier: int = 0  # 0=L0 always loaded, 1=L1 conditional, 2=L2 archived (never sent)
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"role": self.role}
+
+        if self.tool_call_id:
+            result["tool_call_id"] = self.tool_call_id
+
+        if self.tool_calls:
+            result["tool_calls"] = self.tool_calls
+
+        if self.content:
+            result["content"] = self.content
+
+        return result
+
+
+class ContextManager:
+    PRUNE_PROTECT_TOKENS = 40_000
+    PRUNE_MINIMUM_TOKENS = 20_000
+
+    def __init__(
+        self,
+        config: Config,
+        user_memory: str | None,
+        tools: list[Tool] | None,
+    ) -> None:
+        self._system_prompt = get_system_prompt(config, user_memory, tools)
+        self.config = config
+        self._model_name = self.config.model_name
+        self._messages: list[MessageItem] = []
+        self._latest_usage = TokenUsage()
+        self.total_usage = TokenUsage()
+        self._l0_budget = config.l0_token_budget
+        self._l1_budget = config.l1_token_budget
+        self._l1_min_score = config.l1_min_relevance
+
+    @property
+    def message_count(self) -> int:
+        return len(self._messages)
+
+    def add_user_message(self, content: str) -> None:
+        item = MessageItem(
+            role="user",
+            content=content,
+            token_count=count_tokens(
+                content,
+                self._model_name,
+            ),
+        )
+
+        self._messages.append(item)
+
+    def add_assistant_message(
+        self,
+        content: str,
+        tool_calls: list[dict[str, any]] | None = None,
+    ) -> None:
+        item = MessageItem(
+            role="assistant",
+            content=content or "",
+            token_count=count_tokens(
+                content or "",
+                self._model_name,
+            ),
+            tool_calls=tool_calls or [],
+        )
+
+        self._messages.append(item)
+
+    def add_tool_result(self, tool_call_id: str, content: str) -> None:
+        item = MessageItem(
+            role="tool",
+            content=content,
+            tool_call_id=tool_call_id,
+            token_count=count_tokens(content, self._model_name),
+        )
+
+        self._messages.append(item)
+
+    def export_messages(self) -> list[dict[str, Any]]:
+        selected_indices = set(range(len(self._messages)))
+        return self._serialize_messages(selected_indices)
+
+    def _tool_call_ids(self, item: MessageItem) -> set[str]:
+        ids: set[str] = set()
+        for tool_call in item.tool_calls:
+            call_id = tool_call.get("id")
+            if call_id:
+                ids.add(call_id)
+        return ids
+
+    def _assistant_index_for_tool(self, index: int) -> int | None:
+        item = self._messages[index]
+        if item.role != "tool" or not item.tool_call_id:
+            return None
+
+        probe = index - 1
+        while probe >= 0 and self._messages[probe].role == "tool":
+            probe -= 1
+
+        if probe < 0:
+            return None
+
+        assistant = self._messages[probe]
+        if assistant.role != "assistant":
+            return None
+
+        if item.tool_call_id not in self._tool_call_ids(assistant):
+            return None
+
+        return probe
+
+    def _tool_result_indices_for_assistant(self, index: int) -> list[int]:
+        if index < 0 or index >= len(self._messages):
+            return []
+
+        assistant = self._messages[index]
+        expected_ids = self._tool_call_ids(assistant)
+        if assistant.role != "assistant" or not expected_ids:
+            return []
+
+        result_indices: list[int] = []
+        probe = index + 1
+        while probe < len(self._messages):
+            item = self._messages[probe]
+            if item.role != "tool":
+                break
+            if item.tool_call_id not in expected_ids:
+                break
+            result_indices.append(probe)
+            probe += 1
+        return result_indices
+
+    def _expand_tool_context(self, selected_indices: set[int]) -> set[int]:
+        expanded = set(selected_indices)
+
+        changed = True
+        while changed:
+            changed = False
+            for index in list(expanded):
+                item = self._messages[index]
+                if item.role == "tool":
+                    assistant_index = self._assistant_index_for_tool(index)
+                    if assistant_index is None:
+                        continue
+                    if assistant_index not in expanded:
+                        expanded.add(assistant_index)
+                        changed = True
+                    for result_index in self._tool_result_indices_for_assistant(assistant_index):
+                        if result_index not in expanded:
+                            expanded.add(result_index)
+                            changed = True
+                elif item.role == "assistant" and item.tool_calls:
+                    for result_index in self._tool_result_indices_for_assistant(index):
+                        if result_index not in expanded:
+                            expanded.add(result_index)
+                            changed = True
+
+        return expanded
+
+    def _serialize_messages(self, selected_indices: set[int]) -> list[dict[str, Any]]:
+        expanded = self._expand_tool_context(selected_indices)
+        ordered_indices = sorted(expanded)
+        output: list[dict[str, Any]] = []
+        i = 0
+
+        while i < len(ordered_indices):
+            index = ordered_indices[i]
+            item = self._messages[index]
+
+            if item.role == "tool":
+                i += 1
+                continue
+
+            if item.role == "assistant" and item.tool_calls:
+                expected_ids = self._tool_call_ids(item)
+                block = [item.to_dict()]
+                seen_ids: set[str] = set()
+                j = i + 1
+
+                while j < len(ordered_indices):
+                    next_item = self._messages[ordered_indices[j]]
+                    if next_item.role != "tool":
+                        break
+                    if next_item.tool_call_id not in expected_ids:
+                        break
+                    block.append(next_item.to_dict())
+                    if next_item.tool_call_id:
+                        seen_ids.add(next_item.tool_call_id)
+                    j += 1
+
+                if expected_ids and expected_ids.issubset(seen_ids):
+                    output.extend(block)
+                elif item.content:
+                    output.append({"role": "assistant", "content": item.content})
+
+                i = j
+                continue
+
+            output.append(item.to_dict())
+            i += 1
+
+        return output
+
+    def _rebalance_tiers(self) -> None:
+        """Assign L0/L1/L2 tiers to messages based on recency and token budgets.
+
+        Walk newest-to-oldest:
+        - Messages within the L0 token budget → tier 0 (always loaded)
+        - Next messages within the L1 budget → tier 1 (conditionally loaded)
+        - Remainder → tier 2 (archived; never sent to LLM)
+        """
+        budget_l0 = self._l0_budget
+        budget_l1 = self._l1_budget
+        accumulated = 0
+
+        for msg in reversed(self._messages):
+            tokens = msg.token_count or count_tokens(msg.content, self._model_name)
+            if accumulated < budget_l0:
+                msg.tier = 0
+            elif accumulated < budget_l0 + budget_l1:
+                msg.tier = 1
+            else:
+                msg.tier = 2
+            accumulated += tokens
+
+    def get_messages(self, query: str | None = None) -> list[dict[str, Any]]:
+        """Return messages to send to the LLM.
+
+        Always includes:
+        - System prompt
+        - All tier-0 (L0) messages (most recent, within l0_token_budget)
+
+        Conditionally includes tier-1 (L1) messages:
+        - If query provided: only those scoring ≥ l1_min_relevance, best-first, within l1_token_budget
+        - If no query: recency order, within l1_token_budget
+
+        Never includes tier-2 (L2) messages.
+        """
+        from context.retriever import score_relevance
+
+        self._rebalance_tiers()
+
+        messages: list[dict[str, Any]] = []
+
+        if self._system_prompt:
+            messages.append({"role": "system", "content": self._system_prompt})
+
+        l0_msgs = [m for m in self._messages if m.tier == 0]
+        l1_msgs = [m for m in self._messages if m.tier == 1]
+
+        # Select L1 candidates within budget
+        l1_selected: list[MessageItem] = []
+        if l1_msgs:
+            if query:
+                scored = [(score_relevance(m, query), i, m) for i, m in enumerate(l1_msgs)]
+                scored.sort(key=lambda x: (-x[0], -x[1]))  # highest score, then newest
+                candidates = [(s, i, m) for s, i, m in scored if s >= self._l1_min_score]
+            else:
+                candidates = [(0.0, i, m) for i, m in enumerate(l1_msgs)]
+
+            budget = self._l1_budget
+            used = 0
+            selected_indices = set()
+            for _, orig_idx, msg in candidates:
+                tokens = msg.token_count or count_tokens(msg.content, self._model_name)
+                if used + tokens <= budget:
+                    selected_indices.add(orig_idx)
+                    used += tokens
+
+            # Restore original message order for selected L1 messages
+            l1_selected = [m for i, m in enumerate(l1_msgs) if i in selected_indices]
+
+        selected_item_ids = {id(item) for item in (l1_selected + l0_msgs)}
+        selected_indices = {
+            index
+            for index, item in enumerate(self._messages)
+            if id(item) in selected_item_ids
+        }
+
+        messages.extend(self._serialize_messages(selected_indices))
+
+        return messages
+
+    def needs_compression(self) -> bool:
+        context_limit = self.config.model.context_window
+        current_tokens = self._latest_usage.total_tokens
+
+        return current_tokens > (context_limit * 0.8)
+
+    def set_latest_usage(self, usage: TokenUsage):
+        self._latest_usage = usage
+
+    def add_usage(self, usage: TokenUsage):
+        self.total_usage += usage
+
+    def replace_with_summary(self, summary: str) -> None:
+        self._messages = []
+
+        continuation_content = f"""# Context Restoration (Previous Session Compacted)
+
+        The previous conversation was compacted due to context length limits. Below is a detailed summary of the work done so far.
+
+        **CRITICAL: Actions listed under "COMPLETED ACTIONS" are already done. DO NOT repeat them.**
+
+        ---
+
+        {summary}
+
+        ---
+
+        Resume work from where we left off. Focus ONLY on the remaining tasks."""
+
+        summary_item = MessageItem(
+            role="user",
+            content=continuation_content,
+            token_count=count_tokens(continuation_content, self._model_name),
+        )
+        self._messages.append(summary_item)
+
+        ack_content = """I've reviewed the context from the previous session. I understand:
+- The original goal and what was requested
+- Which actions are ALREADY COMPLETED (I will NOT repeat these)
+- The current state of the project
+- What still needs to be done
+
+I'll continue with the REMAINING tasks only, starting from where we left off."""
+        ack_item = MessageItem(
+            role="assistant",
+            content=ack_content,
+            token_count=count_tokens(ack_content, self._model_name),
+        )
+        self._messages.append(ack_item)
+
+        continue_content = (
+            "Continue with the REMAINING work only. Do NOT repeat any completed actions. "
+            "Proceed with the next step as described in the context above."
+        )
+
+        continue_item = MessageItem(
+            role="user",
+            content=continue_content,
+            token_count=count_tokens(continue_content, self._model_name),
+        )
+        self._messages.append(continue_item)
+
+        # Add a note so the model knows compression happened (Improvement 4)
+        compression_note = MessageItem(
+            role="system",
+            content=(
+                "[Context notice: conversation history was compressed to fit context window. "
+                "Older tool outputs and intermediate steps have been summarised. "
+                "Continue from the current state.]"
+            ),
+            token_count=count_tokens(
+                "[Context notice: conversation history was compressed to fit context window. "
+                "Older tool outputs and intermediate steps have been summarised. "
+                "Continue from the current state.]",
+                self._model_name,
+            ),
+        )
+        self._messages.append(compression_note)
+
+        # Recalculate _latest_usage to reflect the compressed context size (Improvement 3)
+        # so needs_compression() won't immediately trigger again with stale pre-compression counts
+        new_token_count = sum(
+            (msg.token_count or count_tokens(msg.content, self._model_name))
+            for msg in self._messages
+        )
+        self._latest_usage = TokenUsage(
+            prompt_tokens=new_token_count,
+            completion_tokens=0,
+            total_tokens=new_token_count,
+        )
+
+    def prune_tool_outputs(self, force_if_above_threshold: bool = False) -> int:
+        # Always require at least 2 user messages to avoid pruning very early conversations
+        user_message_count = sum(1 for msg in self._messages if msg.role == "user")
+
+        if user_message_count < 2:
+            return 0
+
+        # Allow pruning proactively when context is above 60% full, even during tool-call turns
+        context_limit = self.config.model.context_window
+        current_tokens = self._latest_usage.total_tokens
+        above_threshold = current_tokens > (context_limit * 0.6)
+
+        if not above_threshold and not force_if_above_threshold:
+            # Only skip if we're well below the threshold — still prune if tokens are accumulating
+            estimated_history_tokens = sum(
+                (msg.token_count or count_tokens(msg.content, self._model_name))
+                for msg in self._messages
+            )
+            if estimated_history_tokens < (context_limit * 0.4):
+                return 0
+
+        total_tokens = 0
+        pruned_tokens = 0
+        to_prune: list[MessageItem] = []
+
+        for msg in reversed(self._messages):
+            if msg.role == "tool" and msg.tool_call_id:
+                if msg.pruned_at:
+                    break
+
+                tokens = msg.token_count or count_tokens(msg.content, self._model_name)
+                total_tokens += tokens
+
+                if total_tokens > self.PRUNE_PROTECT_TOKENS:
+                    pruned_tokens += tokens
+                    to_prune.append(msg)
+
+        if pruned_tokens < self.PRUNE_MINIMUM_TOKENS:
+            return 0
+
+        pruned_count = 0
+
+        for msg in to_prune:
+            msg.content = "[Old tool result content cleared]"
+            msg.token_count = count_tokens(msg.content, self._model_name)
+            msg.pruned_at = datetime.now()
+            pruned_count += 1
+
+        return pruned_count
+
+    def clear(self) -> None:
+        self._messages = []
+RENDRERE
+- `/init` - Refresh the project summary and write `.ai-agent/Agent.md`
