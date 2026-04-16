@@ -1,86 +1,150 @@
-import polars as pl
-import pandas as pd
+from pathlib import Path
 
-# Example data with None, null, and empty values
-df_left = pd.DataFrame({
-    "colA": ["A,B,C", "X,Y", "M", "A,B,C", "Q,Z", None, "", "  "],
-    "id": [1, 2, 3, 4, 5, 6, 7, 8],
-    "name": ["Alice", "Bob", "Charlie", "David", "Eve", "Frank", "Grace", "Henry"]
-})
+from pptx import Presentation
+from pptx.chart.data import CategoryChartData
+from pptx.dml.color import RGBColor
+from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION, XL_TICK_LABEL_POSITION
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_CONNECTOR, MSO_SHAPE_TYPE
+from pptx.util import Inches, Pt
 
-df_right = pl.DataFrame({
-    "key": ["A", "B", "C", "M", "N", "X", "Y"], 
-    "val": [10, 20, 30, 40, 50, 60, 70],
-    "category": ["cat1", "cat2", "cat1", "cat3", "cat2", "cat1", "cat2"]
-})
-lf_right = df_right.lazy()
 
-# Optimized Polars pipeline
-lf_result = (
-    pl.from_pandas(df_left)
-    .lazy()
-    .with_row_index("row_id")
-    .with_columns(
-        # Only split if colA is valid, otherwise set to null
-        pl.when(
-            pl.col("colA").is_not_null() & 
-            (pl.col("colA") != "") & 
-            (pl.col("colA").str.strip_chars() != "")
-        )
-        .then(pl.col("colA").str.split(","))
-        .otherwise(pl.lit(None))
-        .alias("key")
-    )
-    .with_columns(
-        # Track if this row had valid colA for lookup
-        pl.col("key").is_not_null().alias("had_valid_colA")
-    )
-    .explode("key")
-    .with_columns(
-        pl.when(pl.col("key").is_not_null())
-        .then(pl.col("key").str.strip_chars())
-        .otherwise(pl.col("key"))
-    )
-    .with_columns(
-        pl.when(
-            pl.col("key").is_not_null() & 
-            (pl.col("key") != "")
-        )
-        .then(pl.col("key"))
-        .otherwise(pl.lit(None))
-        .alias("valid_key")
-    )
-    .join(lf_right, left_on="valid_key", right_on="key", how="left")
-    .drop("valid_key", "key")
-    .group_by("row_id", "colA", "id", "name", maintain_order=True)
-    .agg([
-        pl.col("had_valid_colA").first().alias("had_valid_colA"),
-        pl.col("val")
-        .cast(pl.Utf8)
-        .fill_null("NOTFOUND")
-        .str.concat(",")
-        .alias("lookup_val"),
-        
-        pl.col("category")
-        .fill_null("NOTFOUND")
-        .str.concat(",")
-        .alias("lookup_category")
-    ])
-    .with_columns([
-        # If colA was invalid, set lookup columns to None
-        pl.when(pl.col("had_valid_colA"))
-        .then(pl.col("lookup_val"))
-        .otherwise(pl.lit(None))
-        .alias("lookup_val"),
-        
-        pl.when(pl.col("had_valid_colA"))
-        .then(pl.col("lookup_category"))
-        .otherwise(pl.lit(None))
-        .alias("lookup_category")
-    ])
-    .drop("row_id", "had_valid_colA")
-)
+def add_sample_combo_chart(output_path: str | Path = "similar_graph.pptx") -> Path:
+    """
+    Create a PowerPoint slide with a chart visually similar to the reference image.
 
-# Collect result
-df_result = lf_result.collect().to_pandas()
-print(df_result)
+    Because python-pptx does not offer a direct "combo chart with secondary axis"
+    API, this function overlays:
+    1. a clustered column chart for series A/B on the left axis
+    2. a line chart for series C/D on the right axis
+    """
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+    categories = ["D1", "D2", "D3", "D4", "D5"]
+    series_a = [20, 40, 9, 12, 30]
+    series_b = [10, 20, 30, 20, 10]
+    series_c = [1, 3, 8, 3, 6]
+    series_d = [1, 2, 3, 6, 3]
+
+    left = Inches(0.55)
+    top = Inches(0.35)
+    width = Inches(8.65)
+    height = Inches(5.65)
+
+    bar_data = CategoryChartData()
+    bar_data.categories = categories
+    bar_data.add_series("A", series_a)
+    bar_data.add_series("B", series_b)
+
+    bar_shape = slide.shapes.add_chart(
+        XL_CHART_TYPE.COLUMN_CLUSTERED, left, top, width, height, bar_data
+    )
+    bar_chart = bar_shape.chart
+
+    bar_chart.has_title = False
+    bar_chart.has_legend = True
+    bar_chart.legend.position = XL_LEGEND_POSITION.BOTTOM
+    bar_chart.legend.include_in_layout = False
+    bar_chart.value_axis.maximum_scale = 45
+    bar_chart.value_axis.minimum_scale = 0
+    bar_chart.value_axis.major_unit = 5
+    bar_chart.value_axis.has_major_gridlines = True
+    bar_chart.value_axis.tick_label_position = XL_TICK_LABEL_POSITION.LOW
+    bar_chart.category_axis.tick_label_position = XL_TICK_LABEL_POSITION.LOW
+
+    plot = bar_chart.plots[0]
+    plot.gap_width = 150
+
+    bar_chart.series[0].format.fill.solid()
+    bar_chart.series[0].format.fill.fore_color.rgb = RGBColor(68, 114, 196)
+    bar_chart.series[0].format.line.fill.background()
+
+    bar_chart.series[1].format.fill.solid()
+    bar_chart.series[1].format.fill.fore_color.rgb = RGBColor(237, 125, 49)
+    bar_chart.series[1].format.line.fill.background()
+
+    line_data = CategoryChartData()
+    line_data.categories = categories
+    line_data.add_series("C (Right)", series_c)
+    line_data.add_series("D (Right)", series_d)
+
+    line_shape = slide.shapes.add_chart(
+        XL_CHART_TYPE.LINE, left, top, width, height, line_data
+    )
+    line_chart = line_shape.chart
+
+    line_chart.has_title = False
+    line_chart.has_legend = False
+    line_chart.value_axis.maximum_scale = 9
+    line_chart.value_axis.minimum_scale = 0
+    line_chart.value_axis.major_unit = 1
+    line_chart.value_axis.has_major_gridlines = False
+    line_chart.value_axis.tick_label_position = XL_TICK_LABEL_POSITION.HIGH
+    line_chart.category_axis.tick_label_position = XL_TICK_LABEL_POSITION.NONE
+
+    for axis in (line_chart.category_axis, line_chart.value_axis):
+        axis.format.line.fill.background()
+
+    for shape in slide.shapes:
+        if shape.shape_type == MSO_SHAPE_TYPE.CHART:
+            shape.fill.background()
+            shape.line.fill.background()
+
+    c_series = line_chart.series[0]
+    c_series.format.line.color.rgb = RGBColor(165, 165, 165)
+    c_series.format.line.width = Pt(2.25)
+
+    d_series = line_chart.series[1]
+    d_series.format.line.color.rgb = RGBColor(255, 192, 0)
+    d_series.format.line.width = Pt(2.25)
+
+    for series in line_chart.series:
+        series.marker.style = None
+
+    # Add a manual legend so the overlaid charts read like one combined chart.
+    legend_top = top + height + Inches(0.05)
+    legend_left = left + Inches(1.85)
+    item_w = Inches(1.15)
+    box = Inches(0.18)
+
+    legend_items = [
+        ("A", RGBColor(68, 114, 196), "bar"),
+        ("B", RGBColor(237, 125, 49), "bar"),
+        ("C (Right)", RGBColor(165, 165, 165), "line"),
+        ("D (Right)", RGBColor(255, 192, 0), "line"),
+    ]
+
+    for idx, (label, color, kind) in enumerate(legend_items):
+        x = legend_left + item_w * idx
+        y = legend_top
+        if kind == "bar":
+            item = slide.shapes.add_shape(
+                MSO_AUTO_SHAPE_TYPE.RECTANGLE, x, y + Inches(0.03), box * 1.4, box * 0.75
+            )
+            item.fill.solid()
+            item.fill.fore_color.rgb = color
+            item.line.fill.background()
+        else:
+            item = slide.shapes.add_connector(
+                MSO_CONNECTOR.STRAIGHT, x, y + box, x + Inches(0.38), y + box
+            )
+            item.line.color.rgb = color
+            item.line.width = Pt(2.25)
+
+        text_box = slide.shapes.add_textbox(x + Inches(0.45), y - Inches(0.02), Inches(0.7), Inches(0.25))
+        p = text_box.text_frame.paragraphs[0]
+        run = p.add_run()
+        run.text = label
+        run.font.size = Pt(10)
+        run.font.color.rgb = RGBColor(68, 68, 68)
+
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(output_path)
+    return output_path
+
+
+if __name__ == "__main__":
+    out = add_sample_combo_chart()
+    print(f"Saved presentation to: {out}")
