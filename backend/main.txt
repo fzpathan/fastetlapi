@@ -405,3 +405,1998 @@ async def health_check():
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+"""
+System Monitoring Router
+Handles CPU, memory, and system monitoring data
+"""
+from collections import deque
+from fastapi import APIRouter, HTTPException, Query
+from typing import Optional, Iterable
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import re
+import logging
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/monitoring", tags=["monitoring"])
+
+RANGE_WINDOWS = {
+    "1h": timedelta(hours=1),
+    "6h": timedelta(hours=6),
+    "12h": timedelta(hours=12),
+    "24h": timedelta(hours=24),
+}
+
+CPU_RE = re.compile(r"CPU:\s+([\d.]+)%")
+FREQ_RE = re.compile(r"Freq:\s+([\d.]+)MHz")
+LOAD_RE = re.compile(r"Load:\s+([\d.]+)/([\d.]+)/([\d.]+)")
+MEM_PERCENT_RE = re.compile(r"MEM:\s+([\d.]+)%")
+MEM_USED_RE = re.compile(r"Used:\s+([\d.]+[A-Z]+)")
+MEM_AVAIL_RE = re.compile(r"Avail:\s+([\d.]+[A-Z]+)")
+MEM_TOTAL_RE = re.compile(r"Total:\s+([\d.]+[A-Z]+)")
+SWAP_RE = re.compile(r"SWAP:\s+([\d.]+)%")
+CORE_RE = re.compile(r"Per-Core:\s+\[(.*?)\]")
+TAIL_READ_BLOCK_SIZE = 64 * 1024
+TAIL_TARGET_MULTIPLIER = 6
+MONITORING_CACHE = {}
+
+
+def parse_memory_value(mem_str: Optional[str]) -> float:
+    """Parse memory string like '8.50GB' to bytes."""
+    if not mem_str:
+        return 0
+    units = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+    match = re.match(r"([\d.]+)([A-Z]+)", mem_str.strip())
+    if match:
+        value, unit = match.groups()
+        return float(value) * units.get(unit, 1)
+    return 0
+
+
+def parse_timestamp(timestamp_str: str) -> Optional[datetime]:
+    """
+    Parse timestamp in multiple formats and return timezone-aware UTC datetime.
+    """
+    try:
+        if "T" in timestamp_str:
+            parsed_dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        else:
+            parsed_dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+
+        if parsed_dt.tzinfo is None:
+            parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+        return parsed_dt.astimezone(timezone.utc)
+    except Exception as e:
+        logger.warning(f"Failed to parse timestamp '{timestamp_str}': {e}")
+        return None
+
+
+def resolve_log_path(log_file: Optional[str]) -> Path:
+    if log_file:
+        return Path(log_file)
+
+    default_log = Path("cpu_usage.log")
+    if default_log.exists():
+        return default_log
+    return Path("api/cpu_usage.log")
+
+
+def parse_monitoring_line(line: str) -> Optional[dict]:
+    stripped = line.strip()
+    if line.startswith("=") or not stripped or "Monitoring Started" in line:
+        return None
+
+    parts = stripped.split(" | ")
+    if len(parts) < 3:
+        return None
+
+    timestamp_dt = parse_timestamp(parts[0].strip())
+    if not timestamp_dt:
+        return None
+
+    cpu_match = CPU_RE.search(line)
+    freq_match = FREQ_RE.search(line)
+    load_match = LOAD_RE.search(line)
+    mem_percent_match = MEM_PERCENT_RE.search(line)
+    mem_used_match = MEM_USED_RE.search(line)
+    mem_avail_match = MEM_AVAIL_RE.search(line)
+    mem_total_match = MEM_TOTAL_RE.search(line)
+    swap_match = SWAP_RE.search(line)
+    core_match = CORE_RE.search(line)
+
+    core_usage = []
+    if core_match:
+        core_str = core_match.group(1).strip()
+        if core_str:
+            try:
+                core_usage = [float(x.strip().rstrip("%")) for x in core_str.split(",") if x.strip()]
+            except Exception:
+                core_usage = []
+
+    return {
+        "_timestamp_dt": timestamp_dt,
+        "record": {
+            "timestamp": timestamp_dt.isoformat(),
+            "cpu_percent": float(cpu_match.group(1)) if cpu_match else 0,
+            "frequency": float(freq_match.group(1)) if freq_match else 0,
+            "load_1min": float(load_match.group(1)) if load_match else 0,
+            "load_5min": float(load_match.group(2)) if load_match else 0,
+            "load_15min": float(load_match.group(3)) if load_match else 0,
+            "mem_percent": float(mem_percent_match.group(1)) if mem_percent_match else 0,
+            "mem_used": parse_memory_value(mem_used_match.group(1) if mem_used_match else None),
+            "mem_available": parse_memory_value(mem_avail_match.group(1) if mem_avail_match else None),
+            "mem_total": parse_memory_value(mem_total_match.group(1) if mem_total_match else None),
+            "swap_percent": float(swap_match.group(1)) if swap_match else 0,
+            "core_usage": core_usage,
+        },
+    }
+
+
+def downsample_records(data: list, max_points: int) -> list:
+    """Reduce payload size while preserving chronology."""
+    if len(data) <= max_points:
+        return data
+    step = max(1, len(data) // max_points)
+    sampled = data[::step]
+    return sampled[-max_points:]
+
+
+def tail_lines(path: Path, line_limit: int) -> Iterable[str]:
+    """
+    Read the last N lines from a file without scanning it from the beginning.
+    """
+    if line_limit <= 0:
+        return []
+
+    with path.open("rb") as f:
+        f.seek(0, 2)
+        file_size = f.tell()
+        buffer = bytearray()
+        position = file_size
+        newline_count = 0
+
+        while position > 0 and newline_count <= line_limit:
+            read_size = min(TAIL_READ_BLOCK_SIZE, position)
+            position -= read_size
+            f.seek(position)
+            chunk = f.read(read_size)
+            buffer[:0] = chunk
+            newline_count = buffer.count(b"\n")
+
+    lines = buffer.decode("utf-8", errors="ignore").splitlines()
+    return lines[-line_limit:]
+
+
+def get_cached_monitoring_response(
+    log_path: Path,
+    requested_range: str,
+    max_points: int,
+) -> Optional[dict]:
+    """
+    Return cached monitoring payload when the file has not changed.
+    """
+    stat = log_path.stat()
+    cache_key = (
+        str(log_path.resolve()),
+        stat.st_mtime_ns,
+        stat.st_size,
+        requested_range,
+        max_points,
+    )
+    cached = MONITORING_CACHE.get(cache_key)
+    if cached:
+        return cached
+
+    stale_keys = [
+        key for key in MONITORING_CACHE
+        if key[0] == str(log_path.resolve()) and (
+            key[1] != stat.st_mtime_ns or key[2] != stat.st_size
+        )
+    ]
+    for key in stale_keys:
+        MONITORING_CACHE.pop(key, None)
+
+    return None
+
+
+def store_cached_monitoring_response(
+    log_path: Path,
+    requested_range: str,
+    max_points: int,
+    payload: dict,
+) -> None:
+    """
+    Cache monitoring payload for the current file version.
+    """
+    stat = log_path.stat()
+    cache_key = (
+        str(log_path.resolve()),
+        stat.st_mtime_ns,
+        stat.st_size,
+        requested_range,
+        max_points,
+    )
+    MONITORING_CACHE[cache_key] = payload
+
+    if len(MONITORING_CACHE) > 32:
+        oldest_key = next(iter(MONITORING_CACHE))
+        MONITORING_CACHE.pop(oldest_key, None)
+
+
+@router.get("/servers")
+def get_available_servers():
+    """
+    Get list of available monitoring log files (servers)
+    Looks for files matching pattern: *cpu_usage.log or *_monitoring.log
+    """
+    try:
+        # Look for monitoring log files in current directory and api directory
+        search_paths = [Path("."), Path("api")]
+        log_files = []
+        
+        for search_path in search_paths:
+            if not search_path.exists():
+                continue
+            
+            # Find all CPU monitoring log files
+            for pattern in ["*cpu_usage.log", "*_monitoring.log", "cpu_usage*.log"]:
+                for log_file in search_path.glob(pattern):
+                    if log_file.is_file():
+                        # Extract server name from filename
+                        filename = log_file.stem
+                        
+                        # Parse server name
+                        if filename == "cpu_usage":
+                            server_name = "Local Server"
+                        elif "_cpu_usage" in filename:
+                            server_name = filename.replace("_cpu_usage", "").replace("_", " ").title()
+                        elif "_monitoring" in filename:
+                            server_name = filename.replace("_monitoring", "").replace("_", " ").title()
+                        else:
+                            server_name = filename.replace("_", " ").title()
+                        
+                        log_files.append({
+                            "server_name": server_name,
+                            "log_file": str(log_file),
+                            "filename": log_file.name,
+                            "size_mb": round(log_file.stat().st_size / (1024 * 1024), 2),
+                            "modified_at": datetime.fromtimestamp(log_file.stat().st_mtime).isoformat()
+                        })
+        
+        # Remove duplicates and sort by name
+        unique_files = {f["log_file"]: f for f in log_files}
+        sorted_files = sorted(unique_files.values(), key=lambda x: x["server_name"])
+        
+        logger.info(f"Found {len(sorted_files)} monitoring log files")
+        
+        return {
+            "success": True,
+            "servers": sorted_files,
+            "total": len(sorted_files)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error listing monitoring servers: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("")
+def get_system_monitoring(
+    range: str = "1h",
+    log_file: Optional[str] = None,
+    max_points: int = Query(default=1200, ge=100, le=10000),
+):
+    """
+    Get system monitoring data (CPU, Memory, etc.)
+    Reads from specified log file and returns parsed data
+    
+    Query Parameters:
+        range: Time range (1h, 6h, 12h, 24h, all)
+        log_file: Path to log file (optional, defaults to cpu_usage.log)
+    """
+    try:
+        log_path = resolve_log_path(log_file)
+        
+        if not log_path.exists():
+            return {
+                "success": False,
+                "error": f"Monitoring log file not found: {log_path}. Please ensure the monitoring script is running.",
+                "data": [],
+                "range": range
+            }
+
+        requested_range = (range or "1h").lower()
+        if requested_range not in RANGE_WINDOWS and requested_range != "all":
+            logger.warning(f"Unknown range '{range}', defaulting to 1h")
+            requested_range = "1h"
+
+        cached_payload = get_cached_monitoring_response(log_path, requested_range, max_points)
+        if cached_payload:
+            return cached_payload
+
+        cutoff = None
+        if requested_range in RANGE_WINDOWS:
+            cutoff = datetime.now(timezone.utc) - RANGE_WINDOWS[requested_range]
+
+        record_buffer = deque(maxlen=max_points) if requested_range == "all" else []
+        total_parsed = 0
+
+        if requested_range == "all":
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    parsed = parse_monitoring_line(line)
+                    if not parsed:
+                        continue
+
+                    total_parsed += 1
+                    record_buffer.append(parsed["record"])
+        else:
+            tail_limit = max_points * TAIL_TARGET_MULTIPLIER
+            recent_lines = tail_lines(log_path, tail_limit)
+
+            for line in reversed(recent_lines):
+                parsed = parse_monitoring_line(line)
+                if not parsed:
+                    continue
+
+                total_parsed += 1
+                if cutoff and parsed["_timestamp_dt"] < cutoff:
+                    break
+
+                record_buffer.appendleft(parsed["record"])
+
+        data = list(record_buffer)
+        if requested_range != "all":
+            data = downsample_records(data, max_points)
+
+        payload = {
+            "success": True,
+            "data": data,
+            "range": requested_range,
+            "log_file": str(log_path),
+            "log_filename": log_path.name,
+            "total_records": len(data),
+            "total_parsed": total_parsed,
+            "max_points": max_points,
+            "retrieved_at": datetime.now().isoformat()
+        }
+        store_cached_monitoring_response(log_path, requested_range, max_points, payload)
+
+        logger.info(
+            f"Monitoring data fetched: returned={len(data)}, parsed={total_parsed}, "
+            f"range={requested_range}, max_points={max_points}, log={log_path.name}"
+        )
+        return payload
+        
+    except Exception as e:
+        logger.error(f"Error fetching monitoring data: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import {
+    LineChart,
+    Line,
+    AreaChart,
+    Area,
+    BarChart,
+    Bar,
+    XAxis,
+    YAxis,
+    CartesianGrid,
+    Tooltip,
+    Legend,
+    ResponsiveContainer,
+    Cell
+} from 'recharts';
+import { ApiService } from '../../services/api';
+import { FaSync, FaClock, FaServer } from 'react-icons/fa';
+import HSBCLogo from '../../components/HSBCLogo';
+
+/**
+ * System Monitoring Dashboard
+ * Real-time CPU & Memory utilization analysis
+ * Streamlit-inspired clean design
+ */
+const SystemMonitoring = () => {
+    const DEFAULT_TIME_RANGE = '6h';
+    const MAX_POINTS = 600;
+    const MAX_CHART_POINTS = 300;
+
+    const [monitoringData, setMonitoringData] = useState([]);
+    const [isInitialLoading, setIsInitialLoading] = useState(true);
+    const [isRefreshing, setIsRefreshing] = useState(false);
+    const [error, setError] = useState(null);
+    const [autoRefresh, setAutoRefresh] = useState(false);
+    const [lastUpdated, setLastUpdated] = useState(null);
+    const [servers, setServers] = useState([]);
+    const [selectedServer, setSelectedServer] = useState(null);
+    const [serversLoaded, setServersLoaded] = useState(false);
+    const isFetchingRef = useRef(false);
+    const hasDataRef = useRef(false);
+
+    // Streamlit-like theme colors
+    const theme = {
+        background: '#FAFAFA',
+        card: '#FFFFFF',
+        border: '#E0E0E0',
+        text: {
+            primary: '#262730',
+            secondary: '#808495'
+        },
+        colors: {
+            blue: '#0068C9',
+            green: '#09AB3B',
+            orange: '#FF8700',
+            red: '#FF2B2B',
+            purple: '#7D3AC1'
+        }
+    };
+
+    // Fetch available servers
+    const fetchServers = useCallback(async () => {
+        try {
+            const response = await ApiService.getMonitoringServers();
+            if (response.success && response.servers) {
+                setServers(response.servers);
+                // Auto-select first server if available and none selected
+                if (response.servers.length > 0) {
+                    setSelectedServer(prev => prev || response.servers[0].log_file);
+                }
+            }
+        } catch (err) {
+            // silently ignore - servers list is optional
+        } finally {
+            setServersLoaded(true);
+        }
+    }, []); // No dependencies - runs once on mount
+
+    // Fetch monitoring data
+    const fetchMonitoringData = useCallback(async ({ background = false } = {}) => {
+        if (isFetchingRef.current) {
+            return;
+        }
+
+        isFetchingRef.current = true;
+
+        try {
+            const hasData = hasDataRef.current;
+
+            if (background || hasData) {
+                setIsRefreshing(true);
+            } else {
+                setIsInitialLoading(true);
+            }
+            setError(null);
+
+            const response = await ApiService.getSystemMonitoring(
+                DEFAULT_TIME_RANGE,
+                selectedServer,
+                MAX_POINTS
+            );
+
+            const nextData = response.data || [];
+            hasDataRef.current = nextData.length > 0;
+            setMonitoringData(nextData);
+            setLastUpdated(new Date());
+        } catch (err) {
+            setError(err.message || 'Failed to load monitoring data');
+        } finally {
+            setIsInitialLoading(false);
+            setIsRefreshing(false);
+            isFetchingRef.current = false;
+        }
+    }, [selectedServer]);
+
+    // Fetch servers on mount
+    useEffect(() => {
+        fetchServers();
+    }, [fetchServers]);
+
+    // Initial load and re-fetch when selectedServer changes
+    useEffect(() => {
+        if (!serversLoaded) return;
+        if (servers.length > 0 && !selectedServer) return;
+
+        fetchMonitoringData();
+    }, [fetchMonitoringData, selectedServer, servers.length, serversLoaded]);
+
+    // Auto-refresh effect
+    useEffect(() => {
+        if (!autoRefresh) return;
+
+        const interval = setInterval(() => {
+            fetchMonitoringData({ background: true });
+        }, 30000); // Refresh every 30 seconds
+
+        return () => clearInterval(interval);
+    }, [autoRefresh, fetchMonitoringData]);
+
+    const filteredData = useMemo(() => {
+        return monitoringData || [];
+    }, [monitoringData]);
+
+    // Transform data for Recharts
+    const chartData = useMemo(() => {
+        if (!filteredData.length) {
+            return [];
+        }
+
+        const step = Math.max(1, Math.ceil(filteredData.length / MAX_CHART_POINTS));
+        const sampledData = step > 1 ? filteredData.filter((_, idx) => idx % step === 0) : filteredData;
+
+        return sampledData.map((item) => ({
+            time: new Date(item.timestamp).toLocaleTimeString(),
+            timestamp: item.timestamp,
+            cpu: item.cpu_percent,
+            memory: item.mem_percent,
+            memoryUsed: item.mem_used / (1024 ** 3), // Convert to GB
+            memoryAvailable: item.mem_available / (1024 ** 3), // Convert to GB
+            frequency: item.frequency,
+            load1min: item.load_1min,
+            load5min: item.load_5min,
+            load15min: item.load_15min,
+            swap: item.swap_percent,
+            // For per-core data
+            coreData: item.core_usage || []
+        }));
+    }, [filteredData, MAX_CHART_POINTS]);
+
+    // Professional color palette
+    const chartColors = {
+        primary: '#2563eb',      // Blue
+        secondary: '#dc2626',    // Red  
+        success: '#16a34a',      // Green
+        warning: '#f59e0b',      // Amber
+        info: '#3b82f6',         // Light Blue
+        purple: '#9333ea',       // Purple
+        pink: '#ec4899',         // Pink
+        gray: '#6b7280'          // Gray
+    };
+
+    // Enhanced tooltip with better styling
+    const CustomTooltip = ({ active, payload, label }) => {
+        if (active && payload && payload.length) {
+            return (
+                <div style={{
+                    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+                    border: '1px solid #e5e7eb',
+                    borderRadius: '12px',
+                    padding: '16px',
+                    boxShadow: '0 10px 25px rgba(0, 0, 0, 0.15)',
+                    backdropFilter: 'blur(8px)',
+                    fontSize: '14px',
+                    minWidth: '200px'
+                }}>
+                    <div style={{
+                        marginBottom: '12px',
+                        fontWeight: '600',
+                        color: '#1f2937',
+                        fontSize: '15px',
+                        borderBottom: '1px solid #f3f4f6',
+                        paddingBottom: '8px'
+                    }}>
+                        📊 {label}
+                    </div>
+                    {payload.map((entry, index) => (
+                        <div key={index} style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            margin: '6px 0',
+                            padding: '4px 0'
+                        }}>
+                            <div style={{ display: 'flex', alignItems: 'center' }}>
+                                <div style={{
+                                    width: '12px',
+                                    height: '12px',
+                                    backgroundColor: entry.color,
+                                    borderRadius: '2px',
+                                    marginRight: '8px'
+                                }} />
+                                <span style={{ color: '#374151', fontWeight: '500' }}>
+                                    {entry.name || entry.dataKey}
+                                </span>
+                            </div>
+                            <span style={{
+                                fontWeight: '600',
+                                color: entry.color,
+                                backgroundColor: 'rgba(0,0,0,0.05)',
+                                padding: '2px 8px',
+                                borderRadius: '6px',
+                                fontSize: '13px'
+                            }}>
+                                {entry.value}{entry.dataKey.includes('memory') && entry.dataKey !== 'memory' ? ' GB' :
+                                    entry.dataKey.includes('frequency') ? ' MHz' :
+                                        entry.dataKey.includes('load') || entry.dataKey === 'cpu' || entry.dataKey === 'memory' || entry.dataKey === 'swap' ? '%' : ''}
+                            </span>
+                        </div>
+                    ))}
+                </div>
+            );
+        }
+        return null;
+    };
+
+    // Calculate statistics
+    const stats = useMemo(() => {
+        if (!filteredData.length) {
+            return null;
+        }
+
+        const latest = filteredData[filteredData.length - 1];
+        const previous = filteredData.length > 1 ? filteredData[filteredData.length - 2] : latest;
+        let cpuSum = 0;
+        let memSum = 0;
+        let cpuSqSum = 0;
+        let memSqSum = 0;
+        let cpuMin = Number.POSITIVE_INFINITY;
+        let memMin = Number.POSITIVE_INFINITY;
+        let cpuMax = Number.NEGATIVE_INFINITY;
+        let memMax = Number.NEGATIVE_INFINITY;
+
+        filteredData.forEach((item) => {
+            const cpu = item.cpu_percent;
+            const memory = item.mem_percent;
+
+            cpuSum += cpu;
+            memSum += memory;
+            cpuSqSum += cpu * cpu;
+            memSqSum += memory * memory;
+            cpuMin = Math.min(cpuMin, cpu);
+            memMin = Math.min(memMin, memory);
+            cpuMax = Math.max(cpuMax, cpu);
+            memMax = Math.max(memMax, memory);
+        });
+
+        const count = filteredData.length;
+        const cpuAverage = cpuSum / count;
+        const memAverage = memSum / count;
+        const cpuVariance = Math.max((cpuSqSum / count) - (cpuAverage * cpuAverage), 0);
+        const memVariance = Math.max((memSqSum / count) - (memAverage * memAverage), 0);
+
+        return {
+            current: {
+                cpu: latest.cpu_percent,
+                memory: latest.mem_percent,
+                memUsedGB: latest.mem_used / (1024 ** 3),
+                memAvailGB: latest.mem_available / (1024 ** 3),
+                memTotalGB: latest.mem_total / (1024 ** 3),
+                frequency: latest.frequency,
+                load: {
+                    min1: latest.load_1min,
+                    min5: latest.load_5min,
+                    min15: latest.load_15min
+                },
+                swap: latest.swap_percent
+            },
+            delta: {
+                cpu: latest.cpu_percent - previous.cpu_percent,
+                memory: latest.mem_percent - previous.mem_percent
+            },
+            averages: {
+                cpu: cpuAverage,
+                memory: memAverage
+            },
+            peaks: {
+                cpu: cpuMax,
+                memory: memMax
+            },
+            mins: {
+                cpu: cpuMin,
+                memory: memMin
+            },
+            std: {
+                cpu: Math.sqrt(cpuVariance),
+                memory: Math.sqrt(memVariance)
+            }
+        };
+    }, [filteredData]);
+
+    // Streamlit-like Metric Card Component
+    const MetricCard = ({ title, value, delta }) => (
+        <div style={{
+            backgroundColor: theme.card,
+            border: `1px solid ${theme.border}`,
+            borderRadius: '8px',
+            padding: '24px 20px',
+            boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+        }}>
+            <div style={{
+                fontSize: '14px',
+                color: theme.text.secondary,
+                marginBottom: '8px',
+                fontWeight: '400'
+            }}>
+                {title}
+            </div>
+            <div style={{
+                fontSize: '36px',
+                fontWeight: '600',
+                color: theme.text.primary,
+                lineHeight: '1'
+            }}>
+                {value}
+            </div>
+            {delta !== undefined && delta !== null && (
+                <div style={{
+                    fontSize: '14px',
+                    marginTop: '8px',
+                    color: delta >= 0 ? theme.colors.green : theme.colors.red,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '4px'
+                }}>
+                    <span>{delta >= 0 ? '↑' : '↓'}</span>
+                    <span>{Math.abs(delta).toFixed(1)}%</span>
+                </div>
+            )}
+        </div>
+    );
+
+    if (error) {
+        return (
+            <div style={{
+                minHeight: '100vh',
+                backgroundColor: theme.background,
+                padding: '2rem'
+            }}>
+                <div style={{ maxWidth: '800px', margin: '0 auto' }}>
+                    <div style={{
+                        backgroundColor: '#FFF5F5',
+                        border: `1px solid ${theme.colors.red}`,
+                        borderRadius: '8px',
+                        padding: '24px',
+                        marginTop: '48px'
+                    }}>
+                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '12px', marginBottom: '16px' }}>
+                            <FaServer style={{ color: theme.colors.red, fontSize: '24px', marginTop: '4px' }} />
+                            <div>
+                                <h3 style={{ fontSize: '18px', fontWeight: '600', color: theme.text.primary, marginBottom: '8px' }}>
+                                    Monitoring Data Unavailable
+                                </h3>
+                                <p style={{ fontSize: '14px', color: theme.text.secondary }}>
+                                    {error}
+                                </p>
+                            </div>
+                        </div>
+                        <div style={{
+                            backgroundColor: theme.card,
+                            borderRadius: '6px',
+                            padding: '16px',
+                            marginTop: '16px',
+                            fontSize: '14px',
+                            color: theme.text.secondary
+                        }}>
+                            <p style={{ marginBottom: '12px' }}>💡 <strong>To enable monitoring:</strong></p>
+                            <ol style={{ paddingLeft: '20px', lineHeight: '1.8' }}>
+                                <li>Ensure the monitoring script is running on the server</li>
+                                <li>Check that the API endpoint is accessible</li>
+                                <li>Verify the log file path is correct</li>
+                            </ol>
+                        </div>
+                        <button
+                            onClick={() => fetchMonitoringData()}
+                            style={{
+                                marginTop: '16px',
+                                padding: '10px 20px',
+                                backgroundColor: theme.colors.red,
+                                color: 'white',
+                                border: 'none',
+                                borderRadius: '6px',
+                                cursor: 'pointer',
+                                fontSize: '14px',
+                                fontWeight: '500',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '8px'
+                            }}
+                            onMouseEnter={(e) => e.target.style.opacity = '0.9'}
+                            onMouseLeave={(e) => e.target.style.opacity = '1'}
+                        >
+                            <FaSync />
+                            Retry
+                        </button>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="monitoring-container" style={{ minHeight: '100vh', backgroundColor: 'white' }}>
+            {/* Header - Same as Completeness Control */}
+            <div
+                className="border-b border-slate-200 px-8 py-4"
+                style={{
+                    backgroundColor: 'white',
+                    height: '80px',
+                    boxShadow: `
+                        0 4px 8px rgba(0,0,0,0.15),
+                        0 8px 16px rgba(0,0,0,0.1),
+                        0 2px 4px rgba(0,0,0,0.1),
+                        inset 0 2px 0 rgba(255,255,255,0.8),
+                        inset 0 -2px 0 rgba(0,0,0,0.1)
+                    `
+                }}
+            >
+                <div className="flex items-center justify-between h-full">
+                    {/* HSBC Logo - Left */}
+                    <div className="flex items-center flex-shrink-0">
+                        <HSBCLogo height={64} className="mr-4" />
+                    </div>
+
+                    {/* Title - Center */}
+                    <div className="flex-1 flex justify-center">
+                        <h1 className="text-2xl font-bold text-black text-center">
+                            SYSTEM MONITORING DASHBOARD
+                        </h1>
+                    </div>
+
+                    {/* Last Updated Indicator - Right */}
+                    <div className="flex-shrink-0 flex items-center gap-2">
+                        {lastUpdated && (
+                            <div className="px-3 py-1 rounded-lg text-sm font-medium bg-blue-100 text-blue-800 flex items-center gap-2">
+                                <FaClock />
+                                {lastUpdated.toLocaleTimeString()}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+
+            {/* Main Content */}
+            <div style={{
+                backgroundColor: theme.background,
+                padding: '2rem 3rem',
+                minHeight: 'calc(100vh - 80px)'
+            }}>
+
+                {/* Sidebar Controls - Streamlit style */}
+                <div style={{
+                    backgroundColor: theme.card,
+                    border: `1px solid ${theme.border}`,
+                    borderRadius: '8px',
+                    padding: '20px',
+                    marginBottom: '24px',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                }}>
+                    <h3 style={{
+                        fontSize: '16px',
+                        fontWeight: '600',
+                        color: theme.text.primary,
+                        marginBottom: '16px'
+                    }}>
+                        ⚙️ Configuration
+                    </h3>
+
+                    {/* Server Selector */}
+                    {servers.length > 0 && (
+                        <div style={{ marginBottom: '16px' }}>
+                            <label style={{
+                                fontSize: '14px',
+                                fontWeight: '500',
+                                color: theme.text.secondary,
+                                display: 'block',
+                                marginBottom: '8px'
+                            }}>
+                                Select Server
+                            </label>
+                            <select
+                                value={selectedServer || ''}
+                                onChange={(e) => setSelectedServer(e.target.value)}
+                                style={{
+                                    width: '100%',
+                                    padding: '10px 12px',
+                                    border: `1px solid ${theme.border}`,
+                                    borderRadius: '6px',
+                                    fontSize: '14px',
+                                    color: theme.text.primary,
+                                    backgroundColor: theme.card,
+                                    cursor: 'pointer',
+                                    outline: 'none'
+                                }}
+                            >
+                                {servers.map((server) => (
+                                    <option key={server.log_file} value={server.log_file}>
+                                        {server.server_name} ({server.size_mb} MB)
+                                    </option>
+                                ))}
+                            </select>
+                            {servers.length > 1 && (
+                                <div style={{
+                                    marginTop: '8px',
+                                    fontSize: '12px',
+                                    color: theme.text.secondary
+                                }}>
+                                    💡 {servers.length} servers available for monitoring
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Auto-refresh Toggle */}
+                    <div style={{ marginBottom: '12px' }}>
+                        <label style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            cursor: 'pointer',
+                            fontSize: '14px',
+                            color: theme.text.primary
+                        }}>
+                            <input
+                                type="checkbox"
+                                checked={autoRefresh}
+                                onChange={(e) => setAutoRefresh(e.target.checked)}
+                                style={{
+                                    width: '18px',
+                                    height: '18px',
+                                    cursor: 'pointer',
+                                    accentColor: theme.colors.blue
+                                }}
+                            />
+                            <span>Auto-refresh (every 30s)</span>
+                        </label>
+                        {autoRefresh && (
+                            <div style={{
+                                marginTop: '8px',
+                                padding: '8px 12px',
+                                backgroundColor: '#E7F5FF',
+                                borderRadius: '4px',
+                                fontSize: '13px',
+                                color: theme.colors.blue
+                            }}>
+                                ℹ️ Dashboard will refresh automatically
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Refresh Button */}
+                    <button
+                        onClick={() => fetchMonitoringData({ background: true })}
+                        disabled={isInitialLoading || isRefreshing}
+                        style={{
+                            width: '100%',
+                            padding: '10px 16px',
+                            backgroundColor: theme.colors.blue,
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: '6px',
+                            cursor: (isInitialLoading || isRefreshing) ? 'not-allowed' : 'pointer',
+                            fontSize: '14px',
+                            fontWeight: '500',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: '8px',
+                            opacity: (isInitialLoading || isRefreshing) ? 0.6 : 1
+                        }}
+                        onMouseEnter={(e) => !(isInitialLoading || isRefreshing) && (e.target.style.opacity = '0.9')}
+                        onMouseLeave={(e) => !(isInitialLoading || isRefreshing) && (e.target.style.opacity = '1')}
+                    >
+                        <FaSync className={(isInitialLoading || isRefreshing) ? 'animate-spin' : ''} />
+                        {isRefreshing ? 'Refreshing...' : 'Refresh Now'}
+                    </button>
+                </div>
+
+                {/* Loading State */}
+                {isInitialLoading && !stats && (
+                    <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        padding: '48px 0',
+                        backgroundColor: theme.card,
+                        borderRadius: '8px',
+                        border: `1px solid ${theme.border}`
+                    }}>
+                        <div style={{ textAlign: 'center' }}>
+                            <FaSync style={{
+                                fontSize: '32px',
+                                color: theme.colors.blue,
+                                marginBottom: '12px'
+                            }} className="animate-spin" />
+                            <p style={{ fontSize: '14px', color: theme.text.secondary }}>
+                                Loading monitoring data...
+                            </p>
+                        </div>
+                    </div>
+                )}
+
+                {isRefreshing && stats && (
+                    <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                        marginBottom: '16px',
+                        padding: '10px 14px',
+                        backgroundColor: '#E7F5FF',
+                        border: `1px solid ${theme.border}`,
+                        borderRadius: '8px',
+                        color: theme.colors.blue,
+                        fontSize: '14px',
+                        fontWeight: '500'
+                    }}>
+                        <FaSync className="animate-spin" />
+                        Refreshing monitoring data...
+                    </div>
+                )}
+
+                {/* Statistics */}
+                {stats && (
+                    <>
+                        {/* Current Metrics - Streamlit style */}
+                        <div style={{ marginBottom: '32px' }}>
+                            <h2 style={{
+                                fontSize: '28px',
+                                fontWeight: '600',
+                                color: theme.text.primary,
+                                marginBottom: '20px'
+                            }}>
+                                📈 Current Statistics
+                            </h2>
+                            <div style={{
+                                display: 'grid',
+                                gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                                gap: '16px'
+                            }}>
+                                <MetricCard
+                                    title="Current CPU Usage"
+                                    value={`${stats.current.cpu.toFixed(1)}%`}
+                                    delta={stats.delta.cpu}
+                                />
+                                <MetricCard
+                                    title="Average CPU"
+                                    value={`${stats.averages.cpu.toFixed(1)}%`}
+                                />
+                                <MetricCard
+                                    title="Peak CPU"
+                                    value={`${stats.peaks.cpu.toFixed(1)}%`}
+                                />
+                                <MetricCard
+                                    title="Memory Usage"
+                                    value={`${stats.current.memory.toFixed(1)}%`}
+                                    delta={stats.delta.memory}
+                                />
+                                <MetricCard
+                                    title="Memory Used"
+                                    value={`${stats.current.memUsedGB.toFixed(2)} GB`}
+                                />
+                                <MetricCard
+                                    title="Memory Available"
+                                    value={`${stats.current.memAvailGB.toFixed(2)} GB`}
+                                />
+                            </div>
+                        </div>
+
+                        {/* Main Charts - Streamlit style */}
+                        <div style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fit, minmax(500px, 1fr))',
+                            gap: '20px',
+                            marginBottom: '32px'
+                        }}>
+                            {/* CPU Usage Chart */}
+                            <div style={{
+                                backgroundColor: theme.card,
+                                border: `1px solid ${theme.border}`,
+                                borderRadius: '8px',
+                                padding: '24px',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                            }}>
+                                <h3 style={{
+                                    fontSize: '18px',
+                                    fontWeight: '600',
+                                    color: theme.text.primary,
+                                    marginBottom: '16px'
+                                }}>
+                                    💻 CPU Usage Over Time
+                                </h3>
+                                <ResponsiveContainer width="100%" height={350}>
+                                    <AreaChart data={chartData} margin={{ top: 20, right: 40, left: 20, bottom: 80 }}>
+                                        <defs>
+                                            <linearGradient id="cpuGradient" x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="5%" stopColor={chartColors.primary} stopOpacity={0.4} />
+                                                <stop offset="50%" stopColor={chartColors.primary} stopOpacity={0.2} />
+                                                <stop offset="95%" stopColor={chartColors.primary} stopOpacity={0.05} />
+                                            </linearGradient>
+                                        </defs>
+                                        <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                        <XAxis
+                                            dataKey="time"
+                                            stroke="#64748b"
+                                            fontSize={11}
+                                            tick={{ fontSize: 10, fill: '#64748b', angle: -90, textAnchor: 'end' }}
+                                            axisLine={false}
+                                            tickLine={false}
+                                            height={80}
+                                        />
+                                        <YAxis
+                                            domain={[0, 100]}
+                                            stroke="#64748b"
+                                            fontSize={11}
+                                            tick={{ fontSize: 10, fill: '#64748b' }}
+                                            axisLine={false}
+                                            tickLine={false}
+                                            width={60}
+                                            label={{
+                                                value: 'CPU Usage (%)',
+                                                angle: -90,
+                                                position: 'insideLeft',
+                                                style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                            }}
+                                        />
+                                        <Tooltip content={<CustomTooltip />} />
+                                        <Area
+                                            type="monotone"
+                                            dataKey="cpu"
+                                            stroke={chartColors.primary}
+                                            strokeWidth={3}
+                                            fillOpacity={1}
+                                            fill="url(#cpuGradient)"
+                                            dot={false}
+                                            activeDot={{
+                                                r: 6,
+                                                stroke: chartColors.primary,
+                                                strokeWidth: 2,
+                                                fill: 'white'
+                                            }}
+                                        />
+                                    </AreaChart>
+                                </ResponsiveContainer>
+                            </div>
+
+                            {/* Memory Usage Chart */}
+                            <div style={{
+                                backgroundColor: theme.card,
+                                border: `1px solid ${theme.border}`,
+                                borderRadius: '8px',
+                                padding: '24px',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                            }}>
+                                <h3 style={{
+                                    fontSize: '18px',
+                                    fontWeight: '600',
+                                    color: theme.text.primary,
+                                    marginBottom: '16px'
+                                }}>
+                                    🧠 Memory Usage Over Time
+                                </h3>
+                                <ResponsiveContainer width="100%" height={350}>
+                                    <AreaChart data={chartData} margin={{ top: 20, right: 40, left: 20, bottom: 80 }}>
+                                        <defs>
+                                            <linearGradient id="memoryGradient" x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="5%" stopColor={chartColors.warning} stopOpacity={0.4} />
+                                                <stop offset="50%" stopColor={chartColors.warning} stopOpacity={0.2} />
+                                                <stop offset="95%" stopColor={chartColors.warning} stopOpacity={0.05} />
+                                            </linearGradient>
+                                        </defs>
+                                        <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                        <XAxis
+                                            dataKey="time"
+                                            stroke="#64748b"
+                                            fontSize={11}
+                                            tick={{ fontSize: 10, fill: '#64748b', angle: -90, textAnchor: 'end' }}
+                                            axisLine={false}
+                                            tickLine={false}
+                                            height={80}
+                                        />
+                                        <YAxis
+                                            domain={[0, 100]}
+                                            stroke="#64748b"
+                                            fontSize={11}
+                                            tick={{ fontSize: 10, fill: '#64748b' }}
+                                            axisLine={false}
+                                            tickLine={false}
+                                            width={60}
+                                            label={{
+                                                value: 'Memory Usage (%)',
+                                                angle: -90,
+                                                position: 'insideLeft',
+                                                style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                            }}
+                                        />
+                                        <Tooltip content={<CustomTooltip />} />
+                                        <Area
+                                            type="monotone"
+                                            dataKey="memory"
+                                            stroke={chartColors.warning}
+                                            strokeWidth={3}
+                                            fillOpacity={1}
+                                            fill="url(#memoryGradient)"
+                                            dot={false}
+                                            activeDot={{
+                                                r: 6,
+                                                stroke: chartColors.warning,
+                                                strokeWidth: 2,
+                                                fill: 'white'
+                                            }}
+                                        />
+                                    </AreaChart>
+                                </ResponsiveContainer>
+                            </div>
+                        </div>
+
+                        {/* Memory Details - Streamlit style */}
+                        <div style={{
+                            backgroundColor: theme.card,
+                            border: `1px solid ${theme.border}`,
+                            borderRadius: '8px',
+                            padding: '24px',
+                            marginBottom: '32px',
+                            boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                        }}>
+                            <h3 style={{
+                                fontSize: '18px',
+                                fontWeight: '600',
+                                color: theme.text.primary,
+                                marginBottom: '16px'
+                            }}>
+                                💾 Memory Details (GB)
+                            </h3>
+                            <ResponsiveContainer width="100%" height={350}>
+                                <AreaChart data={chartData} margin={{ top: 20, right: 40, left: 20, bottom: 80 }}>
+                                    <defs>
+                                        <linearGradient id="memoryUsedGradient" x1="0" y1="0" x2="0" y2="1">
+                                            <stop offset="5%" stopColor={chartColors.secondary} stopOpacity={0.4} />
+                                            <stop offset="50%" stopColor={chartColors.secondary} stopOpacity={0.2} />
+                                            <stop offset="95%" stopColor={chartColors.secondary} stopOpacity={0.05} />
+                                        </linearGradient>
+                                        <linearGradient id="memoryAvailableGradient" x1="0" y1="0" x2="0" y2="1">
+                                            <stop offset="5%" stopColor={chartColors.success} stopOpacity={0.4} />
+                                            <stop offset="50%" stopColor={chartColors.success} stopOpacity={0.2} />
+                                            <stop offset="95%" stopColor={chartColors.success} stopOpacity={0.05} />
+                                        </linearGradient>
+                                    </defs>
+                                    <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                    <XAxis
+                                        dataKey="time"
+                                        stroke="#64748b"
+                                        fontSize={11}
+                                        tick={{ fontSize: 10, fill: '#64748b', angle: -90, textAnchor: 'end' }}
+                                        axisLine={false}
+                                        tickLine={false}
+                                        height={80}
+                                    />
+                                    <YAxis
+                                        stroke="#64748b"
+                                        fontSize={11}
+                                        tick={{ fontSize: 10, fill: '#64748b' }}
+                                        axisLine={false}
+                                        tickLine={false}
+                                        width={60}
+                                        label={{
+                                            value: 'Memory (GB)',
+                                            angle: -90,
+                                            position: 'insideLeft',
+                                            style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                        }}
+                                    />
+                                    <Tooltip content={<CustomTooltip />} />
+                                    <Legend
+                                        verticalAlign="top"
+                                        height={36}
+                                        iconType="circle"
+                                        wrapperStyle={{ paddingBottom: '10px' }}
+                                    />
+                                    <Area
+                                        type="monotone"
+                                        dataKey="memoryUsed"
+                                        stackId="1"
+                                        stroke={chartColors.secondary}
+                                        strokeWidth={3}
+                                        fillOpacity={1}
+                                        fill="url(#memoryUsedGradient)"
+                                        name="Used Memory"
+                                        dot={false}
+                                    />
+                                    <Area
+                                        type="monotone"
+                                        dataKey="memoryAvailable"
+                                        stackId="1"
+                                        stroke={chartColors.success}
+                                        strokeWidth={3}
+                                        fillOpacity={1}
+                                        fill="url(#memoryAvailableGradient)"
+                                        name="Available Memory"
+                                        dot={false}
+                                    />
+                                </AreaChart>
+                            </ResponsiveContainer>
+                            <div style={{ marginTop: '10px', fontSize: '12px', color: theme.text.secondary }}>
+                                📊 Green shows Available Memory, Red shows Used Memory
+                            </div>
+                        </div>
+
+                        {/* Additional Charts - Streamlit style */}
+                        <div style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fit, minmax(500px, 1fr))',
+                            gap: '20px',
+                            marginBottom: '32px'
+                        }}>
+                            {/* CPU Frequency */}
+                            {stats.current.frequency && (
+                                <div style={{
+                                    backgroundColor: theme.card,
+                                    border: `1px solid ${theme.border}`,
+                                    borderRadius: '8px',
+                                    padding: '24px',
+                                    boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                                }}>
+                                    <h3 style={{
+                                        fontSize: '18px',
+                                        fontWeight: '600',
+                                        color: theme.text.primary,
+                                        marginBottom: '16px'
+                                    }}>
+                                        🔄 CPU Frequency
+                                    </h3>
+                                    <ResponsiveContainer width="100%" height={300}>
+                                        <LineChart data={chartData} margin={{ top: 20, right: 40, left: 20, bottom: 80 }}>
+                                            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                            <XAxis
+                                                dataKey="time"
+                                                stroke="#64748b"
+                                                fontSize={11}
+                                                tick={{ fontSize: 10, fill: '#64748b', angle: -90, textAnchor: 'end' }}
+                                                axisLine={false}
+                                                tickLine={false}
+                                                height={80}
+                                            />
+                                            <YAxis
+                                                stroke="#64748b"
+                                                fontSize={11}
+                                                tick={{ fontSize: 10, fill: '#64748b' }}
+                                                axisLine={false}
+                                                tickLine={false}
+                                                width={60}
+                                                label={{
+                                                    value: 'Frequency (MHz)',
+                                                    angle: -90,
+                                                    position: 'insideLeft',
+                                                    style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                                }}
+                                            />
+                                            <Tooltip content={<CustomTooltip />} />
+                                            <Line
+                                                type="monotone"
+                                                dataKey="frequency"
+                                                stroke={chartColors.purple}
+                                                strokeWidth={3}
+                                                dot={{ r: 4, fill: chartColors.purple, stroke: 'white', strokeWidth: 2 }}
+                                                activeDot={{
+                                                    r: 8,
+                                                    stroke: chartColors.purple,
+                                                    strokeWidth: 3,
+                                                    fill: 'white',
+                                                    style: { filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.2))' }
+                                                }}
+                                            />
+                                        </LineChart>
+                                    </ResponsiveContainer>
+                                </div>
+                            )}
+
+                            {/* Load Average */}
+                            {stats.current.load.min1 !== undefined && (
+                                <div style={{
+                                    backgroundColor: theme.card,
+                                    border: `1px solid ${theme.border}`,
+                                    borderRadius: '8px',
+                                    padding: '24px',
+                                    boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                                }}>
+                                    <h3 style={{
+                                        fontSize: '18px',
+                                        fontWeight: '600',
+                                        color: theme.text.primary,
+                                        marginBottom: '16px'
+                                    }}>
+                                        ⚖️ Load Average
+                                    </h3>
+                                    <ResponsiveContainer width="100%" height={300}>
+                                        <LineChart data={chartData} margin={{ top: 20, right: 40, left: 20, bottom: 80 }}>
+                                            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                            <XAxis
+                                                dataKey="time"
+                                                stroke="#64748b"
+                                                fontSize={11}
+                                                tick={{ fontSize: 10, fill: '#64748b', angle: -90, textAnchor: 'end' }}
+                                                axisLine={false}
+                                                tickLine={false}
+                                                height={80}
+                                            />
+                                            <YAxis
+                                                stroke="#64748b"
+                                                fontSize={11}
+                                                tick={{ fontSize: 10, fill: '#64748b' }}
+                                                axisLine={false}
+                                                tickLine={false}
+                                                width={60}
+                                                label={{
+                                                    value: 'Load Average',
+                                                    angle: -90,
+                                                    position: 'insideLeft',
+                                                    style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                                }}
+                                            />
+                                            <Tooltip content={<CustomTooltip />} />
+                                            <Legend
+                                                verticalAlign="top"
+                                                height={36}
+                                                iconType="circle"
+                                                wrapperStyle={{ paddingBottom: '10px' }}
+                                            />
+                                            <Line
+                                                type="monotone"
+                                                dataKey="load1min"
+                                                stroke={chartColors.success}
+                                                strokeWidth={3}
+                                                dot={{ r: 4, fill: chartColors.success, stroke: 'white', strokeWidth: 2 }}
+                                                activeDot={{
+                                                    r: 8,
+                                                    stroke: chartColors.success,
+                                                    strokeWidth: 3,
+                                                    fill: 'white',
+                                                    style: { filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.2))' }
+                                                }}
+                                                name="1 min"
+                                            />
+                                            <Line
+                                                type="monotone"
+                                                dataKey="load5min"
+                                                stroke={chartColors.secondary}
+                                                strokeWidth={3}
+                                                dot={{ r: 4, fill: chartColors.secondary, stroke: 'white', strokeWidth: 2 }}
+                                                activeDot={{
+                                                    r: 8,
+                                                    stroke: chartColors.secondary,
+                                                    strokeWidth: 3,
+                                                    fill: 'white',
+                                                    style: { filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.2))' }
+                                                }}
+                                                name="5 min"
+                                            />
+                                            <Line
+                                                type="monotone"
+                                                dataKey="load15min"
+                                                stroke={chartColors.purple}
+                                                strokeWidth={3}
+                                                dot={{ r: 4, fill: chartColors.purple, stroke: 'white', strokeWidth: 2 }}
+                                                activeDot={{
+                                                    r: 8,
+                                                    stroke: chartColors.purple,
+                                                    strokeWidth: 3,
+                                                    fill: 'white',
+                                                    style: { filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.2))' }
+                                                }}
+                                                name="15 min"
+                                            />
+                                        </LineChart>
+                                    </ResponsiveContainer>
+                                    <div style={{ marginTop: '10px', fontSize: '12px', color: theme.text.secondary }}>
+                                        📊 Green: 1min, Red: 5min, Purple: 15min load averages
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Swap Usage - Streamlit style */}
+                        {stats.current.swap > 0 && (
+                            <div style={{
+                                backgroundColor: theme.card,
+                                border: `1px solid ${theme.border}`,
+                                borderRadius: '8px',
+                                padding: '24px',
+                                marginBottom: '32px',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                            }}>
+                                <h3 style={{
+                                    fontSize: '18px',
+                                    fontWeight: '600',
+                                    color: theme.text.primary,
+                                    marginBottom: '16px'
+                                }}>
+                                    🔄 Swap Memory Usage
+                                </h3>
+                                <ResponsiveContainer width="100%" height={300}>
+                                    <AreaChart data={chartData} margin={{ top: 20, right: 40, left: 20, bottom: 80 }}>
+                                        <defs>
+                                            <linearGradient id="swapGradient" x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="5%" stopColor={chartColors.pink} stopOpacity={0.4} />
+                                                <stop offset="50%" stopColor={chartColors.pink} stopOpacity={0.2} />
+                                                <stop offset="95%" stopColor={chartColors.pink} stopOpacity={0.05} />
+                                            </linearGradient>
+                                        </defs>
+                                        <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                        <XAxis
+                                            dataKey="time"
+                                            stroke="#64748b"
+                                            fontSize={11}
+                                            tick={{ fontSize: 10, fill: '#64748b', angle: -90, textAnchor: 'end' }}
+                                            axisLine={false}
+                                            tickLine={false}
+                                            height={80}
+                                        />
+                                        <YAxis
+                                            domain={[0, 100]}
+                                            stroke="#64748b"
+                                            fontSize={11}
+                                            tick={{ fontSize: 10, fill: '#64748b' }}
+                                            axisLine={false}
+                                            tickLine={false}
+                                            width={60}
+                                            label={{
+                                                value: 'Swap Usage (%)',
+                                                angle: -90,
+                                                position: 'insideLeft',
+                                                style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                            }}
+                                        />
+                                        <Tooltip content={<CustomTooltip />} />
+                                        <Area
+                                            type="monotone"
+                                            dataKey="swap"
+                                            stroke={chartColors.pink}
+                                            strokeWidth={3}
+                                            fillOpacity={1}
+                                            fill="url(#swapGradient)"
+                                            dot={false}
+                                            activeDot={{
+                                                r: 6,
+                                                stroke: chartColors.pink,
+                                                strokeWidth: 2,
+                                                fill: 'white'
+                                            }}
+                                        />
+                                    </AreaChart>
+                                </ResponsiveContainer>
+                            </div>
+                        )}
+
+                        {/* Per-Core CPU Usage Heatmap - Streamlit style */}
+                        {filteredData.length > 0 && filteredData[0].core_usage && filteredData[0].core_usage.length > 0 && (
+                            <div style={{
+                                backgroundColor: theme.card,
+                                border: `1px solid ${theme.border}`,
+                                borderRadius: '8px',
+                                padding: '24px',
+                                marginBottom: '32px',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                            }}>
+                                <h3 style={{
+                                    fontSize: '18px',
+                                    fontWeight: '600',
+                                    color: theme.text.primary,
+                                    marginBottom: '16px'
+                                }}>
+                                    🔥 Per-Core CPU Usage (Latest Sample)
+                                </h3>
+                                {(() => {
+                                    const latestData = filteredData[filteredData.length - 1];
+                                    if (!latestData || !latestData.core_usage) return <div>No core data available</div>;
+
+                                    // Helper function to get color based on usage
+                                    const getColorForUsage = (usage) => {
+                                        if (usage > 80) return chartColors.secondary; // Red for high
+                                        if (usage > 60) return chartColors.warning;   // Amber for medium
+                                        return chartColors.success;                    // Green for low
+                                    };
+
+                                    const coreData = latestData.core_usage.map((usage, index) => ({
+                                        core: `Core ${index}`,
+                                        usage: usage,
+                                        fill: getColorForUsage(usage)
+                                    }));
+
+                                    return (
+                                        <ResponsiveContainer width="100%" height={350}>
+                                            <BarChart data={coreData} margin={{ top: 20, right: 40, left: 20, bottom: 20 }}>
+                                                <defs>
+                                                    {/* Gradients for each color state */}
+                                                    <linearGradient id="coreGradientGreen" x1="0" y1="0" x2="0" y2="1">
+                                                        <stop offset="5%" stopColor={chartColors.success} stopOpacity={0.9} />
+                                                        <stop offset="95%" stopColor={chartColors.success} stopOpacity={0.6} />
+                                                    </linearGradient>
+                                                    <linearGradient id="coreGradientAmber" x1="0" y1="0" x2="0" y2="1">
+                                                        <stop offset="5%" stopColor={chartColors.warning} stopOpacity={0.9} />
+                                                        <stop offset="95%" stopColor={chartColors.warning} stopOpacity={0.6} />
+                                                    </linearGradient>
+                                                    <linearGradient id="coreGradientRed" x1="0" y1="0" x2="0" y2="1">
+                                                        <stop offset="5%" stopColor={chartColors.secondary} stopOpacity={0.9} />
+                                                        <stop offset="95%" stopColor={chartColors.secondary} stopOpacity={0.6} />
+                                                    </linearGradient>
+                                                </defs>
+                                                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" strokeWidth={1} />
+                                                <XAxis
+                                                    dataKey="core"
+                                                    stroke="#64748b"
+                                                    fontSize={11}
+                                                    tick={{ fontSize: 10, fill: '#64748b' }}
+                                                    axisLine={false}
+                                                    tickLine={false}
+                                                    height={40}
+                                                />
+                                                <YAxis
+                                                    domain={[0, 100]}
+                                                    stroke="#64748b"
+                                                    fontSize={11}
+                                                    tick={{ fontSize: 10, fill: '#64748b' }}
+                                                    axisLine={false}
+                                                    tickLine={false}
+                                                    width={60}
+                                                    label={{
+                                                        value: 'CPU Usage (%)',
+                                                        angle: -90,
+                                                        position: 'insideLeft',
+                                                        style: { textAnchor: 'middle', fill: '#64748b', fontSize: '12px' }
+                                                    }}
+                                                />
+                                                <Tooltip
+                                                    content={({ active, payload, label }) => {
+                                                        if (active && payload && payload.length) {
+                                                            const value = payload[0].value;
+                                                            const color = getColorForUsage(value);
+
+                                                            return (
+                                                                <div style={{
+                                                                    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+                                                                    border: '1px solid #e5e7eb',
+                                                                    borderRadius: '12px',
+                                                                    padding: '16px',
+                                                                    boxShadow: '0 10px 25px rgba(0, 0, 0, 0.15)',
+                                                                    backdropFilter: 'blur(8px)',
+                                                                    fontSize: '14px',
+                                                                    minWidth: '150px'
+                                                                }}>
+                                                                    <div style={{
+                                                                        marginBottom: '8px',
+                                                                        fontWeight: '600',
+                                                                        color: '#1f2937',
+                                                                        fontSize: '15px'
+                                                                    }}>
+                                                                        🔥 {label}
+                                                                    </div>
+                                                                    <div style={{
+                                                                        display: 'flex',
+                                                                        alignItems: 'center',
+                                                                        justifyContent: 'space-between'
+                                                                    }}>
+                                                                        <span style={{ color: '#374151', fontWeight: '500' }}>
+                                                                            CPU Usage
+                                                                        </span>
+                                                                        <span style={{
+                                                                            fontWeight: '600',
+                                                                            color: color,
+                                                                            backgroundColor: 'rgba(0,0,0,0.05)',
+                                                                            padding: '4px 12px',
+                                                                            borderRadius: '8px',
+                                                                            fontSize: '16px'
+                                                                        }}>
+                                                                            {value.toFixed(1)}%
+                                                                        </span>
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        }
+                                                        return null;
+                                                    }}
+                                                />
+                                                <Bar
+                                                    dataKey="usage"
+                                                    radius={[6, 6, 0, 0]}
+                                                >
+                                                    {coreData.map((entry, index) => {
+                                                        let gradientId = 'coreGradientGreen';
+                                                        if (entry.usage > 80) gradientId = 'coreGradientRed';
+                                                        else if (entry.usage > 60) gradientId = 'coreGradientAmber';
+
+                                                        return (
+                                                            <Cell
+                                                                key={`cell-${index}`}
+                                                                fill={`url(#${gradientId})`}
+                                                                stroke="rgba(255,255,255,0.3)"
+                                                                strokeWidth={1}
+                                                            />
+                                                        );
+                                                    })}
+                                                </Bar>
+                                            </BarChart>
+                                        </ResponsiveContainer>
+                                    );
+                                })()}
+                                <div style={{
+                                    marginTop: '12px',
+                                    fontSize: '13px',
+                                    color: theme.text.secondary,
+                                    textAlign: 'center'
+                                }}>
+                                    💡 Green = Low usage, Yellow = Moderate, Red = High usage
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Statistics Tables - Streamlit style */}
+                        <h2 style={{
+                            fontSize: '28px',
+                            fontWeight: '600',
+                            color: theme.text.primary,
+                            marginBottom: '20px',
+                            marginTop: '16px'
+                        }}>
+                            📊 Detailed Statistics
+                        </h2>
+                        <div style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fit, minmax(400px, 1fr))',
+                            gap: '20px',
+                            marginBottom: '32px'
+                        }}>
+                            {/* CPU Statistics */}
+                            <div style={{
+                                backgroundColor: theme.card,
+                                border: `1px solid ${theme.border}`,
+                                borderRadius: '8px',
+                                padding: '24px',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                            }}>
+                                <h3 style={{
+                                    fontSize: '16px',
+                                    fontWeight: '600',
+                                    color: theme.text.primary,
+                                    marginBottom: '16px'
+                                }}>
+                                    CPU Statistics
+                                </h3>
+                                <table style={{ width: '100%', fontSize: '14px', borderCollapse: 'collapse' }}>
+                                    <thead>
+                                        <tr style={{ borderBottom: `2px solid ${theme.border}` }}>
+                                            <th style={{
+                                                textAlign: 'left',
+                                                padding: '12px 0',
+                                                fontWeight: '500',
+                                                color: theme.text.secondary
+                                            }}>Metric</th>
+                                            <th style={{
+                                                textAlign: 'right',
+                                                padding: '12px 0',
+                                                fontWeight: '500',
+                                                color: theme.text.secondary
+                                            }}>Value</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody style={{ color: theme.text.primary }}>
+                                        <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
+                                            <td style={{ padding: '12px 0' }}>Average CPU</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.averages.cpu.toFixed(2)}%</td>
+                                        </tr>
+                                        <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
+                                            <td style={{ padding: '12px 0' }}>Minimum CPU</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.mins.cpu.toFixed(2)}%</td>
+                                        </tr>
+                                        <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
+                                            <td style={{ padding: '12px 0' }}>Maximum CPU</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.peaks.cpu.toFixed(2)}%</td>
+                                        </tr>
+                                        <tr>
+                                            <td style={{ padding: '12px 0' }}>Std Deviation</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.std.cpu.toFixed(2)}%</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            {/* Memory Statistics */}
+                            <div style={{
+                                backgroundColor: theme.card,
+                                border: `1px solid ${theme.border}`,
+                                borderRadius: '8px',
+                                padding: '24px',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.05)'
+                            }}>
+                                <h3 style={{
+                                    fontSize: '16px',
+                                    fontWeight: '600',
+                                    color: theme.text.primary,
+                                    marginBottom: '16px'
+                                }}>
+                                    Memory Statistics
+                                </h3>
+                                <table style={{ width: '100%', fontSize: '14px', borderCollapse: 'collapse' }}>
+                                    <thead>
+                                        <tr style={{ borderBottom: `2px solid ${theme.border}` }}>
+                                            <th style={{
+                                                textAlign: 'left',
+                                                padding: '12px 0',
+                                                fontWeight: '500',
+                                                color: theme.text.secondary
+                                            }}>Metric</th>
+                                            <th style={{
+                                                textAlign: 'right',
+                                                padding: '12px 0',
+                                                fontWeight: '500',
+                                                color: theme.text.secondary
+                                            }}>Value</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody style={{ color: theme.text.primary }}>
+                                        <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
+                                            <td style={{ padding: '12px 0' }}>Average Memory</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.averages.memory.toFixed(2)}%</td>
+                                        </tr>
+                                        <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
+                                            <td style={{ padding: '12px 0' }}>Minimum Memory</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.mins.memory.toFixed(2)}%</td>
+                                        </tr>
+                                        <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
+                                            <td style={{ padding: '12px 0' }}>Maximum Memory</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.peaks.memory.toFixed(2)}%</td>
+                                        </tr>
+                                        <tr>
+                                            <td style={{ padding: '12px 0' }}>Std Deviation</td>
+                                            <td style={{ textAlign: 'right', fontWeight: '500' }}>{stats.std.memory.toFixed(2)}%</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        {/* Footer - Streamlit style */}
+                        <div style={{
+                            backgroundColor: theme.card,
+                            border: `1px solid ${theme.border}`,
+                            borderRadius: '8px',
+                            padding: '16px 20px',
+                            marginTop: '24px',
+                            fontSize: '13px',
+                            color: theme.text.secondary
+                        }}>
+                            <div style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                flexWrap: 'wrap',
+                                gap: '12px'
+                            }}>
+                                <div>
+                                    <strong style={{ color: theme.text.primary }}>Server:</strong> {servers.find(s => s.log_file === selectedServer)?.server_name || 'Unknown'} (UTC)
+                                </div>
+                                <div>
+                                    <strong style={{ color: theme.text.primary }}>Last Updated:</strong> {new Date().toLocaleString()} ({Intl.DateTimeFormat().resolvedOptions().timeZone})
+                                </div>
+                                <div>
+                                    <strong style={{ color: theme.text.primary }}>Total Records:</strong> {filteredData.length}
+                                </div>
+                                {filteredData.length > 0 && (
+                                    <div style={{ width: '100%', marginTop: '8px', paddingTop: '12px', borderTop: `1px solid ${theme.border}` }}>
+                                        <strong style={{ color: theme.text.primary }}>Data Range:</strong>{' '}
+                                        {new Date(filteredData[0].timestamp).toLocaleString()} to {new Date(filteredData[filteredData.length - 1].timestamp).toLocaleString()}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </>
+                )}
+            </div>
+        </div>
+    );
+};
+
+export default SystemMonitoring;
+
+
+import psutil
+import time
+from datetime import datetime
+import sys
+
+DEFAULT_LOG_INTERVAL_SECONDS = 5
+
+
+def format_bytes(bytes_value):
+    """Format bytes to human-readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_value < 1024.0:
+            return f"{bytes_value:.2f}{unit}"
+        bytes_value /= 1024.0
+    return f"{bytes_value:.2f}PB"
+
+
+def get_load_average(cpu_percent):
+    """Return load average, with a Windows-friendly fallback."""
+    try:
+        return psutil.getloadavg()
+    except (AttributeError, OSError):
+        cpu_count = psutil.cpu_count() or 1
+        approx_load = cpu_percent / 100 * cpu_count
+        return (approx_load, approx_load, approx_load)
+
+
+def log_system_metrics(log_file="cpu_usage.log", interval_seconds=DEFAULT_LOG_INTERVAL_SECONDS):
+    """Log system metrics to file."""
+    print("=" * 80)
+    print("System Monitoring Started")
+    print(f"Logging to: {log_file}")
+    print(f"Interval: {interval_seconds} seconds")
+    print("Press Ctrl+C to stop")
+    print("=" * 80)
+
+    # Prime psutil counters so later reads are non-blocking.
+    psutil.cpu_percent(interval=None)
+    psutil.cpu_percent(interval=None, percpu=True)
+
+    with open(log_file, "a", buffering=1) as f:
+        f.write(f"\n{'=' * 80}\n")
+        f.write(f"Monitoring Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"{'=' * 80}\n")
+        f.flush()
+
+        while True:
+            try:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                cpu_percent = psutil.cpu_percent(interval=None)
+                cpu_freq = psutil.cpu_freq()
+                cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
+                load_avg = get_load_average(cpu_percent)
+
+                mem = psutil.virtual_memory()
+                swap = psutil.swap_memory()
+
+                current_freq = cpu_freq.current if cpu_freq else 0
+                log_line = (
+                    f"{timestamp} | "
+                    f"CPU: {cpu_percent:.1f}% | "
+                    f"Freq: {current_freq:.0f}MHz | "
+                    f"Load: {load_avg[0]:.2f}/{load_avg[1]:.2f}/{load_avg[2]:.2f} | "
+                    f"MEM: {mem.percent:.1f}% | "
+                    f"Used: {format_bytes(mem.used)} | "
+                    f"Avail: {format_bytes(mem.available)} | "
+                    f"Total: {format_bytes(mem.total)} | "
+                    f"SWAP: {swap.percent:.1f}% | "
+                    f"Per-Core: [{', '.join([f'{x:.1f}%' for x in cpu_per_core])}]\n"
+                )
+
+                f.write(log_line)
+                f.flush()
+
+                if int(time.time()) % max(interval_seconds * 10, 1) == 0:
+                    print(f"Monitoring active - CPU: {cpu_percent:.1f}% | MEM: {mem.percent:.1f}%")
+
+                time.sleep(interval_seconds)
+
+            except KeyboardInterrupt:
+                print("\n" + "=" * 80)
+                print("Monitoring stopped by user")
+                print(f"Log file: {log_file}")
+                print("=" * 80)
+                f.write(f"\n{'=' * 80}\n")
+                f.write(f"Monitoring Stopped: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"{'=' * 80}\n\n")
+                f.flush()
+                break
+            except Exception as e:
+                print(f"Error: {e}")
+                time.sleep(interval_seconds)
+
+
+if __name__ == "__main__":
+    log_file = "cpu_usage.log"
+    interval_seconds = DEFAULT_LOG_INTERVAL_SECONDS
+
+    if len(sys.argv) > 1:
+        log_file = sys.argv[1]
+
+    if len(sys.argv) > 2:
+        try:
+            interval_seconds = max(1, int(sys.argv[2]))
+        except ValueError:
+            print(f"Invalid interval '{sys.argv[2]}', using default {DEFAULT_LOG_INTERVAL_SECONDS}s")
+
+    log_system_metrics(log_file, interval_seconds)
+
