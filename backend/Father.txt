@@ -1,6 +1,9 @@
 """
 Combo chart builder — any number of bar + line series.
 
+Single true combo chart: bar series on left axis, line series on right axis.
+Uses pptx.oxml.OxmlElement throughout — no raw XML strings.
+
 Usage
 -----
 from similar_graph import add_combo_chart
@@ -12,15 +15,16 @@ add_combo_chart(
         {"label": "B", "values": [10, 20, 30, 20, 10]},
     ],
     line_series=[
-        {"label": "X", "values": [1, 3, 8, 3, 6]},
-        {"label": "Y", "values": [1, 2, 3, 6, 3]},
+        {"label": "X (Right)", "values": [1, 3, 8, 3, 6]},
+        {"label": "Y (Right)", "values": [1, 2, 3, 6, 3]},
     ],
     bar_axis={"min": 0, "max": 45, "unit": 5},
     line_axis={"min": 0, "max": 9,  "unit": 1},
 )
 
 # Slot into an existing shape / placeholder:
-#   shape = slide.shapes["MyBox"]     # or slide.placeholders[1]
+#   shape = slide.shapes["MyBox"]     # by name
+#   shape = slide.placeholders[1]     # by index
 #   add_combo_chart(..., left=shape.left, top=shape.top,
 #                        width=shape.width, height=shape.height)
 """
@@ -33,13 +37,9 @@ from lxml import etree
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
-from pptx.enum.chart import XL_CHART_TYPE, XL_TICK_LABEL_POSITION
-from pptx.enum.shapes import MSO_CONNECTOR
+from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION, XL_TICK_LABEL_POSITION
 from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
-
-_NS_C = "http://schemas.openxmlformats.org/drawingml/2006/chart"
-_NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
 
 # ── Default colour palettes ───────────────────────────────────────────────────
 
@@ -67,7 +67,7 @@ _LINE_COLORS: list[RGBColor] = [
 class SeriesSpec(TypedDict, total=False):
     label: str
     values: list[float]
-    color: RGBColor
+    color: RGBColor          # optional — falls back to palette
 
 
 class AxisSpec(TypedDict, total=False):
@@ -76,122 +76,175 @@ class AxisSpec(TypedDict, total=False):
     unit: float
 
 
-# ── XML helpers ───────────────────────────────────────────────────────────────
+# ── OxmlElement helpers ───────────────────────────────────────────────────────
 
-def _set_spPr_no_fill(element, spPr_ns: str = "c") -> None:
-    """Replace the fill on an existing spPr with noFill."""
-    spPr_tag = qn(f"{spPr_ns}:spPr")
-    spPr = element.find(spPr_tag)
-    if spPr is None:
-        spPr = etree.SubElement(element, spPr_tag)
-    for tag in ("a:solidFill", "a:noFill", "a:gradFill", "a:pattFill", "a:blipFill"):
-        for el in spPr.findall(qn(tag)):
-            spPr.remove(el)
-    etree.SubElement(spPr, qn("a:noFill"))
+def _el(tag: str, **attribs) -> etree._Element:
+    """Create a namespaced lxml element with optional attributes."""
+    e = etree.Element(qn(tag))
+    for k, v in attribs.items():
+        e.set(k, str(v))
+    return e
 
 
-def _make_chart_transparent(chart) -> None:
-    cs = chart._element
-    _set_spPr_no_fill(cs)
-    chart_el = cs.find(qn("c:chart"))
-    if chart_el is not None:
-        plot_area = chart_el.find(qn("c:plotArea"))
-        if plot_area is not None:
-            _set_spPr_no_fill(plot_area)
+def _child(parent, tag: str, **attribs) -> etree._Element:
+    """Create a namespaced lxml element, append to parent, return it."""
+    e = _el(tag, **attribs)
+    parent.append(e)
+    return e
 
 
-def _hide_axis(ax_element) -> None:
-    """Completely suppress an axis with c:delete val='1'."""
-    delete_el = ax_element.find(qn("c:delete"))
-    if delete_el is None:
-        delete_el = etree.Element(qn("c:delete"))
-        # Schema: delete comes after c:scaling
-        scaling = ax_element.find(qn("c:scaling"))
-        if scaling is not None:
-            scaling.addnext(delete_el)
-        else:
-            ax_element.insert(1, delete_el)
-    delete_el.set("val", "1")
+def _rgb_hex(color: RGBColor) -> str:
+    return "%02X%02X%02X" % (color[0], color[1], color[2])
 
 
-def _move_val_axis_right(chart) -> None:
-    """Relocate the value-axis line to the right edge of the chart."""
-    chart_el  = chart._element.find(qn("c:chart"))
-    if chart_el is None:
-        return
-    plot_area = chart_el.find(qn("c:plotArea"))
-    if plot_area is None:
-        return
-    val_ax = plot_area.find(qn("c:valAx"))
-    if val_ax is None:
-        return
+# ── Axis-ID reader ────────────────────────────────────────────────────────────
 
-    # c:axPos is required — always present in python-pptx generated XML
-    ax_pos = val_ax.find(qn("c:axPos"))
-    if ax_pos is not None:
-        ax_pos.set("val", "r")
-    else:
-        new_pos = etree.Element(qn("c:axPos"))
-        new_pos.set("val", "r")
-        scaling = val_ax.find(qn("c:scaling"))
-        if scaling is not None:
-            scaling.addnext(new_pos)
-        else:
-            val_ax.append(new_pos)
+def _read_ax_ids(chart) -> tuple[int, int]:
+    """Return (cat_ax_id, primary_val_ax_id) from a freshly created chart."""
+    pa     = chart._element.find(qn("c:chart")).find(qn("c:plotArea"))
+    cat_id = int(pa.find(qn("c:catAx")).find(qn("c:axId")).get("val"))
+    val_id = int(pa.find(qn("c:valAx")).find(qn("c:axId")).get("val"))
+    return cat_id, val_id
 
 
-def _add_bar_data_labels(
-    series_el,
-    label_rgb: tuple[int, int, int] = (255, 255, 255),
-    font_size_pt: int = 9,
+# ── Line series builder ───────────────────────────────────────────────────────
+
+def _make_line_series(
+    ser_idx: int,
+    spec: SeriesSpec,
+    categories: list[str],
+    color: RGBColor,
+) -> etree._Element:
+    """
+    Build a complete c:ser element for a line chart series.
+    All child elements created via _el/_child — no raw XML strings.
+    """
+    ser = _el("c:ser")
+    _child(ser, "c:idx",   val=ser_idx)
+    _child(ser, "c:order", val=ser_idx)
+
+    # series name
+    tx     = _child(ser, "c:tx")
+    strRef = _child(tx,     "c:strRef")
+    _child(strRef, "c:f")                       # empty formula reference
+    cache  = _child(strRef, "c:strCache")
+    _child(cache, "c:ptCount", val=1)
+    pt = _child(cache, "c:pt", idx=0)
+    _child(pt, "c:v").text = spec["label"]
+
+    # line colour and width
+    spPr = _child(ser, "c:spPr")
+    ln   = _child(spPr, "a:ln", w=str(int(Pt(2.25))))
+    sf   = _child(ln,   "a:solidFill")
+    _child(sf, "a:srgbClr", val=_rgb_hex(color))
+
+    # no markers
+    marker = _child(ser, "c:marker")
+    _child(marker, "c:symbol", val="none")
+
+    # categories
+    cat      = _child(ser, "c:cat")
+    strRef_c = _child(cat, "c:strRef")
+    _child(strRef_c, "c:f")
+    cache_c  = _child(strRef_c, "c:strCache")
+    _child(cache_c, "c:ptCount", val=len(categories))
+    for j, name in enumerate(categories):
+        p = _child(cache_c, "c:pt", idx=j)
+        _child(p, "c:v").text = str(name)
+
+    # values
+    val_el  = _child(ser, "c:val")
+    numRef  = _child(val_el, "c:numRef")
+    _child(numRef, "c:f")
+    cache_n = _child(numRef, "c:numCache")
+    _child(cache_n, "c:formatCode").text = "General"
+    _child(cache_n, "c:ptCount", val=len(spec["values"]))
+    for j, v in enumerate(spec["values"]):
+        p = _child(cache_n, "c:pt", idx=j)
+        _child(p, "c:v").text = str(v)
+
+    return ser
+
+
+# ── Line chart block ──────────────────────────────────────────────────────────
+
+def _append_line_chart(
+    plot_area,
+    categories: list[str],
+    line_specs: list[SeriesSpec],
+    colors: list[RGBColor],
+    cat_ax_id: int,
+    sec_ax_id: int,
+    bar_count: int,
+) -> None:
+    """Append a c:lineChart block to an existing plotArea."""
+    lc = _el("c:lineChart")
+    _child(lc, "c:grouping",  val="standard")
+    _child(lc, "c:varyColors", val="0")
+
+    for i, (spec, color) in enumerate(zip(line_specs, colors)):
+        lc.append(_make_line_series(bar_count + i, spec, categories, color))
+
+    # reference the shared category axis and the new secondary value axis
+    _child(lc, "c:axId", val=cat_ax_id)
+    _child(lc, "c:axId", val=sec_ax_id)
+
+    plot_area.append(lc)
+
+
+# ── Secondary value axis ──────────────────────────────────────────────────────
+
+def _add_secondary_val_axis(
+    plot_area,
+    sec_ax_id: int,
+    cat_ax_id: int,
+    axis_spec: AxisSpec,
 ) -> None:
     """
-    Inject inside-end value labels onto a bar series.
-    Uses etree.fromstring so namespace ordering is always valid.
-    Adds spPr/noFill so labels have no white box background.
+    Append a secondary (right-side) c:valAx to the plotArea.
+    Children written in schema-correct order:
+      axId → scaling → delete → axPos → numFmt → tickLblPos
+      → crossAx → crosses → crossBetween → majorUnit?
     """
-    old = series_el.find(qn("c:dLbls"))
-    if old is not None:
-        series_el.remove(old)
+    vax = _el("c:valAx")
+    _child(vax, "c:axId", val=sec_ax_id)
 
-    hex_color = "%02X%02X%02X" % label_rgb
-    sz        = font_size_pt * 100   # hundredths of a point
+    scaling = _child(vax, "c:scaling")
+    _child(scaling, "c:orientation", val="minMax")
+    if "max" in axis_spec:
+        _child(scaling, "c:max", val=axis_spec["max"])
+    if "min" in axis_spec:
+        _child(scaling, "c:min", val=axis_spec["min"])
 
-    xml_str = (
-        f'<c:dLbls xmlns:c="{_NS_C}" xmlns:a="{_NS_A}">'
-        # ── transparent label background ──
-        f'<c:spPr>'
-        f'<a:noFill/>'
-        f'<a:ln><a:noFill/></a:ln>'
-        f'</c:spPr>'
-        # ── font colour ──
-        f'<c:txPr>'
-        f'<a:bodyPr/>'
-        f'<a:lstStyle/>'
-        f'<a:p><a:pPr>'
-        f'<a:defRPr sz="{sz}" b="0">'
-        f'<a:solidFill><a:srgbClr val="{hex_color}"/></a:solidFill>'
-        f'</a:defRPr>'
-        f'</a:pPr></a:p>'
-        f'</c:txPr>'
-        # ── options ──
-        f'<c:dLblPos val="inEnd"/>'
-        f'<c:showLegendKey val="0"/>'
-        f'<c:showVal val="1"/>'
-        f'<c:showCatName val="0"/>'
-        f'<c:showSerName val="0"/>'
-        f'<c:showPercent val="0"/>'
-        f'<c:showBubbleSize val="0"/>'
-        f'</c:dLbls>'
-    )
-    dLbls = etree.fromstring(xml_str)
+    _child(vax, "c:delete",     val="0")
+    _child(vax, "c:axPos",      val="r")
+    _child(vax, "c:numFmt",     formatCode="General", sourceLinked="1")
+    _child(vax, "c:tickLblPos", val="nextTo")
+    _child(vax, "c:crossAx",    val=cat_ax_id)
+    _child(vax, "c:crosses",    val="max")          # axis line on right edge
+    _child(vax, "c:crossBetween", val="between")
 
-    # CT_BarSer schema: dLbls comes before c:cat
-    cat_el = series_el.find(qn("c:cat"))
-    if cat_el is not None:
-        cat_el.addprevious(dLbls)
+    if "unit" in axis_spec:
+        _child(vax, "c:majorUnit", val=axis_spec["unit"])
+
+    plot_area.append(vax)
+
+
+# ── Bar data-label position ───────────────────────────────────────────────────
+
+def _set_label_inside_end(series) -> None:
+    """
+    Set data label position to inside-end using OxmlElement.
+    Called after series.data_labels.show_value = True so the dLbls
+    element already exists; we insert c:dLblPos before c:showLegendKey.
+    """
+    dLbls    = series.data_labels._element
+    show_key = dLbls.find(qn("c:showLegendKey"))
+    pos      = _el("c:dLblPos", val="inEnd")
+    if show_key is not None:
+        show_key.addprevious(pos)
     else:
-        series_el.append(dLbls)
+        dLbls.append(pos)
 
 
 # ── Main function ─────────────────────────────────────────────────────────────
@@ -210,7 +263,8 @@ def add_combo_chart(
     height: int | None = None,
 ) -> Path:
     """
-    Build a combo chart slide and save to .pptx.
+    Build a true combo chart (single chart object, secondary right axis)
+    and save to a new .pptx file.
 
     Parameters
     ----------
@@ -219,9 +273,9 @@ def add_combo_chart(
     line_series  : [{label, values, color?}]  lines, right axis
     bar_axis     : {min?, max?, unit?} left Y axis
     line_axis    : {min?, max?, unit?} right Y axis
-    output_path  : destination path
+    output_path  : destination .pptx path
     left/top/width/height : position in EMUs — pass shape.left/top/width/height
-                            to fit the chart inside an existing shape/placeholder
+                            to slot the chart into an existing shape/placeholder
     """
     if not bar_series and not line_series:
         raise ValueError("Provide at least one bar or line series.")
@@ -237,105 +291,67 @@ def add_combo_chart(
     prs   = Presentation()
     slide = prs.slides.add_slide(prs.slide_layouts[6])
 
-    # ── Bar (column) chart — left axis ────────────────────────────────────────
+    # ── Step 1: Bar chart via python-pptx API (produces valid base XML) ───────
+    bar_data = CategoryChartData()
+    bar_data.categories = categories
     if bar_series:
-        bar_data = CategoryChartData()
-        bar_data.categories = categories
         for s in bar_series:
             bar_data.add_series(s["label"], s["values"])
+    else:
+        # dummy invisible series so we have a chart container for lines
+        bar_data.add_series("_", [0] * len(categories))
 
-        bar_shape = slide.shapes.add_chart(
-            XL_CHART_TYPE.COLUMN_CLUSTERED, _left, _top, _width, _height, bar_data
-        )
-        bar_chart = bar_shape.chart
-        bar_chart.has_title  = False
-        bar_chart.has_legend = False
+    chart_shape = slide.shapes.add_chart(
+        XL_CHART_TYPE.COLUMN_CLUSTERED, _left, _top, _width, _height, bar_data
+    )
+    chart = chart_shape.chart
 
-        bar_chart.value_axis.minimum_scale = bar_axis.get("min", 0)
-        if "max"  in bar_axis: bar_chart.value_axis.maximum_scale = bar_axis["max"]
-        if "unit" in bar_axis: bar_chart.value_axis.major_unit    = bar_axis["unit"]
-        bar_chart.value_axis.has_major_gridlines    = True
-        bar_chart.value_axis.tick_label_position    = XL_TICK_LABEL_POSITION.LOW
-        bar_chart.category_axis.tick_label_position = XL_TICK_LABEL_POSITION.LOW
-        bar_chart.plots[0].gap_width = 150
+    chart.has_title  = False
+    chart.has_legend = True
+    chart.legend.position          = XL_LEGEND_POSITION.BOTTOM
+    chart.legend.include_in_layout = False
 
+    # left (primary) axis
+    chart.value_axis.minimum_scale = bar_axis.get("min", 0)
+    if "max"  in bar_axis: chart.value_axis.maximum_scale = bar_axis["max"]
+    if "unit" in bar_axis: chart.value_axis.major_unit    = bar_axis["unit"]
+    chart.value_axis.has_major_gridlines    = True
+    chart.value_axis.tick_label_position    = XL_TICK_LABEL_POSITION.LOW
+    chart.category_axis.tick_label_position = XL_TICK_LABEL_POSITION.LOW
+    chart.plots[0].gap_width = 150
+
+    if bar_series:
         for i, s in enumerate(bar_series):
             color = s.get("color") or _BAR_COLORS[i % len(_BAR_COLORS)]
-            ser   = bar_chart.series[i]
+            ser   = chart.series[i]
             ser.format.fill.solid()
             ser.format.fill.fore_color.rgb = color
             ser.format.line.width = 0
-            _add_bar_data_labels(ser._element, label_rgb=(255, 255, 255))
+            ser.data_labels.show_value = True
+            _set_label_inside_end(ser)
 
-        _make_chart_transparent(bar_chart)
-
-    # ── Line chart — right axis (overlaid, transparent) ───────────────────────
+    # ── Step 2: Inject line chart + secondary axis via OxmlElement ────────────
     if line_series:
-        line_data = CategoryChartData()
-        line_data.categories = categories
-        for s in line_series:
-            line_data.add_series(s["label"], s["values"])
+        cat_ax_id, pri_val_id = _read_ax_ids(chart)
+        sec_ax_id = pri_val_id + 1          # unique ID not used by any existing axis
 
-        line_shape = slide.shapes.add_chart(
-            XL_CHART_TYPE.LINE, _left, _top, _width, _height, line_data
+        plot_area = (
+            chart._element
+            .find(qn("c:chart"))
+            .find(qn("c:plotArea"))
         )
-        line_chart = line_shape.chart
-        line_chart.has_title  = False
-        line_chart.has_legend = False
 
-        line_chart.value_axis.minimum_scale = line_axis.get("min", 0)
-        if "max"  in line_axis: line_chart.value_axis.maximum_scale = line_axis["max"]
-        if "unit" in line_axis: line_chart.value_axis.major_unit    = line_axis["unit"]
-        line_chart.value_axis.has_major_gridlines = False
-        line_chart.value_axis.tick_label_position = XL_TICK_LABEL_POSITION.HIGH
+        line_colors = [
+            s.get("color") or _LINE_COLORS[i % len(_LINE_COLORS)]
+            for i, s in enumerate(line_series)
+        ]
 
-        # Completely hide the category axis — bar chart already shows it
-        _hide_axis(line_chart.category_axis._element)
-        # Move value axis line to the right side
-        _move_val_axis_right(line_chart)
-        _make_chart_transparent(line_chart)
-
-        for i, s in enumerate(line_series):
-            color = s.get("color") or _LINE_COLORS[i % len(_LINE_COLORS)]
-            line_chart.series[i].format.line.color.rgb = color
-            line_chart.series[i].format.line.width     = Pt(2.25)
-            line_chart.series[i].marker.style          = None
-
-    # ── Coloured-text legend (no boxes) ───────────────────────────────────────
-    legend_items: list[tuple[str, RGBColor, str]] = []
-    for i, s in enumerate(bar_series):
-        legend_items.append((s["label"], s.get("color") or _BAR_COLORS[i % len(_BAR_COLORS)], "bar"))
-    for i, s in enumerate(line_series):
-        legend_items.append((s["label"], s.get("color") or _LINE_COLORS[i % len(_LINE_COLORS)], "line"))
-
-    total       = len(legend_items)
-    legend_top  = _top + _height + Inches(0.05)
-    item_w      = min(Inches(1.5), (_width - Inches(0.2)) / max(total, 1))
-    legend_left = _left + (_width - item_w * total) / 2
-
-    for idx, (label, color, kind) in enumerate(legend_items):
-        x = legend_left + item_w * idx
-        y = legend_top
-
-        if kind == "line":
-            # Short dash prefix so line entries are visually distinct from bars
-            conn = slide.shapes.add_connector(
-                MSO_CONNECTOR.STRAIGHT,
-                x, y + Inches(0.11), x + Inches(0.25), y + Inches(0.11),
-            )
-            conn.line.color.rgb = color
-            conn.line.width     = Pt(2.25)
-            text_x = x + Inches(0.30)
-        else:
-            text_x = x
-
-        tb  = slide.shapes.add_textbox(text_x, y - Inches(0.01), item_w - Inches(0.05), Inches(0.25))
-        p   = tb.text_frame.paragraphs[0]
-        run = p.add_run()
-        run.text           = label
-        run.font.size      = Pt(10)
-        run.font.bold      = True
-        run.font.color.rgb = color
+        _append_line_chart(
+            plot_area, categories, line_series, line_colors,
+            cat_ax_id, sec_ax_id,
+            bar_count=len(bar_series),
+        )
+        _add_secondary_val_axis(plot_area, sec_ax_id, cat_ax_id, line_axis)
 
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
