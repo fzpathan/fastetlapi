@@ -1,17 +1,80 @@
+"""
+Combo chart builder — any number of bar + line series.
+
+Usage example
+-------------
+from similar_graph import add_combo_chart
+from pptx.dml.color import RGBColor
+
+add_combo_chart(
+    categories=["D1", "D2", "D3", "D4", "D5"],
+    bar_series=[
+        {"label": "A", "values": [20, 40, 9, 12, 30]},
+        {"label": "B", "values": [10, 20, 30, 20, 10]},
+        {"label": "C", "values": [5, 15, 25, 15, 5]},
+    ],
+    line_series=[
+        {"label": "X (Right)", "values": [1, 3, 8, 3, 6]},
+        {"label": "Y (Right)", "values": [1, 2, 3, 6, 3]},
+    ],
+    bar_axis={"min": 0, "max": 45, "unit": 5},
+    line_axis={"min": 0, "max": 9,  "unit": 1},
+    output_path="my_chart.pptx",
+)
+"""
+
+from __future__ import annotations
+
 from pathlib import Path
+from typing import TypedDict
 
 from lxml import etree
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
 from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION, XL_TICK_LABEL_POSITION
-from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_CONNECTOR, MSO_SHAPE_TYPE
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_CONNECTOR
 from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
 
+# ── Default color palettes ────────────────────────────────────────────────────
 
-def _set_spPr_no_fill(element, spPr_ns="c"):
-    """Add a:noFill to the spPr child of a chart XML element."""
+_BAR_COLORS = [
+    RGBColor(68, 114, 196),   # blue
+    RGBColor(237, 125, 49),   # orange
+    RGBColor(112, 173, 71),   # green
+    RGBColor(255, 192, 0),    # yellow
+    RGBColor(91, 155, 213),   # light blue
+    RGBColor(192, 80, 77),    # red
+]
+
+_LINE_COLORS = [
+    RGBColor(165, 165, 165),  # grey
+    RGBColor(255, 192, 0),    # yellow
+    RGBColor(91, 155, 213),   # light blue
+    RGBColor(112, 173, 71),   # green
+    RGBColor(237, 125, 49),   # orange
+    RGBColor(192, 80, 77),    # red
+]
+
+
+# ── Type hints ────────────────────────────────────────────────────────────────
+
+class SeriesSpec(TypedDict, total=False):
+    label: str
+    values: list[float]
+    color: RGBColor          # optional — falls back to palette
+
+
+class AxisSpec(TypedDict, total=False):
+    min: float
+    max: float
+    unit: float
+
+
+# ── XML helpers ───────────────────────────────────────────────────────────────
+
+def _set_spPr_no_fill(element, spPr_ns: str = "c") -> None:
     spPr_tag = qn(f"{spPr_ns}:spPr")
     spPr = element.find(spPr_tag)
     if spPr is None:
@@ -22,125 +85,135 @@ def _set_spPr_no_fill(element, spPr_ns="c"):
     etree.SubElement(spPr, qn("a:noFill"))
 
 
-def _set_no_line(element):
-    """Set noFill on the line (spPr > ln > noFill) via direct XML."""
+def _set_no_line(element) -> None:
     spPr = element.get_or_add_spPr()
     ln = spPr.get_or_add_ln()
     ln.clear()
     etree.SubElement(ln, qn("a:noFill"))
 
 
-def _make_chart_transparent(chart):
-    """Make chart space and plot area transparent via XML."""
-    chart_space = chart._element                                    # c:chartSpace
-    _set_spPr_no_fill(chart_space, spPr_ns="c")
-
+def _make_chart_transparent(chart) -> None:
+    chart_space = chart._element
+    _set_spPr_no_fill(chart_space)
     chart_el = chart_space.find(qn("c:chart"))
     if chart_el is not None:
         plot_area = chart_el.find(qn("c:plotArea"))
         if plot_area is not None:
-            _set_spPr_no_fill(plot_area, spPr_ns="c")
+            _set_spPr_no_fill(plot_area)
 
 
-def add_sample_combo_chart(output_path: str | Path = "similar_graph.pptx") -> Path:
+# ── Main function ─────────────────────────────────────────────────────────────
+
+def add_combo_chart(
+    categories: list[str],
+    bar_series: list[SeriesSpec],
+    line_series: list[SeriesSpec],
+    bar_axis: AxisSpec | None = None,
+    line_axis: AxisSpec | None = None,
+    output_path: str | Path = "similar_graph.pptx",
+) -> Path:
+    """
+    Create a combo chart slide with any mix of bar and line series.
+
+    Parameters
+    ----------
+    categories  : x-axis category labels
+    bar_series  : list of dicts with keys: label, values, color (optional)
+    line_series : list of dicts with keys: label, values, color (optional)
+    bar_axis    : dict with optional keys min, max, unit for the left Y axis
+    line_axis   : dict with optional keys min, max, unit for the right Y axis
+    output_path : where to save the .pptx file
+    """
+    if not bar_series and not line_series:
+        raise ValueError("Provide at least one bar or line series.")
+
+    bar_axis = bar_axis or {}
+    line_axis = line_axis or {}
+
     prs = Presentation()
     slide = prs.slides.add_slide(prs.slide_layouts[6])
 
-    categories = ["D1", "D2", "D3", "D4", "D5"]
-    series_a = [20, 40, 9, 12, 30]
-    series_b = [10, 20, 30, 20, 10]
-    series_c = [1, 3, 8, 3, 6]
-    series_d = [1, 2, 3, 6, 3]
-
-    left = Inches(0.55)
-    top = Inches(0.35)
-    width = Inches(8.65)
+    left   = Inches(0.55)
+    top    = Inches(0.35)
+    width  = Inches(8.65)
     height = Inches(5.65)
 
-    # ── Bar (column) chart ────────────────────────────────────────────────────
-    bar_data = CategoryChartData()
-    bar_data.categories = categories
-    bar_data.add_series("A", series_a)
-    bar_data.add_series("B", series_b)
+    # ── Bar chart ─────────────────────────────────────────────────────────────
+    if bar_series:
+        bar_data = CategoryChartData()
+        bar_data.categories = categories
+        for s in bar_series:
+            bar_data.add_series(s["label"], s["values"])
 
-    bar_shape = slide.shapes.add_chart(
-        XL_CHART_TYPE.COLUMN_CLUSTERED, left, top, width, height, bar_data
-    )
-    bar_chart = bar_shape.chart
+        bar_shape = slide.shapes.add_chart(
+            XL_CHART_TYPE.COLUMN_CLUSTERED, left, top, width, height, bar_data
+        )
+        bar_chart = bar_shape.chart
+        bar_chart.has_title = False
+        bar_chart.has_legend = False           # we draw a unified legend below
+        bar_chart.value_axis.minimum_scale = bar_axis.get("min", 0)
+        bar_chart.value_axis.maximum_scale = bar_axis.get("max", None)
+        if "unit" in bar_axis:
+            bar_chart.value_axis.major_unit = bar_axis["unit"]
+        bar_chart.value_axis.has_major_gridlines = True
+        bar_chart.value_axis.tick_label_position = XL_TICK_LABEL_POSITION.LOW
+        bar_chart.category_axis.tick_label_position = XL_TICK_LABEL_POSITION.LOW
+        bar_chart.plots[0].gap_width = 150
 
-    bar_chart.has_title = False
-    bar_chart.has_legend = True
-    bar_chart.legend.position = XL_LEGEND_POSITION.BOTTOM
-    bar_chart.legend.include_in_layout = False
-    bar_chart.value_axis.maximum_scale = 45
-    bar_chart.value_axis.minimum_scale = 0
-    bar_chart.value_axis.major_unit = 5
-    bar_chart.value_axis.has_major_gridlines = True
-    bar_chart.value_axis.tick_label_position = XL_TICK_LABEL_POSITION.LOW
-    bar_chart.category_axis.tick_label_position = XL_TICK_LABEL_POSITION.LOW
+        for i, s in enumerate(bar_series):
+            color = s.get("color") or _BAR_COLORS[i % len(_BAR_COLORS)]
+            bar_chart.series[i].format.fill.solid()
+            bar_chart.series[i].format.fill.fore_color.rgb = color
+            bar_chart.series[i].format.line.width = 0
 
-    bar_chart.plots[0].gap_width = 150
-
-    bar_chart.series[0].format.fill.solid()
-    bar_chart.series[0].format.fill.fore_color.rgb = RGBColor(68, 114, 196)
-    bar_chart.series[0].format.line.width = 0
-
-    bar_chart.series[1].format.fill.solid()
-    bar_chart.series[1].format.fill.fore_color.rgb = RGBColor(237, 125, 49)
-    bar_chart.series[1].format.line.width = 0
-
-    _make_chart_transparent(bar_chart)
+        _make_chart_transparent(bar_chart)
 
     # ── Line chart (overlaid) ─────────────────────────────────────────────────
-    line_data = CategoryChartData()
-    line_data.categories = categories
-    line_data.add_series("C (Right)", series_c)
-    line_data.add_series("D (Right)", series_d)
+    if line_series:
+        line_data = CategoryChartData()
+        line_data.categories = categories
+        for s in line_series:
+            line_data.add_series(s["label"], s["values"])
 
-    line_shape = slide.shapes.add_chart(
-        XL_CHART_TYPE.LINE, left, top, width, height, line_data
-    )
-    line_chart = line_shape.chart
+        line_shape = slide.shapes.add_chart(
+            XL_CHART_TYPE.LINE, left, top, width, height, line_data
+        )
+        line_chart = line_shape.chart
+        line_chart.has_title = False
+        line_chart.has_legend = False
+        line_chart.value_axis.minimum_scale = line_axis.get("min", 0)
+        line_chart.value_axis.maximum_scale = line_axis.get("max", None)
+        if "unit" in line_axis:
+            line_chart.value_axis.major_unit = line_axis["unit"]
+        line_chart.value_axis.has_major_gridlines = False
+        line_chart.value_axis.tick_label_position = XL_TICK_LABEL_POSITION.HIGH
+        line_chart.category_axis.tick_label_position = XL_TICK_LABEL_POSITION.NONE
 
-    line_chart.has_title = False
-    line_chart.has_legend = False
-    line_chart.value_axis.maximum_scale = 9
-    line_chart.value_axis.minimum_scale = 0
-    line_chart.value_axis.major_unit = 1
-    line_chart.value_axis.has_major_gridlines = False
-    line_chart.value_axis.tick_label_position = XL_TICK_LABEL_POSITION.HIGH
-    line_chart.category_axis.tick_label_position = XL_TICK_LABEL_POSITION.NONE
+        for axis in (line_chart.category_axis, line_chart.value_axis):
+            _set_no_line(axis._element)
 
-    # Hide axis lines via XML (LineFormat.fill chain is unreliable on axes)
-    for axis in (line_chart.category_axis, line_chart.value_axis):
-        _set_no_line(axis._element)
+        _make_chart_transparent(line_chart)
 
-    _make_chart_transparent(line_chart)
+        for i, s in enumerate(line_series):
+            color = s.get("color") or _LINE_COLORS[i % len(_LINE_COLORS)]
+            line_chart.series[i].format.line.color.rgb = color
+            line_chart.series[i].format.line.width = Pt(2.25)
+            line_chart.series[i].marker.style = None
 
-    # ── Line series styling ───────────────────────────────────────────────────
-    c_series = line_chart.series[0]
-    c_series.format.line.color.rgb = RGBColor(165, 165, 165)
-    c_series.format.line.width = Pt(2.25)
+    # ── Unified manual legend ─────────────────────────────────────────────────
+    legend_items: list[tuple[str, RGBColor, str]] = []
+    for i, s in enumerate(bar_series):
+        color = s.get("color") or _BAR_COLORS[i % len(_BAR_COLORS)]
+        legend_items.append((s["label"], color, "bar"))
+    for i, s in enumerate(line_series):
+        color = s.get("color") or _LINE_COLORS[i % len(_LINE_COLORS)]
+        legend_items.append((s["label"], color, "line"))
 
-    d_series = line_chart.series[1]
-    d_series.format.line.color.rgb = RGBColor(255, 192, 0)
-    d_series.format.line.width = Pt(2.25)
-
-    for series in line_chart.series:
-        series.marker.style = None
-
-    # ── Manual combined legend ────────────────────────────────────────────────
-    legend_top = top + height + Inches(0.05)
-    legend_left = left + Inches(1.85)
-    item_w = Inches(1.15)
-    box = Inches(0.18)
-
-    legend_items = [
-        ("A", RGBColor(68, 114, 196), "bar"),
-        ("B", RGBColor(237, 125, 49), "bar"),
-        ("C (Right)", RGBColor(165, 165, 165), "line"),
-        ("D (Right)", RGBColor(255, 192, 0), "line"),
-    ]
+    total = len(legend_items)
+    legend_top  = top + height + Inches(0.05)
+    item_w      = min(Inches(1.15), (width - Inches(0.2)) / total)
+    legend_left = left + (width - item_w * total) / 2
+    box         = Inches(0.18)
 
     for idx, (label, color, kind) in enumerate(legend_items):
         x = legend_left + item_w * idx
@@ -162,10 +235,10 @@ def add_sample_combo_chart(output_path: str | Path = "similar_graph.pptx") -> Pa
             item.line.color.rgb = color
             item.line.width = Pt(2.25)
 
-        text_box = slide.shapes.add_textbox(
+        tb = slide.shapes.add_textbox(
             x + Inches(0.45), y - Inches(0.02), Inches(0.7), Inches(0.25)
         )
-        p = text_box.text_frame.paragraphs[0]
+        p   = tb.text_frame.paragraphs[0]
         run = p.add_run()
         run.text = label
         run.font.size = Pt(10)
@@ -177,6 +250,20 @@ def add_sample_combo_chart(output_path: str | Path = "similar_graph.pptx") -> Pa
     return output_path
 
 
+# ── Demo ──────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    out = add_sample_combo_chart()
-    print(f"Saved presentation to: {out}")
+    out = add_combo_chart(
+        categories=["D1", "D2", "D3", "D4", "D5"],
+        bar_series=[
+            {"label": "A", "values": [20, 40, 9, 12, 30]},
+            {"label": "B", "values": [10, 20, 30, 20, 10]},
+        ],
+        line_series=[
+            {"label": "C (Right)", "values": [1, 3, 8, 3, 6]},
+            {"label": "D (Right)", "values": [1, 2, 3, 6, 3]},
+        ],
+        bar_axis={"min": 0, "max": 45, "unit": 5},
+        line_axis={"min": 0, "max": 9,  "unit": 1},
+    )
+    print(f"Saved: {out}")
