@@ -4,7 +4,6 @@ Combo chart builder — any number of bar + line series.
 Usage
 -----
 from similar_graph import add_combo_chart
-from pptx.dml.color import RGBColor
 
 add_combo_chart(
     categories=["D1", "D2", "D3", "D4", "D5"],
@@ -13,20 +12,18 @@ add_combo_chart(
         {"label": "B", "values": [10, 20, 30, 20, 10]},
     ],
     line_series=[
-        {"label": "X (Right)", "values": [1, 3, 8, 3, 6]},
+        {"label": "X", "values": [1, 3, 8, 3, 6]},
+        {"label": "Y", "values": [1, 2, 3, 6, 3]},
     ],
     bar_axis={"min": 0, "max": 45, "unit": 5},
     line_axis={"min": 0, "max": 9,  "unit": 1},
-    output_path="my_chart.pptx",
 )
 
-# To fit an existing shape / placeholder on a slide, pass its dimensions:
-#   shape = slide.shapes["MyBox"]           # by name
-#   shape = slide.placeholders[1]           # by index
+# Slot into an existing shape / placeholder:
+#   shape = slide.shapes["MyBox"]     # or slide.placeholders[1]
 #   add_combo_chart(..., left=shape.left, top=shape.top,
 #                        width=shape.width, height=shape.height)
 """
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -37,28 +34,31 @@ from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
 from pptx.enum.chart import XL_CHART_TYPE, XL_TICK_LABEL_POSITION
-from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_CONNECTOR
+from pptx.enum.shapes import MSO_CONNECTOR
 from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
+
+_NS_C = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+_NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
 
 # ── Default colour palettes ───────────────────────────────────────────────────
 
 _BAR_COLORS: list[RGBColor] = [
-    RGBColor(68,  114, 196),   # blue
-    RGBColor(237, 125,  49),   # orange
-    RGBColor(112, 173,  71),   # green
-    RGBColor(255, 192,   0),   # yellow
-    RGBColor(91,  155, 213),   # light blue
-    RGBColor(192,  80,  77),   # red
+    RGBColor(68,  114, 196),
+    RGBColor(237, 125,  49),
+    RGBColor(112, 173,  71),
+    RGBColor(255, 192,   0),
+    RGBColor(91,  155, 213),
+    RGBColor(192,  80,  77),
 ]
 
 _LINE_COLORS: list[RGBColor] = [
-    RGBColor(165, 165, 165),   # grey
-    RGBColor(255, 192,   0),   # yellow
-    RGBColor(91,  155, 213),   # light blue
-    RGBColor(112, 173,  71),   # green
-    RGBColor(237, 125,  49),   # orange
-    RGBColor(192,  80,  77),   # red
+    RGBColor(165, 165, 165),
+    RGBColor(255, 192,   0),
+    RGBColor(91,  155, 213),
+    RGBColor(112, 173,  71),
+    RGBColor(237, 125,  49),
+    RGBColor(192,  80,  77),
 ]
 
 
@@ -67,7 +67,7 @@ _LINE_COLORS: list[RGBColor] = [
 class SeriesSpec(TypedDict, total=False):
     label: str
     values: list[float]
-    color: RGBColor          # falls back to palette when omitted
+    color: RGBColor
 
 
 class AxisSpec(TypedDict, total=False):
@@ -79,6 +79,7 @@ class AxisSpec(TypedDict, total=False):
 # ── XML helpers ───────────────────────────────────────────────────────────────
 
 def _set_spPr_no_fill(element, spPr_ns: str = "c") -> None:
+    """Replace the fill on an existing spPr with noFill."""
     spPr_tag = qn(f"{spPr_ns}:spPr")
     spPr = element.find(spPr_tag)
     if spPr is None:
@@ -89,46 +90,54 @@ def _set_spPr_no_fill(element, spPr_ns: str = "c") -> None:
     etree.SubElement(spPr, qn("a:noFill"))
 
 
-def _set_no_line(element) -> None:
-    spPr = element.get_or_add_spPr()
-    ln = spPr.get_or_add_ln()
-    ln.clear()
-    etree.SubElement(ln, qn("a:noFill"))
-
-
 def _make_chart_transparent(chart) -> None:
-    chart_space = chart._element
-    _set_spPr_no_fill(chart_space)
-    chart_el = chart_space.find(qn("c:chart"))
+    cs = chart._element
+    _set_spPr_no_fill(cs)
+    chart_el = cs.find(qn("c:chart"))
     if chart_el is not None:
         plot_area = chart_el.find(qn("c:plotArea"))
         if plot_area is not None:
             _set_spPr_no_fill(plot_area)
 
 
+def _hide_axis(ax_element) -> None:
+    """Completely suppress an axis with c:delete val='1'."""
+    delete_el = ax_element.find(qn("c:delete"))
+    if delete_el is None:
+        delete_el = etree.Element(qn("c:delete"))
+        # Schema: delete comes after c:scaling
+        scaling = ax_element.find(qn("c:scaling"))
+        if scaling is not None:
+            scaling.addnext(delete_el)
+        else:
+            ax_element.insert(1, delete_el)
+    delete_el.set("val", "1")
+
+
 def _move_val_axis_right(chart) -> None:
-    """Relocate the value axis line to the right side of the chart."""
-    chart_el = chart._element.find(qn("c:chart"))
+    """Relocate the value-axis line to the right edge of the chart."""
+    chart_el  = chart._element.find(qn("c:chart"))
     if chart_el is None:
         return
     plot_area = chart_el.find(qn("c:plotArea"))
     if plot_area is None:
         return
-
     val_ax = plot_area.find(qn("c:valAx"))
-    cat_ax = plot_area.find(qn("c:catAx"))
+    if val_ax is None:
+        return
 
-    if val_ax is not None:
-        ax_pos = val_ax.find(qn("c:axPos"))
-        if ax_pos is None:
-            ax_pos = etree.SubElement(val_ax, qn("c:axPos"))
+    # c:axPos is required — always present in python-pptx generated XML
+    ax_pos = val_ax.find(qn("c:axPos"))
+    if ax_pos is not None:
         ax_pos.set("val", "r")
-
-    if cat_ax is not None:
-        crosses = cat_ax.find(qn("c:crosses"))
-        if crosses is None:
-            crosses = etree.SubElement(cat_ax, qn("c:crosses"))
-        crosses.set("val", "max")
+    else:
+        new_pos = etree.Element(qn("c:axPos"))
+        new_pos.set("val", "r")
+        scaling = val_ax.find(qn("c:scaling"))
+        if scaling is not None:
+            scaling.addnext(new_pos)
+        else:
+            val_ax.append(new_pos)
 
 
 def _add_bar_data_labels(
@@ -136,40 +145,48 @@ def _add_bar_data_labels(
     label_rgb: tuple[int, int, int] = (255, 255, 255),
     font_size_pt: int = 9,
 ) -> None:
-    """Insert inside-end value labels with white (or custom) font onto a bar series."""
+    """
+    Inject inside-end value labels onto a bar series.
+    Uses etree.fromstring so namespace ordering is always valid.
+    Adds spPr/noFill so labels have no white box background.
+    """
     old = series_el.find(qn("c:dLbls"))
     if old is not None:
         series_el.remove(old)
 
-    dLbls = etree.Element(qn("c:dLbls"))
+    hex_color = "%02X%02X%02X" % label_rgb
+    sz        = font_size_pt * 100   # hundredths of a point
 
-    # --- font styling (txPr) -------------------------------------------------
-    txPr   = etree.SubElement(dLbls, qn("c:txPr"))
-    etree.SubElement(txPr, qn("a:bodyPr"))
-    etree.SubElement(txPr, qn("a:lstStyle"))
-    p      = etree.SubElement(txPr, qn("a:p"))
-    pPr    = etree.SubElement(p, qn("a:pPr"))
-    defRPr = etree.SubElement(pPr, qn("a:defRPr"))
-    defRPr.set("sz", str(font_size_pt * 100))   # hundredths of a point
-    defRPr.set("b", "0")
-    solidFill = etree.SubElement(defRPr, qn("a:solidFill"))
-    srgbClr   = etree.SubElement(solidFill, qn("a:srgbClr"))
-    srgbClr.set("val", "%02X%02X%02X" % label_rgb)
+    xml_str = (
+        f'<c:dLbls xmlns:c="{_NS_C}" xmlns:a="{_NS_A}">'
+        # ── transparent label background ──
+        f'<c:spPr>'
+        f'<a:noFill/>'
+        f'<a:ln><a:noFill/></a:ln>'
+        f'</c:spPr>'
+        # ── font colour ──
+        f'<c:txPr>'
+        f'<a:bodyPr/>'
+        f'<a:lstStyle/>'
+        f'<a:p><a:pPr>'
+        f'<a:defRPr sz="{sz}" b="0">'
+        f'<a:solidFill><a:srgbClr val="{hex_color}"/></a:solidFill>'
+        f'</a:defRPr>'
+        f'</a:pPr></a:p>'
+        f'</c:txPr>'
+        # ── options ──
+        f'<c:dLblPos val="inEnd"/>'
+        f'<c:showLegendKey val="0"/>'
+        f'<c:showVal val="1"/>'
+        f'<c:showCatName val="0"/>'
+        f'<c:showSerName val="0"/>'
+        f'<c:showPercent val="0"/>'
+        f'<c:showBubbleSize val="0"/>'
+        f'</c:dLbls>'
+    )
+    dLbls = etree.fromstring(xml_str)
 
-    # --- label options -------------------------------------------------------
-    for tag, val in [
-        ("c:dLblPos",       "inEnd"),
-        ("c:showLegendKey", "0"),
-        ("c:showVal",       "1"),
-        ("c:showCatName",   "0"),
-        ("c:showSerName",   "0"),
-        ("c:showPercent",   "0"),
-        ("c:showBubbleSize","0"),
-    ]:
-        e = etree.SubElement(dLbls, qn(tag))
-        e.set("val", val)
-
-    # Insert before <c:cat> to respect the schema ordering
+    # CT_BarSer schema: dLbls comes before c:cat
     cat_el = series_el.find(qn("c:cat"))
     if cat_el is not None:
         cat_el.addprevious(dLbls)
@@ -193,18 +210,18 @@ def add_combo_chart(
     height: int | None = None,
 ) -> Path:
     """
-    Build a combo chart and save to a new .pptx file.
+    Build a combo chart slide and save to .pptx.
 
     Parameters
     ----------
-    categories   : x-axis labels (must match length of every values list)
-    bar_series   : list of {label, values, color?}  — clustered columns, left axis
-    line_series  : list of {label, values, color?}  — lines, right axis
-    bar_axis     : {min?, max?, unit?} for left Y axis
-    line_axis    : {min?, max?, unit?} for right Y axis
-    output_path  : destination .pptx path
-    left/top/width/height : position in EMUs; pass shape.left/top/width/height
-                            to slot the chart into an existing shape's bounding box
+    categories   : x-axis labels
+    bar_series   : [{label, values, color?}]  clustered columns, left axis
+    line_series  : [{label, values, color?}]  lines, right axis
+    bar_axis     : {min?, max?, unit?} left Y axis
+    line_axis    : {min?, max?, unit?} right Y axis
+    output_path  : destination path
+    left/top/width/height : position in EMUs — pass shape.left/top/width/height
+                            to fit the chart inside an existing shape/placeholder
     """
     if not bar_series and not line_series:
         raise ValueError("Provide at least one bar or line series.")
@@ -220,7 +237,7 @@ def add_combo_chart(
     prs   = Presentation()
     slide = prs.slides.add_slide(prs.slide_layouts[6])
 
-    # ── Bar (column) chart ────────────────────────────────────────────────────
+    # ── Bar (column) chart — left axis ────────────────────────────────────────
     if bar_series:
         bar_data = CategoryChartData()
         bar_data.categories = categories
@@ -252,7 +269,7 @@ def add_combo_chart(
 
         _make_chart_transparent(bar_chart)
 
-    # ── Line chart (overlaid, right axis) ─────────────────────────────────────
+    # ── Line chart — right axis (overlaid, transparent) ───────────────────────
     if line_series:
         line_data = CategoryChartData()
         line_data.categories = categories
@@ -269,13 +286,12 @@ def add_combo_chart(
         line_chart.value_axis.minimum_scale = line_axis.get("min", 0)
         if "max"  in line_axis: line_chart.value_axis.maximum_scale = line_axis["max"]
         if "unit" in line_axis: line_chart.value_axis.major_unit    = line_axis["unit"]
-        line_chart.value_axis.has_major_gridlines    = False
-        line_chart.value_axis.tick_label_position    = XL_TICK_LABEL_POSITION.HIGH
-        line_chart.category_axis.tick_label_position = XL_TICK_LABEL_POSITION.NONE
+        line_chart.value_axis.has_major_gridlines = False
+        line_chart.value_axis.tick_label_position = XL_TICK_LABEL_POSITION.HIGH
 
-        for axis in (line_chart.category_axis, line_chart.value_axis):
-            _set_no_line(axis._element)
-
+        # Completely hide the category axis — bar chart already shows it
+        _hide_axis(line_chart.category_axis._element)
+        # Move value axis line to the right side
         _move_val_axis_right(line_chart)
         _make_chart_transparent(line_chart)
 
@@ -302,7 +318,7 @@ def add_combo_chart(
         y = legend_top
 
         if kind == "line":
-            # Short coloured dash to distinguish line entries
+            # Short dash prefix so line entries are visually distinct from bars
             conn = slide.shapes.add_connector(
                 MSO_CONNECTOR.STRAIGHT,
                 x, y + Inches(0.11), x + Inches(0.25), y + Inches(0.11),
