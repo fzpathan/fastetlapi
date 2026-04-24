@@ -1,0 +1,190 @@
+import asyncio
+import os
+from dotenv import load_dotenv
+from llm_client import LLMClient
+from response import StreamEventType
+
+load_dotenv()
+
+SYSTEM_PROMPTS = {
+    "1": {
+        "label": "General Assistant",
+        "prompt": "You are a helpful general-purpose assistant. Answer clearly and concisely.",
+    },
+    "2": {
+        "label": "Code Reviewer",
+        "prompt": (
+            "You are an expert code reviewer. Analyze code for bugs, performance issues, "
+            "and best practices. Always explain your reasoning."
+        ),
+    },
+    "3": {
+        "label": "SQL Expert",
+        "prompt": (
+            "You are a SQL expert. Help write, optimize, and debug SQL queries. "
+            "Always explain what the query does."
+        ),
+    },
+    "4": {
+        "label": "Summarizer",
+        "prompt": (
+            "You are a text summarizer. Summarize content into clear, bullet-pointed key points. "
+            "Be concise and accurate."
+        ),
+    },
+}
+
+
+def pick_system_prompt() -> str:
+    print("\nSelect a system prompt:")
+    for key, val in SYSTEM_PROMPTS.items():
+        print(f"  [{key}] {val['label']}")
+
+    while True:
+        choice = input("\nEnter choice (1-4): ").strip()
+        if choice in SYSTEM_PROMPTS:
+            selected = SYSTEM_PROMPTS[choice]
+            print(f"\nUsing: {selected['label']}")
+            return selected["prompt"]
+        print("Invalid choice, try again.")
+
+
+async def ask_once(system_prompt: str, question: str) -> None:
+    client = LLMClient(
+        api_key=os.environ["OPENAI_API_KEY"],
+        model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        system_prompt=system_prompt,
+        base_url=os.environ.get("OPENAI_BASE_URL"),  # None = direct OpenAI
+    )
+
+    print("\nAnswer:\n" + "-" * 40)
+    try:
+        async for event in client.ask(question, stream=True, use_turns=False):
+            if event.type == StreamEventType.TEXT_DELTA:
+                print(event.text_delta.content, end="", flush=True)
+
+            elif event.type == StreamEventType.MESSAGE_COMPLETE:
+                print()  # newline after streamed text
+                if event.usage:
+                    u = event.usage
+                    print(
+                        f"\n[tokens] prompt={u.prompt_tokens} "
+                        f"completion={u.completion_tokens} "
+                        f"total={u.total_tokens}"
+                    )
+
+            elif event.type == StreamEventType.ERROR:
+                print(f"\n[error] {event.error}")
+    finally:
+        await client.close()
+
+
+async def main() -> None:
+    system_prompt = pick_system_prompt()
+    question = input("\nYour question: ").strip()
+    if not question:
+        print("No question entered.")
+        return
+    await ask_once(system_prompt, question)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+from __future__ import annotations
+from abc import ABC, abstractmethod
+from typing import Any
+
+
+class Skill(ABC):
+    """Base class for all skills that can be registered with LLMClient."""
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Unique function name the model will call (no spaces, snake_case)."""
+        ...
+
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """Plain-English description shown to the model to decide when to call this skill."""
+        ...
+
+    @property
+    @abstractmethod
+    def parameters(self) -> dict:
+        """JSON Schema 'object' describing the function arguments."""
+        ...
+
+    @abstractmethod
+    async def execute(self, **kwargs: Any) -> Any:
+        """Run the skill. kwargs are parsed from the model's JSON arguments."""
+        ...
+
+    def to_tool_definition(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }
+
+
+from __future__ import annotations
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
+
+
+class StreamEventType(str, Enum):
+    TEXT_DELTA       = "text_delta"
+    MESSAGE_COMPLETE = "message_complete"
+    TOOL_CALL        = "tool_call"
+    TOOL_RESULT      = "tool_result"
+    ERROR            = "error"
+
+
+@dataclass
+class TextDelta:
+    content: str
+
+    def __str__(self) -> str:
+        return self.content
+
+
+@dataclass
+class TokenUsage:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    cached_tokens: int = 0
+
+    def __add__(self, other: TokenUsage) -> TokenUsage:
+        return TokenUsage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+            cached_tokens=self.cached_tokens + other.cached_tokens,
+        )
+
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: str  # raw JSON string from the model
+
+
+@dataclass
+class StreamEvent:
+    type: StreamEventType
+    text_delta: TextDelta | None = None
+    tool_call: ToolCall | None = None
+    tool_result: dict[str, Any] | None = None
+    finish_reason: str | None = None
+    usage: TokenUsage | None = None
+    error: str | None = None
