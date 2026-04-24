@@ -30,6 +30,7 @@ add_combo_chart(
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import TypedDict
 
@@ -247,62 +248,88 @@ def _set_label_inside_end(series) -> None:
         dLbls.append(pos)
 
 
-# ── Main function ─────────────────────────────────────────────────────────────
+# ── Legend font helper ────────────────────────────────────────────────────────
 
-def add_combo_chart(
+def _set_legend_font_size(legend, size_pt: float) -> None:
+    """Inject c:txPr into the legend element to set font size."""
+    leg_el  = legend._element
+    txPr    = leg_el.find(qn("c:txPr"))
+    if txPr is None:
+        txPr = _child(leg_el, "c:txPr")
+    else:
+        txPr.clear()
+
+    _child(txPr, "a:bodyPr")
+    _child(txPr, "a:lstStyle")
+    p     = _child(txPr, "a:p")
+    pPr   = _child(p,    "a:pPr")
+    defRPr = _child(pPr, "a:defRPr")
+    defRPr.set("sz", str(int(size_pt * 100)))   # hundredths of a point
+
+
+# ── PDF conversion ───────────────────────────────────────────────────────────
+
+def convert_to_pdf(pptx_path: str | Path) -> Path:
+    """
+    Convert a .pptx file to PDF using the installed PowerPoint application.
+    Requires Microsoft Office on Windows.
+
+    Returns the path of the generated .pdf file.
+    """
+    pptx_path = Path(pptx_path).resolve()
+    pdf_path  = pptx_path.with_suffix(".pdf")
+
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$ppt  = New-Object -ComObject PowerPoint.Application
+$ppt.Visible = [Microsoft.Office.Core.MsoTriState]::msoTrue
+$deck = $ppt.Presentations.Open('{pptx_path}', $false, $false, $false)
+$deck.SaveAs('{pdf_path}', 32)
+$deck.Close()
+$ppt.Quit()
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($ppt) | Out-Null
+"""
+    result = subprocess.run(
+        ["powershell", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"PDF conversion failed:\n{result.stderr.strip() or result.stdout.strip()}"
+        )
+    return pdf_path
+
+
+# ── Core chart builder (shared by both public functions) ─────────────────────
+
+def _build_chart_on_slide(
+    slide,
+    left: int, top: int, width: int, height: int,
     categories: list[str],
     bar_series: list[SeriesSpec],
     line_series: list[SeriesSpec],
     bar_axis: AxisSpec | None = None,
     line_axis: AxisSpec | None = None,
-    output_path: str | Path = "similar_graph.pptx",
-    *,
-    left: int | None = None,
-    top: int | None = None,
-    width: int | None = None,
-    height: int | None = None,
-) -> Path:
-    """
-    Build a true combo chart (single chart object, secondary right axis)
-    and save to a new .pptx file.
-
-    Parameters
-    ----------
-    categories   : x-axis labels
-    bar_series   : [{label, values, color?}]  clustered columns, left axis
-    line_series  : [{label, values, color?}]  lines, right axis
-    bar_axis     : {min?, max?, unit?} left Y axis
-    line_axis    : {min?, max?, unit?} right Y axis
-    output_path  : destination .pptx path
-    left/top/width/height : position in EMUs — pass shape.left/top/width/height
-                            to slot the chart into an existing shape/placeholder
-    """
-    if not bar_series and not line_series:
-        raise ValueError("Provide at least one bar or line series.")
-
+    data_label_font_pt: float | None = None,
+    axis_font_pt: float | None = None,
+    legend_font_pt: float | None = None,
+) -> None:
+    """Add a combo chart to an existing slide at the given EMU position/size."""
     bar_axis  = bar_axis  or {}
     line_axis = line_axis or {}
 
-    _left   = left   if left   is not None else Inches(0.55)
-    _top    = top    if top    is not None else Inches(0.35)
-    _width  = width  if width  is not None else Inches(8.65)
-    _height = height if height is not None else Inches(5.65)
-
-    prs   = Presentation()
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-
-    # ── Step 1: Bar chart via python-pptx API (produces valid base XML) ───────
+    # ── Step 1: Bar chart via python-pptx API ─────────────────────────────────
     bar_data = CategoryChartData()
     bar_data.categories = categories
     if bar_series:
         for s in bar_series:
             bar_data.add_series(s["label"], s["values"])
     else:
-        # dummy invisible series so we have a chart container for lines
         bar_data.add_series("_", [0] * len(categories))
 
     chart_shape = slide.shapes.add_chart(
-        XL_CHART_TYPE.COLUMN_CLUSTERED, _left, _top, _width, _height, bar_data
+        XL_CHART_TYPE.COLUMN_CLUSTERED, left, top, width, height, bar_data
     )
     chart = chart_shape.chart
 
@@ -311,7 +338,6 @@ def add_combo_chart(
     chart.legend.position          = XL_LEGEND_POSITION.BOTTOM
     chart.legend.include_in_layout = False
 
-    # left (primary) axis
     chart.value_axis.minimum_scale = bar_axis.get("min", 0)
     if "max"  in bar_axis: chart.value_axis.maximum_scale = bar_axis["max"]
     if "unit" in bar_axis: chart.value_axis.major_unit    = bar_axis["unit"]
@@ -330,22 +356,20 @@ def add_combo_chart(
             ser.data_labels.show_value = True
             _set_label_inside_end(ser)
 
-    # ── Step 2: Inject line chart + secondary axis via OxmlElement ────────────
+    # ── Step 2: Line chart + secondary axis ───────────────────────────────────
     if line_series:
         cat_ax_id, pri_val_id = _read_ax_ids(chart)
-        sec_ax_id = pri_val_id + 1          # unique ID not used by any existing axis
+        sec_ax_id = pri_val_id + 1
 
         plot_area = (
             chart._element
             .find(qn("c:chart"))
             .find(qn("c:plotArea"))
         )
-
         line_colors = [
             s.get("color") or _LINE_COLORS[i % len(_LINE_COLORS)]
             for i, s in enumerate(line_series)
         ]
-
         _append_line_chart(
             plot_area, categories, line_series, line_colors,
             cat_ax_id, sec_ax_id,
@@ -353,16 +377,158 @@ def add_combo_chart(
         )
         _add_secondary_val_axis(plot_area, sec_ax_id, cat_ax_id, line_axis)
 
+    # ── Step 3: Font sizes ────────────────────────────────────────────────────
+    if data_label_font_pt is not None and bar_series:
+        for ser in chart.series:
+            ser.data_labels.font.size = Pt(data_label_font_pt)
+
+    if axis_font_pt is not None:
+        chart.value_axis.tick_labels.font.size    = Pt(axis_font_pt)
+        chart.category_axis.tick_labels.font.size = Pt(axis_font_pt)
+
+    if legend_font_pt is not None:
+        _set_legend_font_size(chart.legend, legend_font_pt)
+
+
+# ── Main function ─────────────────────────────────────────────────────────────
+
+def add_combo_chart(
+    categories: list[str],
+    bar_series: list[SeriesSpec],
+    line_series: list[SeriesSpec],
+    bar_axis: AxisSpec | None = None,
+    line_axis: AxisSpec | None = None,
+    output_path: str | Path = "similar_graph.pptx",
+    *,
+    left: int | None = None,
+    top: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    data_label_font_pt: float | None = None,
+    axis_font_pt: float | None = None,
+    legend_font_pt: float | None = None,
+    convert_pdf: bool = False,
+) -> Path:
+    """
+    Build a true combo chart (single chart object, secondary right axis)
+    and save to a new .pptx file.
+
+    Parameters
+    ----------
+    categories        : x-axis labels
+    bar_series        : [{label, values, color?}]  clustered columns, left axis
+    line_series       : [{label, values, color?}]  lines, right axis
+    bar_axis          : {min?, max?, unit?} left Y axis
+    line_axis         : {min?, max?, unit?} right Y axis
+    output_path       : destination .pptx path
+    left/top/width/height : position in EMUs — pass shape.left/top/width/height
+                            to slot the chart into an existing shape/placeholder
+    data_label_font_pt : font size in points for bar value labels  (e.g. 7)
+    axis_font_pt       : font size in points for both axis tick labels (e.g. 8)
+    legend_font_pt     : font size in points for the legend text (e.g. 8)
+    convert_pdf        : if True, also export a .pdf next to the .pptx
+                         (requires Microsoft Office on Windows)
+    """
+    if not bar_series and not line_series:
+        raise ValueError("Provide at least one bar or line series.")
+
+    _left   = left   if left   is not None else Inches(0.55)
+    _top    = top    if top    is not None else Inches(0.35)
+    _width  = width  if width  is not None else Inches(8.65)
+    _height = height if height is not None else Inches(5.65)
+
+    prs   = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+    _build_chart_on_slide(
+        slide, _left, _top, _width, _height,
+        categories, bar_series, line_series,
+        bar_axis, line_axis,
+        data_label_font_pt, axis_font_pt, legend_font_pt,
+    )
+
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     prs.save(output_path)
+
+    if convert_pdf:
+        pdf_path = convert_to_pdf(output_path)
+        print(f"PDF:  {pdf_path}")
+
+    return output_path
+
+
+def insert_chart_into_shape(
+    pptx_path: str | Path,
+    categories: list[str],
+    bar_series: list[SeriesSpec],
+    line_series: list[SeriesSpec],
+    bar_axis: AxisSpec | None = None,
+    line_axis: AxisSpec | None = None,
+    shape_index: int = 0,
+    output_path: str | Path | None = None,
+    *,
+    remove_shape: bool = True,
+    data_label_font_pt: float | None = None,
+    axis_font_pt: float | None = None,
+    legend_font_pt: float | None = None,
+    slide_index: int = 0,
+    convert_pdf: bool = False,
+) -> Path:
+    """
+    Open an existing .pptx, find a shape by index, and place the combo chart
+    exactly inside it.
+
+    Parameters
+    ----------
+    pptx_path    : path to the existing .pptx file
+    categories / bar_series / line_series / bar_axis / line_axis : same as add_combo_chart
+    shape_index  : 0-based index of the shape whose bounds to use (default 0)
+    output_path  : where to save the result; defaults to pptx_path with '_chart' suffix
+    remove_shape : if True (default), delete the placeholder shape after inserting chart
+    slide_index  : which slide to insert on (default 0)
+    data_label_font_pt / axis_font_pt / legend_font_pt / convert_pdf : same as add_combo_chart
+    """
+    pptx_path = Path(pptx_path).resolve()
+    prs       = Presentation(pptx_path)
+    slide     = prs.slides[slide_index]
+
+    target = slide.shapes[shape_index]
+    left, top, width, height = target.left, target.top, target.width, target.height
+    print(f"Using shape {shape_index!r} ({target.name!r}): "
+          f"{width/914400:.3f}in × {height/914400:.3f}in "
+          f"at ({left/914400:.3f}in, {top/914400:.3f}in)")
+
+    if remove_shape:
+        sp = target._element
+        sp.getparent().remove(sp)
+
+    _build_chart_on_slide(
+        slide, left, top, width, height,
+        categories, bar_series, line_series,
+        bar_axis, line_axis,
+        data_label_font_pt, axis_font_pt, legend_font_pt,
+    )
+
+    if output_path is None:
+        output_path = pptx_path.with_stem(pptx_path.stem + "_chart")
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(output_path)
+
+    if convert_pdf:
+        pdf_path = convert_to_pdf(output_path)
+        print(f"PDF:  {pdf_path}")
+
     return output_path
 
 
 # ── Demo ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    out = add_combo_chart(
+    # Insert chart into the box inside presentation1.pptx
+    out = insert_chart_into_shape(
+        pptx_path="D:/office/config-assistant/presentation1.pptx",
         categories=["D1", "D2", "D3", "D4", "D5"],
         bar_series=[
             {"label": "A", "values": [20, 40,  9, 12, 30]},
@@ -374,5 +540,10 @@ if __name__ == "__main__":
         ],
         bar_axis={"min": 0, "max": 45, "unit": 5},
         line_axis={"min": 0, "max": 9,  "unit": 1},
+        shape_index=0,
+        data_label_font_pt=6,
+        axis_font_pt=6,
+        legend_font_pt=10,
+        convert_pdf=True,
     )
     print(f"Saved: {out}")
