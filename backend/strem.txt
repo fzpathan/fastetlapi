@@ -164,12 +164,28 @@ def path_from_input(raw_path: str) -> Path | None:
     return Path(clean_path).expanduser()
 
 
+def folder_exists(path: Path | None) -> bool:
+    return path is not None and path.is_dir()
+
+
+def output_folder_is_usable(path: Path | None) -> bool:
+    if path is None:
+        return False
+    if path.exists():
+        return path.is_dir()
+    return path.parent.exists() and path.parent.is_dir()
+
+
 def browse_for_folder(initial_path: str | None = None) -> str | None:
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
 
-    initial_dir = initial_path or str(Path.cwd())
+    initial_dir_path = path_from_input(initial_path or "")
+    if not folder_exists(initial_dir_path):
+        initial_dir_path = Path.cwd()
+
+    initial_dir = str(initial_dir_path)
     selected_path = filedialog.askdirectory(initialdir=initial_dir)
     root.destroy()
 
@@ -179,21 +195,29 @@ def browse_for_folder(initial_path: str | None = None) -> str | None:
 
 
 def folder_picker(label: str, key: str, default: str = "") -> str:
-    if key not in st.session_state:
-        st.session_state[key] = default
+    state_key = f"{key}_path"
+    pending_key = f"{key}_pending_path"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = default
+    if pending_key in st.session_state:
+        st.session_state[state_key] = st.session_state.pop(pending_key)
+        st.session_state[key] = st.session_state[state_key]
+    elif key not in st.session_state:
+        st.session_state[key] = st.session_state[state_key]
 
     text_col, button_col = st.columns([4, 1])
     with text_col:
         value = st.text_input(label, key=key)
+        st.session_state[state_key] = value
     with button_col:
         st.write("")
         if st.button("Browse", key=f"{key}_browse"):
-            selected_path = browse_for_folder(value)
+            selected_path = browse_for_folder(st.session_state.get(state_key, ""))
             if selected_path:
-                st.session_state[key] = selected_path
+                st.session_state[pending_key] = selected_path
                 st.rerun()
 
-    return st.session_state[key]
+    return value or default
 
 
 def list_csv_files(working_dir: Path) -> list[Path]:
@@ -329,12 +353,14 @@ input_dir = path_from_input(input_dir_raw)
 output_dir = path_from_input(output_dir_raw)
 
 folder_errors = []
-if working_dir is None or not working_dir.is_dir():
+if not folder_exists(working_dir):
     folder_errors.append("Enter a valid working directory.")
-if input_dir is None or not input_dir.is_dir():
+if not folder_exists(input_dir):
     folder_errors.append("Enter a valid input folder.")
 if output_dir is None:
     folder_errors.append("Enter a valid output folder.")
+elif not output_folder_is_usable(output_dir):
+    folder_errors.append("Enter an output folder path with an existing parent folder.")
 
 if folder_errors:
     for error in folder_errors:
@@ -383,8 +409,24 @@ with st.container(border=True):
         '<div class="small-muted">Find files whose filename contains any selected ID. Review the list before moving.</div>',
         unsafe_allow_html=True,
     )
-    if st.button("Find matching files", type="primary"):
-        st.session_state["matches"] = find_matching_files(input_dir, ids, recursive)
+    action_col_1, action_col_2 = st.columns(2)
+    with action_col_1:
+        if st.button("Find matching files", type="primary", use_container_width=True):
+            st.session_state["matches"] = find_matching_files(input_dir, ids, recursive)
+    with action_col_2:
+        move_now = st.checkbox("Move immediately after finding matches")
+        if st.button("Find and move files", disabled=not move_now, use_container_width=True):
+            matches_to_move = find_matching_files(input_dir, ids, recursive)
+            st.session_state["matches"] = matches_to_move
+            if matches_to_move:
+                results = move_files(matches_to_move, output_dir, overwrite)
+                summary_path = create_summary_file(results, output_dir)
+                st.session_state["move_results"] = results
+                st.session_state["summary_path"] = str(summary_path)
+                st.session_state["matches"] = []
+            else:
+                st.session_state["move_results"] = []
+                st.session_state.pop("summary_path", None)
 
 matches = st.session_state.get("matches", [])
 if matches:
@@ -420,12 +462,3 @@ if move_results:
         summary_path = st.session_state.get("summary_path")
         if summary_path:
             st.info(f"Summary file created: {summary_path}")
-
-            
-[theme]
-base = "light"
-primaryColor = "#30dc15"
-backgroundColor = "#f6f8fb"
-secondaryBackgroundColor = "#ffffff"
-textColor = "#172033"
-font = "sans serif"
