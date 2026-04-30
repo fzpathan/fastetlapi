@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 from llm_client import LLMClient
 from response import StreamEventType
+from skills import AddNumbersSkill, KarpathyGuidelinesSkill
 
 load_dotenv()
 
@@ -32,6 +33,22 @@ SYSTEM_PROMPTS = {
             "Be concise and accurate."
         ),
     },
+    "5": {
+        "label": "Karpathy-Style Assistant",
+        "prompt": (
+            "You are a thoughtful coding assistant guided by the Karpathy principles:\n\n"
+            "1. Think Before Coding — Don't assume. State your assumptions explicitly. "
+            "Surface tradeoffs. If something is unclear, ask.\n\n"
+            "2. Simplicity First — Write minimum code that solves the problem. "
+            "No speculative features, no premature abstractions, no unnecessary flexibility. "
+            "If it could be 50 lines instead of 200, rewrite it.\n\n"
+            "3. Surgical Changes — Touch only what you must. Don't improve adjacent code. "
+            "Match existing style. Remove only what your own changes made unused.\n\n"
+            "4. Goal-Driven Execution — Define verifiable success criteria before starting. "
+            "For multi-step tasks, state a brief plan and verify each step.\n\n"
+            "Answer clearly and concisely. When writing or reviewing code, apply these principles."
+        ),
+    },
 }
 
 
@@ -41,7 +58,7 @@ def pick_system_prompt() -> str:
         print(f"  [{key}] {val['label']}")
 
     while True:
-        choice = input("\nEnter choice (1-4): ").strip()
+        choice = input("\nEnter choice (1-5): ").strip()
         if choice in SYSTEM_PROMPTS:
             selected = SYSTEM_PROMPTS[choice]
             print(f"\nUsing: {selected['label']}")
@@ -56,6 +73,8 @@ async def ask_once(system_prompt: str, question: str) -> None:
         system_prompt=system_prompt,
         base_url=os.environ.get("OPENAI_BASE_URL"),  # None = direct OpenAI
     )
+    client.register_skill(AddNumbersSkill())
+    client.register_skill(KarpathyGuidelinesSkill())
 
     print("\nAnswer:\n" + "-" * 40)
     try:
@@ -90,6 +109,8 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
 
 
 from __future__ import annotations
@@ -578,3 +599,233 @@ class LLMClient:
         if self._client:
             await self._client.close()
             self._client = None
+from __future__ import annotations
+
+from typing import Any
+from skill import Skill
+
+
+class AddNumbersSkill(Skill):
+    @property
+    def name(self) -> str:
+        return "add_numbers"
+
+    @property
+    def description(self) -> str:
+        return "Add two numbers and return the result."
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "a": {
+                    "type": "number",
+                    "description": "First number",
+                },
+                "b": {
+                    "type": "number",
+                    "description": "Second number",
+                },
+            },
+            "required": ["a", "b"],
+            "additionalProperties": False,
+        }
+
+    async def execute(self, **kwargs: Any) -> Any:
+        a = kwargs["a"]
+        b = kwargs["b"]
+        return {
+            "a": a,
+            "b": b,
+            "result": a + b,
+        }
+
+
+class KarpathyGuidelinesSkill(Skill):
+    @property
+    def name(self) -> str:
+        return "karpathy_guidelines"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Behavioral guidelines to reduce common LLM coding mistakes. Use when writing, "
+            "reviewing, or refactoring code to avoid overcomplication, make surgical changes, "
+            "surface assumptions, and define verifiable success criteria."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
+
+    async def execute(self, **kwargs: Any) -> Any:
+        return {
+            "name": "karpathy-guidelines",
+            "guidelines": [
+                {
+                    "id": "1",
+                    "title": "Think Before Coding",
+                    "summary": "Don't assume. Don't hide confusion. Surface tradeoffs.",
+                    "rules": [
+                        "State your assumptions explicitly. If uncertain, ask.",
+                        "If multiple interpretations exist, present them - don't pick silently.",
+                        "If a simpler approach exists, say so. Push back when warranted.",
+                        "If something is unclear, stop. Name what's confusing. Ask.",
+                    ],
+                },
+                {
+                    "id": "2",
+                    "title": "Simplicity First",
+                    "summary": "Minimum code that solves the problem. Nothing speculative.",
+                    "rules": [
+                        "No features beyond what was asked.",
+                        "No abstractions for single-use code.",
+                        "No 'flexibility' or 'configurability' that wasn't requested.",
+                        "No error handling for impossible scenarios.",
+                        "If you write 200 lines and it could be 50, rewrite it.",
+                    ],
+                },
+                {
+                    "id": "3",
+                    "title": "Surgical Changes",
+                    "summary": "Touch only what you must. Clean up only your own mess.",
+                    "rules": [
+                        "Don't 'improve' adjacent code, comments, or formatting.",
+                        "Don't refactor things that aren't broken.",
+                        "Match existing style, even if you'd do it differently.",
+                        "If you notice unrelated dead code, mention it - don't delete it.",
+                        "Remove imports/variables/functions that YOUR changes made unused.",
+                        "Don't remove pre-existing dead code unless asked.",
+                    ],
+                },
+                {
+                    "id": "4",
+                    "title": "Goal-Driven Execution",
+                    "summary": "Define success criteria. Loop until verified.",
+                    "rules": [
+                        "Transform tasks into verifiable goals.",
+                        "For multi-step tasks, state a brief plan.",
+                        "Strong success criteria let you loop independently.",
+                        "Weak criteria ('make it work') require constant clarification.",
+                    ],
+                },
+            ],
+        }
+
+
+class SummarizeJiraIssueSkill(Skill):
+    @property
+    def name(self) -> str:
+        return "summarize_jira_issue"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Summarize a JIRA issue from the standard JIRA REST API response format. "
+            "Extract key metadata, truncate description, preview comments, and highlight "
+            "labels, priority, and status. Returns a clean structured summary."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "issue_data": {
+                    "type": "object",
+                    "description": "The full JIRA issue JSON object from the REST API.",
+                },
+            },
+            "required": ["issue_data"],
+            "additionalProperties": False,
+        }
+
+    async def execute(self, **kwargs: Any) -> Any:
+        issue = kwargs["issue_data"]
+        fields = issue.get("fields", {})
+        key = issue.get("key", "UNKNOWN")
+
+        status = fields.get("status", {})
+        status_name = status.get("name", "Unknown") if isinstance(status, dict) else str(status)
+
+        priority = fields.get("priority", {})
+        priority_name = priority.get("name", "None") if isinstance(priority, dict) else str(priority)
+
+        assignee = fields.get("assignee", {})
+        assignee_name = assignee.get("displayName", "Unassigned") if isinstance(assignee, dict) else "Unassigned"
+
+        issue_type = fields.get("issuetype", {})
+        type_name = issue_type.get("name", "Task") if isinstance(issue_type, dict) else str(issue_type)
+
+        summary = fields.get("summary", "")
+        description = fields.get("description", "")
+        if description and isinstance(description, str):
+            desc_preview = description[:300] + ("..." if len(description) > 300 else "")
+        elif description and isinstance(description, dict):
+            content_blocks = description.get("content", [])
+            desc_text = " ".join(
+                block.get("content", [{}])[0].get("text", "")
+                for block in content_blocks
+                if block.get("content") and block["content"][0].get("text")
+            )
+            desc_preview = desc_text[:300] + ("..." if len(desc_text) > 300 else "")
+        else:
+            desc_preview = "No description."
+
+        labels = fields.get("labels", [])
+        comment_data = fields.get("comment", {})
+        comments = comment_data.get("comments", []) if isinstance(comment_data, dict) else []
+        comment_count = comment_data.get("total", len(comments)) if isinstance(comment_data, dict) else 0
+
+        last_comment = None
+        if comments:
+            last = comments[-1]
+            last_body = last.get("body", "")
+            if isinstance(last_body, dict):
+                content_blocks = last_body.get("content", [])
+                last_body = " ".join(
+                    block.get("content", [{}])[0].get("text", "")
+                    for block in content_blocks
+                    if block.get("content") and block["content"][0].get("text")
+                )
+            last_author = last.get("author", {})
+            author_name = last_author.get("displayName", "Unknown") if isinstance(last_author, dict) else "Unknown"
+            created = last.get("created", "")
+            last_comment = {
+                "author": author_name,
+                "preview": last_body[:150] + ("..." if len(last_body) > 150 else ""),
+                "created": created[:10] if created else "",
+            }
+
+        parent = fields.get("parent", {})
+        parent_key = parent.get("key", "") if isinstance(parent, dict) else ""
+
+        story_points = None
+        for key_name in ("customfield_10016", "customfield_10015", "customfield_10014"):
+            if key_name in fields:
+                story_points = fields[key_name]
+                break
+
+        issuelinks = fields.get("issuelinks", [])
+        linked_count = len(issuelinks) if issuelinks else 0
+
+        return {
+            "key": key,
+            "type": type_name,
+            "summary": summary,
+            "status": status_name,
+            "priority": priority_name,
+            "assignee": assignee_name,
+            "description_preview": desc_preview,
+            "labels": labels if labels else [],
+            "comment_count": comment_count,
+            "last_comment": last_comment,
+            "parent": parent_key if parent_key else None,
+            "linked_issues_count": linked_count,
+            "story_points": story_points,
+        }
