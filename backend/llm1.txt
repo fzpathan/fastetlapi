@@ -188,3 +188,393 @@ class StreamEvent:
     finish_reason: str | None = None
     usage: TokenUsage | None = None
     error: str | None = None
+from __future__ import annotations
+
+import asyncio
+import json
+import traceback
+from dataclasses import dataclass, field
+from typing import Any, AsyncGenerator
+
+from openai import AsyncOpenAI, APIConnectionError, APIError, RateLimitError
+
+from response import StreamEvent, StreamEventType, TextDelta, TokenUsage, ToolCall
+from skill import Skill
+
+_MAX_TOOL_ITERATIONS = 10
+
+
+@dataclass
+class _TurnState:
+    """Mutable side-channel so async generators can communicate results back."""
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    finish_reason: str = "stop"
+    content: str = ""
+
+
+class LLMClient:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        system_prompt: str = "You are a helpful assistant.",
+        base_url: str | None = None,
+        max_retries: int = 3,
+    ) -> None:
+        self._api_key = api_key
+        self._model = model
+        self._system_prompt = system_prompt
+        self._base_url = base_url
+        self._max_retries = max_retries
+
+        self._client: AsyncOpenAI | None = None
+        self._skills: dict[str, Skill] = {}
+        self._history: list[dict[str, Any]] = []
+
+    # ------------------------------------------------------------------
+    # Public configuration
+    # ------------------------------------------------------------------
+
+    def register_skill(self, skill: Skill) -> None:
+        self._skills[skill.name] = skill
+
+    def set_system_prompt(self, prompt: str) -> None:
+        self._system_prompt = prompt
+
+    def reset_turns(self) -> None:
+        self._history.clear()
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    async def ask(
+        self,
+        question: str,
+        stream: bool = True,
+        use_turns: bool = True,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """
+        Ask the LLM a question. Yields StreamEvent objects.
+
+        use_turns=True  — maintains conversation history across calls
+        use_turns=False — stateless single-shot (system + user only)
+        """
+        messages = self._build_messages(question, use_turns)
+        tools = self._build_tools()
+        accumulated_text = ""
+
+        for _ in range(_MAX_TOOL_ITERATIONS):
+            state = _TurnState(messages=messages)
+
+            if stream:
+                async for event in self._stream_turn(state, tools):
+                    yield event
+            else:
+                async for event in self._non_stream_turn(state, tools):
+                    yield event
+
+            accumulated_text += state.content
+            messages = state.messages
+
+            if state.finish_reason != "tool_calls":
+                break
+
+        if use_turns and accumulated_text:
+            self._history.append({"role": "user", "content": question})
+            self._history.append({"role": "assistant", "content": accumulated_text})
+
+    # ------------------------------------------------------------------
+    # Streaming turn
+    # ------------------------------------------------------------------
+
+    async def _stream_turn(
+        self,
+        state: _TurnState,
+        tools: list[dict] | None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        client = self._get_client()
+        kwargs = self._build_kwargs(state.messages, tools, stream=True)
+
+        for attempt in range(self._max_retries):
+            try:
+                response = await client.chat.completions.create(**kwargs)
+                async for event in self._consume_stream(response, state):
+                    yield event
+                return
+            except RateLimitError as e:
+                if attempt < self._max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                yield StreamEvent(type=StreamEventType.ERROR, error=f"Rate limit: {e}")
+                return
+            except APIConnectionError as e:
+                if attempt < self._max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                yield StreamEvent(type=StreamEventType.ERROR, error=f"Connection error: {e}")
+                return
+            except APIError as e:
+                yield StreamEvent(type=StreamEventType.ERROR, error=f"API error: {e}")
+                return
+            except Exception:
+                yield StreamEvent(type=StreamEventType.ERROR, error=traceback.format_exc())
+                return
+
+    async def _consume_stream(
+        self,
+        response: Any,
+        state: _TurnState,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        usage: TokenUsage | None = None
+        full_content = ""
+        # index -> accumulated fields
+        tool_call_buffers: dict[int, dict[str, str]] = {}
+
+        async for chunk in response:
+            if hasattr(chunk, "usage") and chunk.usage:
+                details = getattr(chunk.usage, "prompt_tokens_details", None)
+                cached = getattr(details, "cached_tokens", 0) if details else 0
+                usage = TokenUsage(
+                    prompt_tokens=chunk.usage.prompt_tokens,
+                    completion_tokens=chunk.usage.completion_tokens,
+                    total_tokens=chunk.usage.total_tokens,
+                    cached_tokens=cached,
+                )
+
+            if not chunk.choices:
+                continue
+
+            choice = chunk.choices[0]
+            delta = choice.delta
+
+            if choice.finish_reason:
+                state.finish_reason = choice.finish_reason
+
+            if delta.content:
+                full_content += delta.content
+                yield StreamEvent(
+                    type=StreamEventType.TEXT_DELTA,
+                    text_delta=TextDelta(delta.content),
+                )
+
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_call_buffers:
+                        tool_call_buffers[idx] = {"id": "", "name": "", "arguments": ""}
+                    buf = tool_call_buffers[idx]
+                    if tc_delta.id:
+                        buf["id"] += tc_delta.id
+                    if tc_delta.function and tc_delta.function.name:
+                        buf["name"] += tc_delta.function.name
+                    if tc_delta.function and tc_delta.function.arguments:
+                        buf["arguments"] += tc_delta.function.arguments
+
+        state.content = full_content
+
+        if state.finish_reason == "tool_calls" and tool_call_buffers:
+            raw_tool_calls = []
+            tool_calls = []
+            for buf in tool_call_buffers.values():
+                tc = ToolCall(id=buf["id"], name=buf["name"], arguments=buf["arguments"])
+                tool_calls.append(tc)
+                raw_tool_calls.append({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.name, "arguments": tc.arguments},
+                })
+                yield StreamEvent(type=StreamEventType.TOOL_CALL, tool_call=tc)
+
+            updated_messages = state.messages + [
+                {"role": "assistant", "content": full_content or None, "tool_calls": raw_tool_calls}
+            ]
+
+            for tc in tool_calls:
+                result = await self._execute_skill(tc)
+                yield StreamEvent(
+                    type=StreamEventType.TOOL_RESULT,
+                    tool_result={"tool_call_id": tc.id, "name": tc.name, "result": result},
+                )
+                updated_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(result) if not isinstance(result, str) else result,
+                })
+
+            state.messages = updated_messages
+        else:
+            state.messages = state.messages + [{"role": "assistant", "content": full_content}]
+
+        yield StreamEvent(
+            type=StreamEventType.MESSAGE_COMPLETE,
+            finish_reason=state.finish_reason,
+            usage=usage,
+        )
+
+    # ------------------------------------------------------------------
+    # Non-streaming turn
+    # ------------------------------------------------------------------
+
+    async def _non_stream_turn(
+        self,
+        state: _TurnState,
+        tools: list[dict] | None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        client = self._get_client()
+        kwargs = self._build_kwargs(state.messages, tools, stream=False)
+
+        for attempt in range(self._max_retries):
+            try:
+                response = await client.chat.completions.create(**kwargs)
+                async for event in self._process_non_stream(response, state):
+                    yield event
+                return
+            except RateLimitError as e:
+                if attempt < self._max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                yield StreamEvent(type=StreamEventType.ERROR, error=f"Rate limit: {e}")
+                return
+            except APIConnectionError as e:
+                if attempt < self._max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                yield StreamEvent(type=StreamEventType.ERROR, error=f"Connection error: {e}")
+                return
+            except APIError as e:
+                yield StreamEvent(type=StreamEventType.ERROR, error=f"API error: {e}")
+                return
+            except Exception:
+                yield StreamEvent(type=StreamEventType.ERROR, error=traceback.format_exc())
+                return
+
+    async def _process_non_stream(
+        self,
+        response: Any,
+        state: _TurnState,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        choice = response.choices[0]
+        message = choice.message
+        state.finish_reason = choice.finish_reason or "stop"
+
+        usage: TokenUsage | None = None
+        if response.usage:
+            details = getattr(response.usage, "prompt_tokens_details", None)
+            cached = getattr(details, "cached_tokens", 0) if details else 0
+            usage = TokenUsage(
+                prompt_tokens=response.usage.prompt_tokens,
+                completion_tokens=response.usage.completion_tokens,
+                total_tokens=response.usage.total_tokens,
+                cached_tokens=cached,
+            )
+
+        text_content = message.content or ""
+        state.content = text_content
+
+        if state.finish_reason == "tool_calls" and message.tool_calls:
+            raw_tool_calls = []
+            tool_calls = []
+            for tc_obj in message.tool_calls:
+                tc = ToolCall(
+                    id=tc_obj.id,
+                    name=tc_obj.function.name,
+                    arguments=tc_obj.function.arguments,
+                )
+                tool_calls.append(tc)
+                raw_tool_calls.append({
+                    "id": tc_obj.id,
+                    "type": "function",
+                    "function": {"name": tc_obj.function.name, "arguments": tc_obj.function.arguments},
+                })
+                yield StreamEvent(type=StreamEventType.TOOL_CALL, tool_call=tc)
+
+            updated_messages = state.messages + [
+                {"role": "assistant", "content": text_content or None, "tool_calls": raw_tool_calls}
+            ]
+
+            for tc in tool_calls:
+                result = await self._execute_skill(tc)
+                yield StreamEvent(
+                    type=StreamEventType.TOOL_RESULT,
+                    tool_result={"tool_call_id": tc.id, "name": tc.name, "result": result},
+                )
+                updated_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(result) if not isinstance(result, str) else result,
+                })
+
+            state.messages = updated_messages
+        else:
+            if text_content:
+                yield StreamEvent(
+                    type=StreamEventType.TEXT_DELTA,
+                    text_delta=TextDelta(text_content),
+                )
+            state.messages = state.messages + [{"role": "assistant", "content": text_content}]
+
+        yield StreamEvent(
+            type=StreamEventType.MESSAGE_COMPLETE,
+            finish_reason=state.finish_reason,
+            usage=usage,
+        )
+
+    # ------------------------------------------------------------------
+    # Skill execution
+    # ------------------------------------------------------------------
+
+    async def _execute_skill(self, tool_call: ToolCall) -> Any:
+        skill = self._skills.get(tool_call.name)
+        if skill is None:
+            return {"error": f"Unknown skill: {tool_call.name}"}
+        try:
+            args = json.loads(tool_call.arguments) if tool_call.arguments else {}
+            return await skill.execute(**args)
+        except Exception:
+            return {"error": traceback.format_exc()}
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get_client(self) -> AsyncOpenAI:
+        if self._client is None:
+            self._client = AsyncOpenAI(
+                api_key=self._api_key,
+                base_url=self._base_url,
+            )
+        return self._client
+
+    def _build_messages(self, question: str, use_turns: bool) -> list[dict[str, Any]]:
+        system_msg = {"role": "system", "content": self._system_prompt}
+        if use_turns:
+            return [system_msg] + list(self._history) + [{"role": "user", "content": question}]
+        return [system_msg, {"role": "user", "content": question}]
+
+    def _build_tools(self) -> list[dict] | None:
+        if not self._skills:
+            return None
+        return [skill.to_tool_definition() for skill in self._skills.values()]
+
+    def _build_kwargs(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        stream: bool,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "stream": stream,
+        }
+        if stream:
+            kwargs["stream_options"] = {"include_usage": True}
+        if tools:
+            kwargs["tools"] = tools
+        return kwargs
+
+    async def close(self) -> None:
+        if self._client:
+            await self._client.close()
+            self._client = None
